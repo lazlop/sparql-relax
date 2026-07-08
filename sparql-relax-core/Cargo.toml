@@ -1,0 +1,9 @@
+[package]
+name = "sparql-relax-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+oxigraph = { version = "0.5.9", default-features = false }
+spargebra = { version = "0.4.6", features = ["sep-0006"] }
+thiserror = "2.0.18"

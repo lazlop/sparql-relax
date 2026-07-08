@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sparql-relax-rs"
+version = "0.1.0"
+description = "Diagnose and relax broken SPARQL queries over Oxigraph, with real forward/inverse graph-path search"
+requires-python = ">=3.9"
+readme = "README.md"
+
+[tool.maturin]
+python-source = "python"
+module-name = "sparql_relax_rs._sparql_relax_rs"
+features = ["pyo3/extension-module"]

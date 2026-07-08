@@ -1,0 +1,16 @@
+use oxigraph::sparql::QueryEvaluationError;
+use spargebra::SparqlSyntaxError;
+
+#[derive(thiserror::Error, Debug)]
+pub enum RelaxError {
+    #[error("SPARQL syntax error: {0}")]
+    Syntax(#[from] SparqlSyntaxError),
+    #[error("SPARQL evaluation error: {0}")]
+    Evaluation(#[from] QueryEvaluationError),
+    #[error("only SELECT queries are supported, got: {0}")]
+    UnsupportedQueryForm(&'static str),
+    #[error("query has no basic graph pattern triples to diagnose")]
+    NoTriples,
+}
+
+pub type Result<T> = std::result::Result<T, RelaxError>;
