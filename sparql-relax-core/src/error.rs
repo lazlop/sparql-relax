@@ -11,6 +11,8 @@ pub enum RelaxError {
     UnsupportedQueryForm(&'static str),
     #[error("query has no basic graph pattern triples to diagnose")]
     NoTriples,
+    #[error("culprit triple {0:?} could not be located while relaxing the query it was diagnosed from")]
+    CulpritNotFound(String),
 }
 
 pub type Result<T> = std::result::Result<T, RelaxError>;

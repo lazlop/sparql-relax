@@ -3,7 +3,10 @@
 //! actual triples outward from a bound endpoint, trying both a real
 //! outgoing edge (forward, `<p>`) and a real incoming edge (inverse, `^<p>`)
 //! at every step, to find a sequence of hops that actually connects two
-//! bound nodes.
+//! bound nodes. An optional namespace allowlist (`allowed_namespaces`) can
+//! further restrict which real edges are eligible to walk at all — a
+//! predicate outside every listed namespace is invisible to the search,
+//! even if it would otherwise connect the two nodes.
 
 use oxigraph::model::{GraphNameRef, NamedNode, NamedOrBlankNode, Term};
 use oxigraph::store::Store;
@@ -19,8 +22,10 @@ pub enum Hop {
 /// Bounded-depth breadth-first search from `start` to `goal` over the
 /// store's real edges, in either direction. Returns the shortest hop
 /// sequence found (`Some(vec![])` if `start == goal` already), or `None`
-/// if no path exists within `max_depth` hops.
-pub fn find_path(store: &Store, start: &Term, goal: &Term, max_depth: usize) -> Option<Vec<Hop>> {
+/// if no path exists within `max_depth` hops. `allowed_namespaces` restricts
+/// which predicates are eligible hops (see [`neighbors`]); `None` means any
+/// real predicate is fair game.
+pub fn find_path(store: &Store, start: &Term, goal: &Term, max_depth: usize, allowed_namespaces: Option<&[String]>) -> Option<Vec<Hop>> {
     if start == goal {
         return Some(Vec::new());
     }
@@ -31,7 +36,7 @@ pub fn find_path(store: &Store, start: &Term, goal: &Term, max_depth: usize) -> 
     for _ in 0..max_depth {
         let mut next_frontier = Vec::new();
         for (node, path) in &frontier {
-            for (hop, neighbor) in neighbors(store, node) {
+            for (hop, neighbor) in neighbors(store, node, allowed_namespaces) {
                 if &neighbor == goal {
                     let mut full = path.clone();
                     full.push(hop);
@@ -52,66 +57,6 @@ pub fn find_path(store: &Store, start: &Term, goal: &Term, max_depth: usize) -> 
     None
 }
 
-/// Caps how many distinct hop-sequence shapes [`explore_from`] returns, so
-/// exploring outward from a well-connected node without a fixed goal can't
-/// blow up.
-const MAX_UNDIRECTED_CANDIDATES: usize = 20;
-
-/// Explores outward from `anchor` over the store's real edges (forward and
-/// inverse) with no fixed goal, up to `max_depth` hops, and returns the
-/// shortest hop sequence reaching each distinct node found (standard BFS
-/// dedup by node, not by hop-sequence text — without this, a real inverse
-/// edge back toward an ancestor, e.g. `<p>` then `^<p>`, would otherwise
-/// show up as a spurious "alternative" that doesn't actually lead anywhere
-/// new). Used when a broken triple's other side isn't bound anywhere else
-/// in the query, so there's no specific target to search for: these are
-/// offered as suggested alternatives related to `anchor`, not verified
-/// fixes.
-pub fn explore_from(store: &Store, anchor: &Term, max_depth: usize) -> Vec<Vec<Hop>> {
-    let mut results: Vec<Vec<Hop>> = Vec::new();
-    let mut expanded: HashSet<Term> = HashSet::from([anchor.clone()]);
-    let mut frontier: Vec<(Term, Vec<Hop>)> = vec![(anchor.clone(), Vec::new())];
-
-    'depth: for _ in 0..max_depth {
-        let mut next_frontier = Vec::new();
-        for (node, path) in &frontier {
-            for (hop, neighbor) in neighbors(store, node) {
-                if !expanded.insert(neighbor.clone()) {
-                    continue; // already reached via an earlier, shorter-or-equal path
-                }
-                let mut new_path = path.clone();
-                new_path.push(hop);
-                results.push(new_path.clone());
-                if results.len() >= MAX_UNDIRECTED_CANDIDATES {
-                    break 'depth;
-                }
-                next_frontier.push((neighbor, new_path));
-            }
-        }
-        if next_frontier.is_empty() {
-            break;
-        }
-        frontier = next_frontier;
-    }
-
-    results.sort_by_key(Vec::len);
-    results
-}
-
-/// Reverses a hop sequence and flips each step's direction, e.g.
-/// `[Forward(p1), Inverse(p2)]` becomes `[Forward(p2), Inverse(p1)]`. Used
-/// when a path was searched outward from an object anchor (no subject
-/// available) but needs to be phrased as subject → object.
-pub fn reverse_hops(hops: &[Hop]) -> Vec<Hop> {
-    hops.iter()
-        .rev()
-        .map(|hop| match hop {
-            Hop::Forward(p) => Hop::Inverse(p.clone()),
-            Hop::Inverse(p) => Hop::Forward(p.clone()),
-        })
-        .collect()
-}
-
 /// Verifies that following `hops` from `start` (step by step, over the
 /// store's real edges) actually lands on `goal`. Used to check whether a
 /// hop sequence discovered for one bound pair generalizes to another.
@@ -119,7 +64,7 @@ pub fn path_holds(store: &Store, start: &Term, goal: &Term, hops: &[Hop]) -> boo
     let mut current = start.clone();
     for hop in hops {
         let mut stepped = false;
-        for (candidate_hop, neighbor) in neighbors(store, &current) {
+        for (candidate_hop, neighbor) in neighbors(store, &current, None) {
             if &candidate_hop == hop {
                 current = neighbor;
                 stepped = true;
@@ -133,20 +78,34 @@ pub fn path_holds(store: &Store, start: &Term, goal: &Term, hops: &[Hop]) -> boo
     current == *goal
 }
 
-fn neighbors(store: &Store, node: &Term) -> Vec<(Hop, Term)> {
+/// Every real forward/inverse edge out of `node`, optionally restricted to
+/// predicates under one of `allowed_namespaces`' prefixes (`None` allows
+/// any predicate).
+fn neighbors(store: &Store, node: &Term, allowed_namespaces: Option<&[String]>) -> Vec<(Hop, Term)> {
     let mut out = Vec::new();
 
     if let Some(subject) = as_subject(node) {
         for quad in store.quads_for_pattern(Some(subject.as_ref()), None, None, Some(GraphNameRef::DefaultGraph)).flatten() {
-            out.push((Hop::Forward(quad.predicate), quad.object));
+            if predicate_allowed(&quad.predicate, allowed_namespaces) {
+                out.push((Hop::Forward(quad.predicate), quad.object));
+            }
         }
     }
 
     for quad in store.quads_for_pattern(None, None, Some(node.as_ref()), Some(GraphNameRef::DefaultGraph)).flatten() {
-        out.push((Hop::Inverse(quad.predicate), Term::from(quad.subject)));
+        if predicate_allowed(&quad.predicate, allowed_namespaces) {
+            out.push((Hop::Inverse(quad.predicate), Term::from(quad.subject)));
+        }
     }
 
     out
+}
+
+fn predicate_allowed(predicate: &NamedNode, allowed_namespaces: Option<&[String]>) -> bool {
+    match allowed_namespaces {
+        None => true,
+        Some(namespaces) => namespaces.iter().any(|ns| predicate.as_str().starts_with(ns.as_str())),
+    }
 }
 
 fn as_subject(term: &Term) -> Option<NamedOrBlankNode> {

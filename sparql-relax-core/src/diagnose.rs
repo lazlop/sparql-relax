@@ -30,15 +30,18 @@
 //! does not apply to them (queries rarely have enough interacting filters
 //! for combining removals to matter, unlike triples).
 
-use crate::algebra::{collect_bgp_triples, collect_filters, pattern_of, remove_filter, remove_triple, with_pattern};
+use crate::algebra::{ask_query, collect_bgp_triples, collect_filters, pattern_of, remove_filter, remove_triple, with_pattern};
 use crate::error::{RelaxError, Result};
 use oxigraph::model::{GraphNameRef, NamedOrBlankNode, Term};
-use oxigraph::sparql::{QueryResults, QuerySolution, SparqlEvaluator};
+use oxigraph::sparql::{CancellationToken, QueryEvaluationError, QueryResults, QuerySolution, SparqlEvaluator};
 use oxigraph::store::Store;
+use rayon::prelude::*;
 use spargebra::Query;
 use spargebra::SparqlParser;
-use spargebra::algebra::Expression;
+use spargebra::algebra::{Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
+use std::thread;
+use std::time::Instant;
 
 /// One or more BGP triples whose *joint* removal unblocks the query, and
 /// which never jointly hold for any binding of the rest of the query — the
@@ -90,11 +93,29 @@ pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
 /// triples. `depth = 1` reproduces single-triple-only diagnosis.
 pub fn diagnose(query_text: &str, store: &Store, depth: usize) -> Result<Diagnosis> {
     let query = SparqlParser::new().parse_query(query_text)?;
+    ensure_select(&query)?;
+    let pattern = pattern_of(&query).clone();
+    diagnose_parsed(query_text, &query, &pattern, store, depth)
+}
+
+pub(crate) fn ensure_select(query: &Query) -> Result<()> {
     if !matches!(query, Query::Select { .. }) {
         return Err(RelaxError::UnsupportedQueryForm("SELECT"));
     }
-    let pattern = pattern_of(&query);
+    Ok(())
+}
 
+/// Same as [`diagnose`], but takes an already-parsed `query`/`pattern`
+/// instead of re-parsing `query_text` itself (still needed to actually run
+/// the *original* query once, unmodified). [`crate::relax::diagnose_and_relax`]
+/// uses this — rather than calling [`diagnose`] and then separately
+/// re-parsing the same text a second time for its own use — so the culprit
+/// triples it gets back are guaranteed to be the exact same values it can
+/// later find and remove from its own copy of the pattern. Two independent
+/// parses of identical text are not guaranteed to produce identical
+/// `TriplePattern` values in every case, which would otherwise make a
+/// culprit "disappear" when relaxation tries to remove it.
+pub(crate) fn diagnose_parsed(query_text: &str, query: &Query, pattern: &GraphPattern, store: &Store, depth: usize) -> Result<Diagnosis> {
     let original_rows = run_select(query_text, store)?;
 
     let triple_candidates: Vec<TriplePattern> = collect_bgp_triples(pattern)
@@ -113,32 +134,40 @@ pub fn diagnose(query_text: &str, store: &Store, depth: usize) -> Result<Diagnos
             break; // no more triples left to combine
         }
 
-        let mut found_at_this_depth = false;
-        for combo in combinations(&triple_candidates, k) {
-            if !is_culprit_combo(&query, pattern, &combo, store) {
-                continue;
-            }
-            found_at_this_depth = true;
-            culprits.push(Culprit { triples: combo, depth: k });
-        }
+        // Every combination's ablation check is an independent read against
+        // `store` (Oxigraph stores support concurrent reads), so check them
+        // all in parallel rather than one at a time — C(n, k) grows fast
+        // once a query has more than a handful of candidate triples.
+        let found: Vec<Culprit> = combinations(&triple_candidates, k)
+            .into_par_iter()
+            .filter(|combo| is_culprit_combo(query, pattern, combo, store, original_rows.is_empty()))
+            .map(|triples| Culprit { triples, depth: k })
+            .collect();
 
-        if found_at_this_depth {
+        if !found.is_empty() {
+            culprits.extend(found);
             break; // don't escalate to a larger combination size
         }
     }
 
-    let mut filter_culprits = Vec::new();
-    for expression in filter_candidates {
-        let Some(reduced_pattern) = remove_filter(pattern, &expression) else { continue };
-        let reduced_text = with_pattern(&query, reduced_pattern).to_string();
-        let Ok(reduced_rows) = run_select(&reduced_text, store) else { continue };
-        // Removing a FILTER can only ever keep or grow the result set (it's
-        // a pure restriction), so a strict increase means this filter was
-        // actually excluding rows.
-        if reduced_rows.len() > original_rows.len() {
-            filter_culprits.push(FilterCulprit { expression, row_count_without_filter: reduced_rows.len() });
-        }
-    }
+    // Each filter's ablation check is an independent read against `store`,
+    // exactly like the triple-combo checks above, so check them all in
+    // parallel too rather than one at a time.
+    let filter_culprits: Vec<FilterCulprit> = filter_candidates
+        .into_par_iter()
+        .filter_map(|expression| {
+            let reduced_pattern = remove_filter(pattern, &expression)?;
+            let reduced_rows = run_select_query(with_pattern(query, reduced_pattern), store).ok()?;
+            // Removing a FILTER can only ever keep or grow the result set
+            // (it's a pure restriction), so a strict increase means this
+            // filter was actually excluding rows. (Unlike triple combos,
+            // this can't reuse the cheaper ASK-existence shortcut above
+            // even when the original query is empty: the actual row count
+            // is part of `FilterCulprit`, not just a yes/no.)
+            (reduced_rows.len() > original_rows.len())
+                .then(|| FilterCulprit { expression, row_count_without_filter: reduced_rows.len() })
+        })
+        .collect();
 
     Ok(Diagnosis { original_row_count: original_rows.len(), culprits, filter_culprits })
 }
@@ -147,19 +176,56 @@ pub fn diagnose(query_text: &str, store: &Store, depth: usize) -> Result<Diagnos
 /// and no single row satisfies every triple in `combo` jointly (i.e. the
 /// combination is genuinely, jointly responsible — not just incidentally
 /// relaxing enough constraints for something else to match).
-fn is_culprit_combo(query: &Query, pattern: &spargebra::algebra::GraphPattern, combo: &[TriplePattern], store: &Store) -> bool {
+///
+/// `original_is_empty` (`original_row_count == 0` in [`diagnose_parsed`])
+/// enables a shortcut: the original pattern is exactly `reduced_pattern ∧
+/// combo`, so a row of `reduced_pattern` that also satisfied `combo`
+/// pointwise would itself be a full solution to the original query. If the
+/// original query has zero rows, no such row can exist — the per-row
+/// [`triple_holds_for_row`] check below is *guaranteed* to never match, so
+/// it's skipped entirely in favor of a single cheap existence check
+/// ([`pattern_has_solution`]). This only holds when the original query is
+/// empty; otherwise the full per-row check below is still needed.
+fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern], store: &Store, original_is_empty: bool) -> bool {
     let Some(reduced_pattern) = combo.iter().try_fold(pattern.clone(), |p, t| remove_triple(&p, t)) else {
         return false;
     };
-    let reduced_text = with_pattern(query, reduced_pattern).to_string();
-    let Ok(reduced_rows) = run_select(&reduced_text, store) else { return false };
-    if reduced_rows.is_empty() {
-        return false; // removing this combination alone doesn't unblock anything
+
+    if original_is_empty {
+        return pattern_has_solution(query, reduced_pattern, store);
     }
 
-    let jointly_holds_somewhere =
-        reduced_rows.iter().any(|row| combo.iter().all(|t| triple_holds_for_row(store, t, row)));
-    !jointly_holds_somewhere
+    // Streams the reduced query's solutions one at a time rather than
+    // collecting them all first (unlike [`run_select`]): the common case is
+    // a combo that *does* jointly hold somewhere (not a culprit), and that
+    // can stop at the very first matching row instead of paying to
+    // materialize a potentially large result set that removing constraining
+    // triples tends to produce.
+    let Ok(results) = SparqlEvaluator::new().for_query(with_pattern(query, reduced_pattern)).on_store(store).execute() else {
+        return false;
+    };
+    let QueryResults::Solutions(solutions) = results else { return false };
+
+    let mut any_row = false;
+    for solution in solutions {
+        let Ok(row) = solution else { break };
+        any_row = true;
+        if combo.iter().all(|t| triple_holds_for_row(store, t, &row)) {
+            return false; // some binding satisfies every triple in the combo; not a genuine culprit set
+        }
+    }
+    any_row // non-empty, and no row ever satisfied the whole combo jointly
+}
+
+/// Whether `pattern` has at least one solution against `store`, evaluated as
+/// a SPARQL `ASK` (short-circuits on the first matching solution) rather
+/// than a `SELECT` that has to be told to stop separately or fully
+/// materialized to find out.
+fn pattern_has_solution(query: &Query, pattern: GraphPattern, store: &Store) -> bool {
+    let Ok(results) = SparqlEvaluator::new().for_query(ask_query(query, pattern)).on_store(store).execute() else {
+        return false;
+    };
+    matches!(results, QueryResults::Boolean(true))
 }
 
 /// All distinct size-`k` combinations of `items` (order-independent, no
@@ -229,6 +295,76 @@ pub(crate) fn run_select(query_text: &str, store: &Store) -> Result<Vec<QuerySol
                 rows.push(solution?);
             }
             Ok(rows)
+        }
+        _ => Err(RelaxError::UnsupportedQueryForm("SELECT")),
+    }
+}
+
+/// Same as [`run_select`], but takes an already-parsed `query` instead of
+/// text — skips the serialize-then-reparse round trip for callers that
+/// built `query` from the algebra tree themselves (e.g. a reduced pattern)
+/// rather than starting from SPARQL text.
+fn run_select_query(query: Query, store: &Store) -> Result<Vec<QuerySolution>> {
+    let results = SparqlEvaluator::new().for_query(query).on_store(store).execute()?;
+    match results {
+        QueryResults::Solutions(iter) => {
+            let mut rows = Vec::new();
+            for solution in iter {
+                rows.push(solution?);
+            }
+            Ok(rows)
+        }
+        _ => Err(RelaxError::UnsupportedQueryForm("SELECT")),
+    }
+}
+
+/// Same as [`run_select_query`], but aborts the evaluation rather than
+/// running it unbounded if it doesn't finish by `deadline` (`None` means no
+/// deadline — delegates straight to [`run_select_query`]). `Ok(None)`
+/// specifically means the deadline was hit; it's kept distinct from a
+/// genuine empty result (`Ok(Some(vec![]))`) so a caller can degrade
+/// gracefully (e.g. fall back to some already-known-safe alternative)
+/// instead of treating a slow query as a real error — a single expensive
+/// reduced-query evaluation (e.g. removing a triple leaves the rest of the
+/// query essentially unconstrained, forcing a large join) shouldn't be able
+/// to hang or fail a caller that's relaxing many culprits at once.
+///
+/// Backed by Oxigraph's own `CancellationToken`, checked by the query
+/// engine on every underlying quad lookup — a real mid-evaluation abort,
+/// not just a wrapper that gives up waiting while the query keeps running
+/// in the background.
+pub(crate) fn run_select_query_with_deadline(query: Query, store: &Store, deadline: Option<Instant>) -> Result<Option<Vec<QuerySolution>>> {
+    let Some(deadline) = deadline else {
+        return run_select_query(query, store).map(Some);
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Ok(None);
+    }
+
+    let cancellation_token = CancellationToken::new();
+    let timer_token = cancellation_token.clone();
+    thread::spawn(move || {
+        thread::sleep(remaining);
+        timer_token.cancel();
+    });
+
+    let results = match SparqlEvaluator::new().with_cancellation_token(cancellation_token).for_query(query).on_store(store).execute() {
+        Ok(results) => results,
+        Err(QueryEvaluationError::Cancelled) => return Ok(None),
+        Err(e) => return Err(RelaxError::Evaluation(e)),
+    };
+    match results {
+        QueryResults::Solutions(iter) => {
+            let mut rows = Vec::new();
+            for solution in iter {
+                match solution {
+                    Ok(row) => rows.push(row),
+                    Err(QueryEvaluationError::Cancelled) => return Ok(None),
+                    Err(e) => return Err(RelaxError::Evaluation(e)),
+                }
+            }
+            Ok(Some(rows))
         }
         _ => Err(RelaxError::UnsupportedQueryForm("SELECT")),
     }

@@ -1,7 +1,8 @@
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::store::Store;
 use sparql_relax_core::bfs::Hop;
-use sparql_relax_core::{diagnose, diagnose_and_relax, diagnose_and_relax_default};
+use sparql_relax_core::{NamespaceScope, diagnose, diagnose_and_relax, diagnose_and_relax_default};
+use std::time::Duration;
 
 const TTL: &str = r#"
     @prefix ex: <urn:example#> .
@@ -40,7 +41,7 @@ fn diagnoses_the_wrong_predicate_as_a_culprit() {
 #[test]
 fn finds_a_real_forward_forward_path_and_fixes_the_query() {
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5)).unwrap();
+    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
 
     assert_eq!(report.original_row_count, 0);
     assert_eq!(report.results.len(), 1);
@@ -96,7 +97,7 @@ fn finds_an_inverse_hop_path() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5)).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let relaxed_triple = &report.results[0].triples[0];
     assert_eq!(
@@ -110,12 +111,93 @@ fn finds_an_inverse_hop_path() {
 #[test]
 fn reports_no_relaxation_when_depth_is_too_small() {
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(1), Some(5)).unwrap();
+    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(1), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
     assert!(result.triples[0].hop_alternatives.is_empty());
     assert!(result.relaxed_query.is_none());
     assert_eq!(result.row_count, 0);
+
+    // No real relaxation was found, but the pruned fallback (culprit triple
+    // just dropped, no path substitution) is still there and non-empty.
+    assert!(!result.pruned_query.contains("hasSensor"), "the culprit triple should be dropped, not replaced");
+    assert_eq!(result.pruned_row_count, 1, "sensor1 still matches once the broken triple is just dropped");
+}
+
+#[test]
+fn pruned_query_is_present_even_when_a_real_relaxation_is_found() {
+    // pruned_query isn't only emitted on failure — it's always populated,
+    // even alongside a successful relaxed_query, so callers can compare
+    // the two or fall back later without a second call.
+    let store = test_store();
+    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let result = &report.results[0];
+    assert!(result.relaxed_query.is_some(), "sanity check: a real relaxation was found here");
+    assert!(!result.pruned_query.contains("hasSensor"), "the culprit triple should be dropped, not replaced");
+    assert_eq!(result.pruned_row_count, 1, "sensor1 is still reachable once the broken triple is just dropped");
+}
+
+#[test]
+fn pruned_row_count_respects_result_limit() {
+    // Dropping the culprit's hasSensor triple leaves both sensor1 and
+    // sensor2 matching `?sensor a ex:TempSensor`, so pruned_row_count
+    // should be tightened by result_limit the same way a real relaxed
+    // query's row count is.
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:buildingA ex:hasPart ex:zoneA .
+                ex:zoneA ex:hasSensor ex:sensor1 .
+                ex:sensor1 a ex:TempSensor .
+                ex:buildingA ex:hasDevice ex:sensor2 .
+                ex:sensor2 a ex:TempSensor .
+            "#,
+        )
+        .unwrap();
+
+    let query = r#"
+        PREFIX ex: <urn:example#>
+        SELECT ?sensor WHERE {
+            ex:buildingA ex:hasSensor ?sensor .
+            ?sensor a ex:TempSensor .
+        }
+    "#;
+
+    let unbounded = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    assert_eq!(unbounded.results[0].pruned_row_count, 2);
+
+    let capped = diagnose_and_relax(query, &store, 1, Some(4), Some(5), Some(1), NamespaceScope::Unrestricted, None).unwrap();
+    assert_eq!(capped.results[0].pruned_row_count, 1, "result_limit tightens pruned_row_count too");
+}
+
+#[test]
+fn falls_back_to_pruned_query_when_the_relaxation_timeout_is_exceeded() {
+    // An effectively-zero timeout means the deadline is already passed by
+    // the time relax_combo's first query would run, so every SPARQL
+    // execution inside it degrades the same way a genuinely slow query
+    // would: `relaxed_query: None`, empty hop_alternatives, no error and no
+    // hang for the whole `diagnose_and_relax` call.
+    let store = test_store();
+    let report = diagnose_and_relax(
+        BROKEN_QUERY,
+        &store,
+        1,
+        Some(4),
+        Some(5),
+        None,
+        NamespaceScope::Unrestricted,
+        Some(Duration::from_nanos(1)),
+    )
+    .unwrap();
+    assert_eq!(report.results.len(), 1);
+    let result = &report.results[0];
+    assert!(result.relaxed_query.is_none(), "no query work could complete within the timeout");
+    assert!(result.triples[0].hop_alternatives.is_empty());
+    assert!(!result.pruned_query.is_empty(), "the pruned fallback's text needs no store access, so it's still there");
+    assert!(!result.pruned_query.contains("hasSensor"));
 }
 
 fn value_store() -> Store {
@@ -181,7 +263,7 @@ fn diagnose_and_relax_reports_filters_without_attempting_a_relaxation() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5)).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
     assert!(report.results.is_empty());
     assert_eq!(report.filter_results.len(), 1);
     assert_eq!(report.filter_results[0].row_count_without_filter, 1);
@@ -221,7 +303,7 @@ fn combines_distinct_paths_from_different_bound_pairs_as_alternatives() {
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1);
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5)).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
 
@@ -258,10 +340,10 @@ fn sample_limit_none_samples_every_distinct_bound_pair() {
         }
     "#;
 
-    let capped = diagnose_and_relax(query, &store, 1, Some(2), Some(5)).unwrap();
+    let capped = diagnose_and_relax(query, &store, 1, Some(2), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
     assert_eq!(capped.results[0].triples[0].hop_alternatives.len(), 5, "capped sampling stops at the limit");
 
-    let uncapped = diagnose_and_relax(query, &store, 1, Some(2), None).unwrap();
+    let uncapped = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None).unwrap();
     assert_eq!(
         uncapped.results[0].triples[0].hop_alternatives.len(),
         6,
@@ -316,7 +398,7 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
     // Relaxation: the hasSensor triple has a real path (hasZone/hasSensor),
     // but the hasUnit triple genuinely has none (nothing connects sensor1
     // to Fahrenheit), so the combination as a whole should not be relaxed.
-    let report = diagnose_and_relax(query, &store, 3, Some(4), None).unwrap();
+    let report = diagnose_and_relax(query, &store, 3, Some(4), None, None, NamespaceScope::Unrestricted, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
     assert_eq!(result.triples.len(), 2);
@@ -330,14 +412,13 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
 }
 
 #[test]
-fn explores_outward_from_a_subject_only_anchor_when_the_object_is_unconstrained() {
+fn does_not_relax_when_the_object_is_unconstrained_elsewhere() {
     // `?sensor` appears *only* in the broken triple below, so once it's
     // removed to check ablation, nothing else binds it — there's no
-    // specific target to search for, only the subject (a concrete IRI) to
-    // explore outward from. Both a real 1-hop path (hasZone) and a real
-    // 2-hop path (hasZone/hasSensor) exist from `building`, and since
-    // there's no fixed goal to prefer one over the other, both should come
-    // back as alternatives.
+    // specific target to search for, only the subject (a concrete IRI).
+    // A real 1-hop path (hasZone) does exist from `building`, but a
+    // one-sided endpoint isn't searched at all (see the module docs), so no
+    // relaxation should be attempted despite that real path existing.
     let store = Store::new().unwrap();
     store
         .load_from_slice(
@@ -360,27 +441,20 @@ fn explores_outward_from_a_subject_only_anchor_when_the_object_is_unconstrained(
     let diagnosis = diagnose(query, &store, 1).unwrap();
     assert_eq!(diagnosis.culprits.len(), 1, "building has no direct hasSensor edge");
 
-    let report = diagnose_and_relax(query, &store, 1, Some(2), None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let relaxed_triple = &report.results[0].triples[0];
-    assert_eq!(
-        relaxed_triple.hop_alternatives.len(),
-        2,
-        "both the 1-hop (hasZone) and 2-hop (hasZone/hasSensor) real paths should be offered"
-    );
-    assert_eq!(
-        report.results[0].row_count,
-        2,
-        "the relaxed query should return both zone1 and sensor1 as suggestions"
-    );
+    assert!(relaxed_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
+    assert!(relaxed_triple.path_text.is_none());
+    assert!(report.results[0].relaxed_query.is_none());
+    assert_eq!(report.results[0].row_count, 0);
 }
 
 #[test]
-fn explores_outward_from_an_object_only_anchor_and_reverses_the_path() {
+fn does_not_relax_when_the_subject_is_unconstrained_elsewhere() {
     // `?x` appears only in the broken triple, and this time it's the
-    // *subject* that's unconstrained, not the object — so search has to
-    // anchor on the object side and flip the discovered path around to
-    // still read subject -> object.
+    // *subject* that's unconstrained, not the object. A real path
+    // (partOf) does exist, but again, a one-sided endpoint isn't searched.
     let store = Store::new().unwrap();
     store
         .load_from_slice(
@@ -399,11 +473,12 @@ fn explores_outward_from_an_object_only_anchor_and_reverses_the_path() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(1), None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let relaxed_triple = &report.results[0].triples[0];
-    assert_eq!(relaxed_triple.path_text.as_deref(), Some("<urn:example#partOf>"));
-    assert_eq!(report.results[0].row_count, 1, "sensor1 is recovered via the real partOf edge");
+    assert!(relaxed_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
+    assert!(report.results[0].relaxed_query.is_none());
+    assert_eq!(report.results[0].row_count, 0);
 }
 
 #[test]
@@ -441,7 +516,7 @@ fn default_ablation_depth_escalates_on_its_own_to_find_a_joint_culprit() {
 }
 
 #[test]
-fn default_max_depth_is_adaptive_2_for_point_to_point_1_for_anchor_only() {
+fn default_max_depth_is_2_for_pair_search() {
     let store = Store::new().unwrap();
     store
         .load_from_slice(
@@ -455,8 +530,8 @@ fn default_max_depth_is_adaptive_2_for_point_to_point_1_for_anchor_only() {
         )
         .unwrap();
 
-    // Point-to-point (both sides bound): the 2-hop hasZone/hasSensor path
-    // should be found by default (DEFAULT_PAIR_SEARCH_DEPTH = 2).
+    // Both sides bound: the 2-hop hasZone/hasSensor path should be found by
+    // default (DEFAULT_PAIR_SEARCH_DEPTH = 2).
     let pair_query = r#"
         PREFIX ex: <urn:example#>
         SELECT ?sensor WHERE {
@@ -464,24 +539,61 @@ fn default_max_depth_is_adaptive_2_for_point_to_point_1_for_anchor_only() {
             ?sensor a ex:TempSensor .
         }
     "#;
-    let pair_report = diagnose_and_relax(pair_query, &store, 1, None, Some(5)).unwrap();
+    let pair_report = diagnose_and_relax(pair_query, &store, 1, None, Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
     assert_eq!(pair_report.results[0].row_count, 1, "default pair-search depth (2) finds the 2-hop path");
+}
 
-    // Anchor-only (only the subject is bound; `?sensor` is unconstrained
-    // elsewhere): only the 1-hop hasZone path should be found by default
-    // (DEFAULT_ANCHOR_SEARCH_DEPTH = 1), not the 2-hop hasZone/hasSensor one.
-    let anchor_query = r#"
+#[test]
+fn namespace_scope_restricts_path_search_to_allowed_prefixes() {
+    // The only real edge connecting `building` to `zone1` uses a predicate
+    // outside the Brick/S223/RDFS/QUDT namespaces `NamespaceScope::default`
+    // restricts to, so a namespace-restricted search should find nothing
+    // even though an unrestricted search finds it easily.
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:building ex:altPath ex:zone1 .
+                ex:zone1 a ex:Zone .
+            "#,
+        )
+        .unwrap();
+
+    let query = r#"
         PREFIX ex: <urn:example#>
-        SELECT ?sensor WHERE {
-            ex:building ex:hasSensor ?sensor .
+        SELECT ?zone WHERE {
+            ex:building ex:hasZone ?zone .
+            ?zone a ex:Zone .
         }
     "#;
-    let anchor_report = diagnose_and_relax(anchor_query, &store, 1, None, Some(5)).unwrap();
-    let relaxed_triple = &anchor_report.results[0].triples[0];
-    assert_eq!(
-        relaxed_triple.hop_alternatives.len(),
-        1,
-        "only the 1-hop path should be found at the default anchor-only depth"
+
+    let unrestricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None).unwrap();
+    assert_eq!(unrestricted.results[0].triples[0].hop_alternatives.len(), 1, "the real altPath edge should be found");
+    assert_eq!(unrestricted.results[0].row_count, 1);
+
+    let brick_restricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::default(), None).unwrap();
+    assert!(
+        brick_restricted.results[0].triples[0].hop_alternatives.is_empty(),
+        "ex:altPath isn't in any allowed namespace, so it shouldn't be found"
     );
-    assert_eq!(anchor_report.results[0].row_count, 1, "only zone1 should come back, not sensor1 too");
+    assert!(brick_restricted.results[0].relaxed_query.is_none());
+
+    let custom_restricted = diagnose_and_relax(
+        query,
+        &store,
+        1,
+        Some(1),
+        None,
+        None,
+        NamespaceScope::Only(vec!["urn:example#alt".to_string()]),
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        custom_restricted.results[0].triples[0].hop_alternatives.len(),
+        1,
+        "a caller-supplied namespace covering ex:altPath should find it"
+    );
 }

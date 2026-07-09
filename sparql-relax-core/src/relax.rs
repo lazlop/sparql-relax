@@ -13,47 +13,113 @@
 //!
 //! A broken triple's other side is sometimes not bound anywhere else in the
 //! query (e.g. `?sensor` in `building hasSensor ?sensor` if nothing else
-//! constrains `?sensor`), so there's no specific target to search for. When
-//! only one side resolves, path search instead explores outward from that
-//! single anchor with no fixed goal and returns whatever real paths it
-//! finds as suggestions — not verified fixes, since there's nothing to
-//! verify against except by actually re-running the whole query afterward.
+//! constrains `?sensor`), so there's no specific target to search for —
+//! only whichever single side did resolve. Such a triple is skipped
+//! entirely rather than searched: without a fixed goal, "path search" would
+//! just be an undirected exploration outward from one anchor, offering
+//! suggestions with nothing to verify them against except re-running the
+//! whole query, which isn't worth the cost of searching for.
+//!
+//! Path search itself can optionally be restricted to a caller-supplied set
+//! of predicate namespaces (see [`NamespaceScope`]) — real edges whose
+//! predicate falls outside every listed namespace are simply invisible to
+//! the search, even if they'd otherwise connect the two endpoints.
+//!
+//! Relaxing one culprit combination can itself be expensive — resolving
+//! endpoints or verifying a candidate fix both re-run a SPARQL query that,
+//! with the broken triple(s) out of the way, can turn into a much larger
+//! join than the original ever was. Each combination gets its own `timeout`
+//! budget for that query work; if it can't finish in time, that combination
+//! falls back to its [`RelaxedCulprit::pruned_query`] (the broken triple(s)
+//! simply dropped, already known cheap and non-empty from diagnosis) rather
+//! than hanging or failing the whole [`diagnose_and_relax`] call over one
+//! slow combination.
 
-use crate::algebra::{pattern_of, replace_triple_with_path, with_pattern};
-use crate::bfs::{Hop, explore_from, find_path, path_to_property_path, reverse_hops};
-use crate::diagnose::{Culprit, DEFAULT_ABLATION_DEPTH, diagnose, resolve_term_pattern, run_select};
-use crate::error::Result;
+use crate::algebra::{pattern_of, replace_triple_with_path, with_limit, with_pattern};
+use crate::bfs::{Hop, find_path, path_to_property_path};
+use crate::diagnose::{Culprit, DEFAULT_ABLATION_DEPTH, diagnose_parsed, ensure_select, resolve_term_pattern, run_select_query_with_deadline};
+use crate::error::{RelaxError, Result};
 use oxigraph::model::Term;
 use oxigraph::store::Store;
+use rayon::prelude::*;
 use spargebra::Query;
 use spargebra::SparqlParser;
 use spargebra::algebra::{GraphPattern, PropertyPathExpression};
+use std::time::{Duration, Instant};
 
 /// Default for `sample_limit`: a representative handful of bound endpoints
 /// is normally enough to find a generalizable path without examining every
 /// row of a potentially large reduced query.
 pub const DEFAULT_SAMPLE_LIMIT: usize = 5;
 
-/// Default path-search depth when both a culprit triple's subject and
-/// object are known (a concrete point-to-point search, bounded by its
-/// target — cheap enough to search a little deeper).
+/// Default path-search depth: a culprit triple is only ever searched once
+/// both its subject and object are known (see the module docs), so this is
+/// a concrete point-to-point search bounded by its target.
 pub const DEFAULT_PAIR_SEARCH_DEPTH: usize = 2;
 
-/// Default path-search depth when only one side of a culprit triple is
-/// known (an undirected exploration with no fixed goal — more expensive per
-/// level, so shallower by default).
-pub const DEFAULT_ANCHOR_SEARCH_DEPTH: usize = 1;
+/// Default for `result_limit`: a relaxed query (especially one whose paths
+/// were combined via `|` alternation) can match far more broadly than the
+/// original, so its row count is capped by default rather than left
+/// unbounded.
+pub const DEFAULT_RESULT_LIMIT: usize = 50_000;
 
-/// What a broken triple's subject/object resolved to, for one binding of
-/// the rest of the query. Both sides resolving gives a concrete
-/// point-to-point path search; only one resolving still gives *something*
-/// to search outward from, just without a specific target.
-#[derive(PartialEq, Eq, Clone, Hash)]
-enum BoundEndpoint {
-    Pair(Term, Term),
-    SubjectOnly(Term),
-    ObjectOnly(Term),
+/// Default for `timeout`: the query work needed to relax one culprit
+/// combination (resolving endpoints, verifying a candidate fix) is normally
+/// well under this; five seconds is enough headroom for that while still
+/// bounding the rare combination whose reduced query turns into a much
+/// larger join than the original.
+pub const DEFAULT_RELAX_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Namespace prefixes [`NamespaceScope::default`] restricts path search to:
+/// the building-automation ontologies (Brick, ASHRAE 223P, RDFS, QUDT) this
+/// tool is normally used against. Ported from the Python implementation's
+/// `_RELAX_NAMESPACES`.
+pub const DEFAULT_RELAX_NAMESPACES: &[&str] = &[
+    "https://brickschema.org/schema/Brick#", // brick:
+    "https://brickschema.org/schema/Brick/", // ref: (covers both ref# and bare Brick/)
+    "http://data.ashrae.org/standard223#",   // s223:
+    "http://www.w3.org/2000/01/rdf-schema#", // rdfs:
+    "http://qudt.org/schema/qudt/",          // qudt:
+];
+
+/// Which predicate namespaces path search is allowed to traverse when
+/// looking for a real path between a broken triple's bound endpoints. A
+/// real edge whose predicate falls outside every allowed namespace is
+/// simply invisible to the search, even if it would otherwise connect the
+/// two endpoints.
+#[derive(Clone)]
+pub enum NamespaceScope {
+    /// Only follow edges whose predicate IRI starts with one of these
+    /// prefixes.
+    Only(Vec<String>),
+    /// No restriction: any real predicate found in the store is fair game
+    /// (the original behavior, before namespace scoping existed).
+    Unrestricted,
 }
+
+impl Default for NamespaceScope {
+    /// Restricts to [`DEFAULT_RELAX_NAMESPACES`] — the common case for this
+    /// tool's building-automation use case, where a real but out-of-domain
+    /// predicate (e.g. an ad hoc `ex:` edge in a hand-authored graph) is
+    /// rarely a fix anyone actually wants suggested.
+    fn default() -> Self {
+        NamespaceScope::Only(DEFAULT_RELAX_NAMESPACES.iter().map(|ns| ns.to_string()).collect())
+    }
+}
+
+impl NamespaceScope {
+    fn as_filter(&self) -> Option<&[String]> {
+        match self {
+            NamespaceScope::Only(namespaces) => Some(namespaces),
+            NamespaceScope::Unrestricted => None,
+        }
+    }
+}
+
+/// A broken triple's subject and object, both resolved for one binding of
+/// the rest of the query — the concrete point-to-point pair path search
+/// runs between.
+type BoundEndpoint = (Term, Term);
 
 /// One triple within a relaxed culprit combination, and what path search
 /// found for it specifically.
@@ -89,6 +155,22 @@ pub struct RelaxedCulprit {
     /// Row count of `relaxed_query` when re-executed. Zero if no combined
     /// relaxation was built, or it still returns nothing.
     pub row_count: usize,
+    /// The original query with every triple in this combination simply
+    /// removed — no path substitution, so it isn't a real fix (it silently
+    /// drops a constraint rather than relaxing it) and its rows shouldn't
+    /// be trusted as answers. Always present, and its text alone needs no
+    /// store access to build, so it's there even if `timeout` cuts off
+    /// everything else for this combination. Useful as a fallback when
+    /// `relaxed_query` is `None` or still returns nothing, so the caller
+    /// isn't left with no query at all.
+    pub pruned_query: String,
+    /// Row count of `pruned_query` when re-executed. Guaranteed non-empty
+    /// under normal operation — an empty result here would mean this
+    /// combination was never a genuine culprit in the first place (see the
+    /// diagnosis module docs) — *except* when `timeout` cuts off the
+    /// verification itself before it can complete, in which case this falls
+    /// back to `0` even though `pruned_query` is still known to return rows.
+    pub pruned_row_count: usize,
 }
 
 /// A `FILTER` flagged by ablation as excluding rows. Reported, not relaxed:
@@ -107,12 +189,22 @@ pub struct RelaxReport {
 }
 
 /// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`],
-/// [`DEFAULT_SAMPLE_LIMIT`], and adaptive per-endpoint path-search depth
-/// (see [`diagnose_and_relax`]), and attempts to relax each broken culprit
+/// [`DEFAULT_SAMPLE_LIMIT`], [`DEFAULT_PAIR_SEARCH_DEPTH`],
+/// [`NamespaceScope::default`] (restricted to [`DEFAULT_RELAX_NAMESPACES`]),
+/// and [`DEFAULT_RELAX_TIMEOUT`], and attempts to relax each broken culprit
 /// combination found. A convenient default for callers who don't need to
 /// tune the search.
 pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<RelaxReport> {
-    diagnose_and_relax(query_text, store, DEFAULT_ABLATION_DEPTH, None, Some(DEFAULT_SAMPLE_LIMIT))
+    diagnose_and_relax(
+        query_text,
+        store,
+        DEFAULT_ABLATION_DEPTH,
+        None,
+        Some(DEFAULT_SAMPLE_LIMIT),
+        Some(DEFAULT_RESULT_LIMIT),
+        NamespaceScope::default(),
+        Some(DEFAULT_RELAX_TIMEOUT),
+    )
 }
 
 /// Diagnoses `query_text` against `store` and attempts to relax each broken
@@ -124,32 +216,56 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
 /// three, and so on up to `ablation_depth`.
 ///
 /// `max_depth` bounds the forward/inverse graph-path search itself. `None`
-/// (the default, see [`diagnose_and_relax_default`]) uses an adaptive depth
-/// per endpoint instead of one fixed value: [`DEFAULT_PAIR_SEARCH_DEPTH`]
-/// when a culprit triple's subject and object are both known (a concrete,
-/// target-bounded search), or the shallower [`DEFAULT_ANCHOR_SEARCH_DEPTH`]
-/// when only one side is known (an undirected exploration with no fixed
-/// goal, so more expensive per level). Passing `Some(n)` overrides both
-/// cases uniformly.
+/// (the default, see [`diagnose_and_relax_default`]) uses
+/// [`DEFAULT_PAIR_SEARCH_DEPTH`]; passing `Some(n)` overrides it.
 ///
 /// `sample_limit` caps how many of a culprit's bound endpoints are searched
 /// for a path, or `None` to search every distinct endpoint found. Filters
 /// flagged by diagnosis are reported as-is, with no relaxation attempted.
+///
+/// `result_limit` caps how many rows a relaxed query's `LIMIT` allows (only
+/// tightening one already present in the original query, never loosening
+/// it); `None` leaves it unbounded. Defaults to [`DEFAULT_RESULT_LIMIT`] via
+/// [`diagnose_and_relax_default`], since a relaxed path (especially an
+/// alternation of several distinct paths) can match far more broadly than
+/// the original triple did.
+///
+/// `namespace_scope` restricts which predicates path search is allowed to
+/// traverse (see [`NamespaceScope`]); pass [`NamespaceScope::Unrestricted`]
+/// to search any real predicate found in the store, with no restriction.
+///
+/// `timeout` bounds the SPARQL query work needed to relax *each* culprit
+/// combination (resolving endpoints, verifying a candidate fix) — not
+/// diagnosis, and not path search itself, which never touches the query
+/// engine (see the module docs). A combination that can't finish within its
+/// budget falls back to [`RelaxedCulprit::pruned_query`] rather than hanging
+/// or failing the whole call. Defaults to [`DEFAULT_RELAX_TIMEOUT`] via
+/// [`diagnose_and_relax_default`]; pass `None` to leave it unbounded.
 pub fn diagnose_and_relax(
     query_text: &str,
     store: &Store,
     ablation_depth: usize,
     max_depth: Option<usize>,
     sample_limit: Option<usize>,
+    result_limit: Option<usize>,
+    namespace_scope: NamespaceScope,
+    timeout: Option<Duration>,
 ) -> Result<RelaxReport> {
-    let diagnosis = diagnose(query_text, store, ablation_depth)?;
     let query = SparqlParser::new().parse_query(query_text)?;
+    ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
+    let diagnosis = diagnose_parsed(query_text, &query, &pattern, store, ablation_depth)?;
+    let allowed_namespaces = namespace_scope.as_filter();
 
+    // Every culprit combination is relaxed independently against the same
+    // read-only `store`, so search them all in parallel. Each gets its own
+    // fresh `timeout` budget, computed from the moment its own relaxation
+    // work starts rather than shared off one call-wide clock — a slow
+    // combination's budget shouldn't eat into a different combination's.
     let results = diagnosis
         .culprits
-        .iter()
-        .map(|culprit| relax_combo(&query, &pattern, culprit, store, max_depth, sample_limit))
+        .par_iter()
+        .map(|culprit| relax_combo(&query, &pattern, culprit, store, max_depth, sample_limit, result_limit, allowed_namespaces, timeout))
         .collect::<Result<Vec<_>>>()?;
 
     let filter_results = diagnosis
@@ -164,24 +280,55 @@ pub fn diagnose_and_relax(
     Ok(RelaxReport { original_row_count: diagnosis.original_row_count, results, filter_results })
 }
 
+/// Every triple in a culprit combination removed together, the endpoints
+/// that resolves for each, and the pruned fallback built from the same
+/// reduced pattern (see [`RelaxedCulprit::pruned_query`]).
+struct BoundEndpoints {
+    per_triple: Vec<Vec<BoundEndpoint>>,
+    pruned_query: String,
+    pruned_row_count: usize,
+}
+
 /// Removes every triple in `culprit` together (mirroring how diagnosis
 /// found it) and resolves each triple's subject/object against the
-/// resulting rows, one endpoint list per triple in `culprit.triples`.
+/// resulting rows, one endpoint list per triple in `culprit.triples`. A row
+/// that only resolves one side of a triple contributes nothing — see the
+/// module docs on why one-sided endpoints aren't searched.
+///
+/// `deadline` bounds the row materialization needed for endpoint binding —
+/// the query most likely to balloon into a large join once the broken
+/// triple(s) are out of the way (see the module docs). If it's hit, this
+/// returns empty endpoint lists (search then finds nothing, same as if no
+/// path existed) rather than propagating an error, so one slow combination
+/// degrades gracefully instead of failing the whole call. `pruned_query`'s
+/// text needs no store access at all, so it's still built and returned
+/// either way; `pruned_row_count` falls back to `0` only in this same
+/// timeout case (see its doc comment).
 fn bind_endpoints(
     query: &Query,
     pattern: &GraphPattern,
     culprit: &Culprit,
     store: &Store,
-) -> Result<Vec<Vec<BoundEndpoint>>> {
-    let reduced_pattern = culprit
-        .triples
-        .iter()
-        .try_fold(pattern.clone(), |p, t| crate::algebra::remove_triple(&p, t))
-        .expect("culprit triples came from diagnosing this same query, so they must be present");
-    let reduced_text = with_pattern(query, reduced_pattern).to_string();
-    let reduced_rows = run_select(&reduced_text, store)?;
+    result_limit: Option<usize>,
+    deadline: Option<Instant>,
+) -> Result<BoundEndpoints> {
+    let reduced_pattern = culprit.triples.iter().try_fold(pattern.clone(), |p, t| crate::algebra::remove_triple(&p, t)).ok_or_else(|| {
+        RelaxError::CulpritNotFound(culprit.triples.first().map(ToString::to_string).unwrap_or_default())
+    })?;
 
-    Ok(culprit
+    let mut pruned_pattern = reduced_pattern.clone();
+    if let Some(limit) = result_limit {
+        pruned_pattern = with_limit(pruned_pattern, limit);
+    }
+    let pruned_query = with_pattern(query, pruned_pattern).to_string();
+
+    let reduced_query = with_pattern(query, reduced_pattern);
+    let Some(reduced_rows) = run_select_query_with_deadline(reduced_query, store, deadline)? else {
+        let per_triple = culprit.triples.iter().map(|_| Vec::new()).collect();
+        return Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count: 0 });
+    };
+
+    let per_triple = culprit
         .triples
         .iter()
         .map(|triple| {
@@ -189,42 +336,28 @@ fn bind_endpoints(
             for row in &reduced_rows {
                 let s = resolve_term_pattern(&triple.subject, row);
                 let o = resolve_term_pattern(&triple.object, row);
-                let endpoint = match (s, o) {
-                    (Some(s), Some(o)) => BoundEndpoint::Pair(s, o),
-                    (Some(s), None) => BoundEndpoint::SubjectOnly(s),
-                    (None, Some(o)) => BoundEndpoint::ObjectOnly(o),
-                    (None, None) => continue,
-                };
+                let (Some(s), Some(o)) = (s, o) else { continue };
+                let endpoint = (s, o);
                 if !endpoints.contains(&endpoint) {
                     endpoints.push(endpoint);
                 }
             }
             endpoints
         })
-        .collect())
+        .collect();
+
+    let pruned_row_count = result_limit.map_or(reduced_rows.len(), |limit| reduced_rows.len().min(limit));
+    Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count })
 }
 
-/// Candidate hop sequences (subject → object) for one bound endpoint:
-/// a concrete point-to-point search when both sides are known, or an
-/// undirected exploration from whichever single side is known otherwise.
-/// `max_depth_override` of `None` picks [`DEFAULT_PAIR_SEARCH_DEPTH`] or
-/// [`DEFAULT_ANCHOR_SEARCH_DEPTH`] depending on which kind of endpoint this
-/// is; `Some(n)` uses `n` for either kind.
-fn candidates_for(store: &Store, endpoint: &BoundEndpoint, max_depth_override: Option<usize>) -> Vec<Vec<Hop>> {
-    match endpoint {
-        BoundEndpoint::Pair(s, o) => {
-            let depth = max_depth_override.unwrap_or(DEFAULT_PAIR_SEARCH_DEPTH);
-            find_path(store, s, o, depth).into_iter().collect()
-        }
-        BoundEndpoint::SubjectOnly(s) => {
-            let depth = max_depth_override.unwrap_or(DEFAULT_ANCHOR_SEARCH_DEPTH);
-            explore_from(store, s, depth)
-        }
-        BoundEndpoint::ObjectOnly(o) => {
-            let depth = max_depth_override.unwrap_or(DEFAULT_ANCHOR_SEARCH_DEPTH);
-            explore_from(store, o, depth).iter().map(|hops| reverse_hops(hops)).collect()
-        }
-    }
+/// Candidate hop sequences (subject → object) for one bound endpoint pair.
+/// `max_depth_override` of `None` picks [`DEFAULT_PAIR_SEARCH_DEPTH`];
+/// `Some(n)` uses `n` instead. `allowed_namespaces` restricts which
+/// predicates the search may traverse (see [`NamespaceScope`]).
+fn candidates_for(store: &Store, endpoint: &BoundEndpoint, max_depth_override: Option<usize>, allowed_namespaces: Option<&[String]>) -> Vec<Vec<Hop>> {
+    let (s, o) = endpoint;
+    let depth = max_depth_override.unwrap_or(DEFAULT_PAIR_SEARCH_DEPTH);
+    find_path(store, s, o, depth, allowed_namespaces).into_iter().collect()
 }
 
 fn relax_combo(
@@ -234,62 +367,124 @@ fn relax_combo(
     store: &Store,
     max_depth: Option<usize>,
     sample_limit: Option<usize>,
+    result_limit: Option<usize>,
+    allowed_namespaces: Option<&[String]>,
+    timeout: Option<Duration>,
 ) -> Result<RelaxedCulprit> {
-    let bound_endpoints = bind_endpoints(query, pattern, culprit, store)?;
+    // One budget for all of this combination's query work — resolving
+    // endpoints and (later) verifying the candidate fix both draw from it,
+    // rather than each getting its own fresh `timeout`.
+    let deadline = timeout.map(|t| Instant::now() + t);
 
-    let mut relaxed_triples = Vec::new();
-    let mut paths = Vec::new(); // Some(path_expr) per triple, parallel to culprit.triples
+    let bound = bind_endpoints(query, pattern, culprit, store, result_limit, deadline)?;
+    let pruned_query = bound.pruned_query;
+    let pruned_row_count = bound.pruned_row_count;
 
-    for (triple, endpoints) in culprit.triples.iter().zip(&bound_endpoints) {
-        let sampled: Vec<&BoundEndpoint> = match sample_limit {
-            Some(limit) => endpoints.iter().take(limit).collect(),
-            None => endpoints.iter().collect(),
-        };
+    // Every triple in the combination is searched independently (and, within
+    // that, every sampled bound endpoint), so both levels run in parallel —
+    // each is just reads against the same `store`.
+    let per_triple: Vec<(RelaxedTriple, Option<PropertyPathExpression>)> = culprit
+        .triples
+        .par_iter()
+        .zip(bound.per_triple.par_iter())
+        .map(|(triple, endpoints)| {
+            let sampled: Vec<&BoundEndpoint> = match sample_limit {
+                Some(limit) => endpoints.iter().take(limit).collect(),
+                None => endpoints.iter().collect(),
+            };
 
-        let mut candidates: Vec<Vec<Hop>> = Vec::new();
-        for endpoint in &sampled {
-            for hops in candidates_for(store, endpoint, max_depth) {
-                if !hops.is_empty() && !candidates.contains(&hops) {
+            let found: Vec<Vec<Hop>> = sampled
+                .par_iter()
+                .flat_map(|endpoint| candidates_for(store, endpoint, max_depth, allowed_namespaces).into_par_iter())
+                .filter(|hops| !hops.is_empty())
+                .collect();
+
+            let mut candidates: Vec<Vec<Hop>> = Vec::new();
+            for hops in found {
+                if !candidates.contains(&hops) {
                     candidates.push(hops);
                 }
             }
-        }
-        candidates.sort_by_key(Vec::len);
+            candidates.sort_by_key(Vec::len);
 
-        let path_expr = combine_as_alternatives(&candidates);
-        relaxed_triples.push(RelaxedTriple {
-            triple_text: triple.to_string(),
-            hop_alternatives: candidates,
-            path_text: path_expr.as_ref().map(PropertyPathExpression::to_string),
-        });
-        paths.push(path_expr);
-    }
+            let path_expr = combine_as_alternatives(&candidates);
+            let relaxed_triple = RelaxedTriple {
+                triple_text: triple.to_string(),
+                hop_alternatives: candidates,
+                path_text: path_expr.as_ref().map(PropertyPathExpression::to_string),
+            };
+            (relaxed_triple, path_expr)
+        })
+        .collect();
+
+    let (relaxed_triples, paths): (Vec<_>, Vec<_>) = per_triple.into_iter().unzip();
 
     // Only build a combined relaxed query if every triple in the
     // combination had a discoverable path — otherwise the ones without one
     // are still broken and the query would still fail regardless.
     let all_found = paths.iter().all(Option::is_some);
     if !all_found {
-        return Ok(RelaxedCulprit { found_at_depth: culprit.depth, triples: relaxed_triples, relaxed_query: None, row_count: 0 });
+        return Ok(RelaxedCulprit {
+            found_at_depth: culprit.depth,
+            triples: relaxed_triples,
+            relaxed_query: None,
+            row_count: 0,
+            pruned_query,
+            pruned_row_count,
+        });
     }
 
     let mut relaxed_pattern = pattern.clone();
     for (triple, path_expr) in culprit.triples.iter().zip(paths.into_iter().flatten()) {
         let Some(next) = replace_triple_with_path(&relaxed_pattern, triple, path_expr) else {
-            return Ok(RelaxedCulprit { found_at_depth: culprit.depth, triples: relaxed_triples, relaxed_query: None, row_count: 0 });
+            return Ok(RelaxedCulprit {
+                found_at_depth: culprit.depth,
+                triples: relaxed_triples,
+                relaxed_query: None,
+                row_count: 0,
+                pruned_query,
+                pruned_row_count,
+            });
         };
         relaxed_pattern = next;
     }
 
-    let relaxed_text = with_pattern(query, relaxed_pattern).to_string();
-    let row_count = run_select(&relaxed_text, store).map(|rows| rows.len()).unwrap_or(0);
+    if let Some(limit) = result_limit {
+        relaxed_pattern = with_limit(relaxed_pattern, limit);
+    }
+    let relaxed_query_obj = with_pattern(query, relaxed_pattern);
+    let relaxed_text = relaxed_query_obj.to_string();
 
-    Ok(RelaxedCulprit {
-        found_at_depth: culprit.depth,
-        triples: relaxed_triples,
-        relaxed_query: Some(relaxed_text),
-        row_count,
-    })
+    // A candidate fix found in time but too expensive to *verify* in what's
+    // left of the budget falls back the same way an unfound path does:
+    // `relaxed_query: None`, so the caller looks at `pruned_query` instead
+    // of trusting an unconfirmed `row_count`.
+    match run_select_query_with_deadline(relaxed_query_obj, store, deadline) {
+        Ok(Some(rows)) => Ok(RelaxedCulprit {
+            found_at_depth: culprit.depth,
+            triples: relaxed_triples,
+            relaxed_query: Some(relaxed_text),
+            row_count: rows.len(),
+            pruned_query,
+            pruned_row_count,
+        }),
+        Ok(None) => Ok(RelaxedCulprit {
+            found_at_depth: culprit.depth,
+            triples: relaxed_triples,
+            relaxed_query: None,
+            row_count: 0,
+            pruned_query,
+            pruned_row_count,
+        }),
+        Err(_) => Ok(RelaxedCulprit {
+            found_at_depth: culprit.depth,
+            triples: relaxed_triples,
+            relaxed_query: Some(relaxed_text),
+            row_count: 0,
+            pruned_query,
+            pruned_row_count,
+        }),
+    }
 }
 
 /// Folds every candidate hop sequence into one `PropertyPathExpression`,

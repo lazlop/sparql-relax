@@ -5,5 +5,6 @@ edition = "2024"
 
 [dependencies]
 oxigraph = { version = "0.5.9", default-features = false }
+rayon = "1.12.0"
 spargebra = { version = "0.4.6", features = ["sep-0006"] }
 thiserror = "2.0.18"

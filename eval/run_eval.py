@@ -42,6 +42,11 @@ Usage:
   # A couple of specific CSVs, a bigger sample, custom output path
   python3 run_eval.py --csv "Experiment_Results/DA-KGQA/o3-mini.csv" \\
       --sample-per-csv 100 --output my_eval.csv
+
+  # Diagnose-only: skip relaxation (path search + candidate scoring)
+  # entirely, just report which triples/filters are flagged as culprits.
+  # Much cheaper per row than the full pass.
+  python3 run_eval.py --diagnose-only
 """
 
 from __future__ import annotations
@@ -51,7 +56,10 @@ import csv
 import glob
 import random
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -87,6 +95,35 @@ def _value_set(query_text: str, store: pyoxigraph.Store, limit: Optional[int]) -
         return None, str(exc)
 
 
+def _get_row_sets(query_text: str, store: pyoxigraph.Store, limit: Optional[int]) -> tuple[Optional[list[frozenset]], Optional[str]]:
+    """Runs a SELECT query and returns a list of frozensets, one per row,
+    containing all bound values in that row."""
+    q = query_text
+    if limit and "LIMIT" not in query_text.upper():
+        q = f"{query_text}\nLIMIT {limit}"
+    try:
+        solutions = store.query(q)
+        row_sets = []
+        for solution in solutions:
+            values = frozenset(str(term) for term in solution.values() if term is not None)
+            row_sets.append(values)
+        return row_sets, None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _row_coverage_stats(res_sets: list[frozenset], gt_sets: list[frozenset]) -> tuple[int, int]:
+    """Returns (gt_rows_covered, excess_result_rows)."""
+    if not gt_sets:
+        return 0, len(res_sets) if res_sets else 0
+    if not res_sets:
+        return 0, 0
+
+    gt_covered = sum(1 for g in gt_sets if any(r <= g for r in res_sets))
+    excess = sum(1 for r in res_sets if not any(r <= g for g in gt_sets))
+    return gt_covered, excess
+
+
 def value_set_f1(query_text: str, gt_values: set, store: pyoxigraph.Store, limit: Optional[int]) -> tuple[float, Optional[str]]:
     """Scores `query_text`'s value set against a precomputed ground-truth
     value set. A query that errors scores 0.0 (matching the prior Python
@@ -119,6 +156,15 @@ class BuildingCache:
         self.buildings_dir = buildings_dir
         self._stores: dict[str, Optional[pyoxigraph.Store]] = {}
         self._texts: dict[str, Optional[str]] = {}
+        # Guards the check-and-load below: with concurrent rows (--workers > 1),
+        # two threads racing to first-load the same building would otherwise
+        # parse the same TTL twice.
+        self._lock = threading.Lock()
+
+    def _ensure_loaded(self, building: str) -> None:
+        with self._lock:
+            if building not in self._stores:
+                self._load(building)
 
     def _load(self, building: str) -> None:
         path = self.buildings_dir / f"{building}.ttl"
@@ -136,13 +182,11 @@ class BuildingCache:
         self._texts[building] = text
 
     def store(self, building: str) -> Optional[pyoxigraph.Store]:
-        if building not in self._stores:
-            self._load(building)
+        self._ensure_loaded(building)
         return self._stores[building]
 
     def text(self, building: str) -> Optional[str]:
-        if building not in self._texts:
-            self._load(building)
+        self._ensure_loaded(building)
         return self._texts[building]
 
 
@@ -172,12 +216,24 @@ def load_rows(csv_path: str) -> pd.DataFrame:
 OUTPUT_FIELDS = [
     "source_csv", "query_id", "question", "building", "approach", "model_name",
     "skipped", "score_error",
-    "original_f1",
-    "num_bgp_culprits", "num_filter_culprits",
-    "best_found_at_depth", "best_relaxed_f1", "delta_f1",
+    "original_f1", "original_row_coverage", "original_excess_rows",
+    "num_bgp_culprits", "num_filter_culprits", "culprit_triples", "culprit_depths",
+    "best_found_at_depth", "best_relaxed_f1", "best_relaxed_row_coverage", "best_relaxed_excess_rows", "delta_f1",
     "best_relaxed_triples", "best_relaxed_path_texts", "best_relaxed_query",
     "diagnose_error", "elapsed_sec",
 ]
+
+
+def _blank_relax_fields() -> dict:
+    """The relaxation-only output columns, blank: shared by every code path
+    that doesn't run (or didn't finish) the relax phase — a skipped row, a
+    diagnose-only row, or a row where diagnosis found culprits but no
+    relaxed_query was built for any of them."""
+    return {
+        "best_found_at_depth": "", "best_relaxed_f1": "", "best_relaxed_row_coverage": "",
+        "best_relaxed_excess_rows": "", "delta_f1": "",
+        "best_relaxed_triples": "", "best_relaxed_path_texts": "", "best_relaxed_query": "",
+    }
 
 
 @dataclass
@@ -188,6 +244,8 @@ class EvalConfig:
     max_depth: Optional[int]
     sample_limit: Optional[int]
     verbose: bool
+    timeout: float
+    diagnose_only: bool
 
 
 def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig) -> Optional[dict]:
@@ -214,20 +272,39 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     if gt_values is None:
         gt_values = set()  # ground truth itself failed to run; treat as empty
 
+    gt_sets, _ = _get_row_sets(gt_query, store, cfg.limit)
+    if gt_sets is None:
+        gt_sets = []
+
     original_f1, score_error = value_set_f1(gen_query, gt_values, store, cfg.limit)
+    
+    gen_sets, _ = _get_row_sets(gen_query, store, cfg.limit)
+    if gen_sets is None:
+        gen_sets = []
+    orig_cov, orig_exc = _row_coverage_stats(gen_sets, gt_sets)
+
     t_score = round(time.monotonic() - t_score0, 3)
     if cfg.verbose:
-        print(f"    scored original+GT in {t_score}s -> original_f1={original_f1:.3f}", flush=True)
+        print(f"    scored original+GT in {t_score}s -> original_f1={original_f1:.3f}, cov={orig_cov}, exc={orig_exc}", flush=True)
 
     if original_f1 >= cfg.threshold:
         return {
             **base, "skipped": True, "score_error": score_error or gt_error or "",
             "original_f1": round(original_f1, 6),
-            "num_bgp_culprits": "", "num_filter_culprits": "",
-            "best_found_at_depth": "", "best_relaxed_f1": "", "delta_f1": "",
-            "best_relaxed_triples": "", "best_relaxed_path_texts": "", "best_relaxed_query": "",
+            "original_row_coverage": orig_cov, "original_excess_rows": orig_exc,
+            "num_bgp_culprits": "", "num_filter_culprits": "", "culprit_triples": "", "culprit_depths": "",
+            **_blank_relax_fields(),
             "diagnose_error": "", "elapsed_sec": "",
         }
+
+    common = {
+        **base, "skipped": False, "score_error": score_error or gt_error or "",
+        "original_f1": round(original_f1, 6),
+        "original_row_coverage": orig_cov, "original_excess_rows": orig_exc,
+    }
+
+    if cfg.diagnose_only:
+        return _diagnose_only_row(text, gen_query, cfg, common, base["query_id"], building)
 
     if cfg.verbose:
         print(f"  [{base['query_id']}] {building}  original_f1={original_f1:.3f} -> relaxing...", flush=True)
@@ -238,17 +315,35 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     best = None
     num_bgp_culprits = 0
     num_filter_culprits = 0
+    culprit_triples = culprit_depths = ""
     try:
         t_relax0 = time.monotonic()
-        report = sparql_relax_rs.diagnose_and_relax(
+        # A handful of queries turn out to need a genuinely expensive
+        # reduced-query evaluation (e.g. removing the one type-constraining
+        # triple leaves the rest of the query essentially unconstrained,
+        # forcing a large join) — that's a real SPARQL execution cost, not
+        # something our search algorithm can avoid. Bound it with a timeout
+        # rather than letting one pathological row stall the whole batch.
+        # A fresh single-worker executor per row (rather than a shared pool)
+        # means an abandoned/still-running worker from a timed-out row can
+        # never block a later row's submission.
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(
+            sparql_relax_rs.diagnose_and_relax,
             text, gen_query,
             ablation_depth=cfg.ablation_depth,
             max_depth=cfg.max_depth,
             sample_limit=cfg.sample_limit,
         )
+        try:
+            report = future.result(timeout=cfg.timeout)
+        finally:
+            executor.shutdown(wait=False)
         t_relax = round(time.monotonic() - t_relax0, 3)
         num_bgp_culprits = len(report.results)
         num_filter_culprits = len(report.filter_results)
+        culprit_triples = " | ".join(" && ".join(t.triple for t in c.triples) for c in report.results)
+        culprit_depths = " | ".join(str(c.found_at_depth) for c in report.results)
         if cfg.verbose:
             print(
                 f"    diagnose_and_relax took {t_relax}s -> "
@@ -265,6 +360,10 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
                 best = culprit
         if cfg.verbose:
             print(f"    scored {num_bgp_culprits} candidate(s) in {round(time.monotonic() - t_candidates0, 3)}s", flush=True)
+    except FutureTimeoutError:
+        diagnose_error = f"timed out after {cfg.timeout}s"
+        if cfg.verbose:
+            print(f"    diagnose_and_relax timed out after {cfg.timeout}s (abandoned; moving on)", flush=True)
     except Exception as exc:  # noqa: BLE001 - keep going across the whole batch
         diagnose_error = str(exc)
         if cfg.verbose:
@@ -276,25 +375,82 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
 
     if best is None:
         return {
-            **base, "skipped": False, "score_error": score_error or gt_error or "",
-            "original_f1": round(original_f1, 6),
+            **common,
             "num_bgp_culprits": num_bgp_culprits, "num_filter_culprits": num_filter_culprits,
-            "best_found_at_depth": "", "best_relaxed_f1": "", "delta_f1": "",
-            "best_relaxed_triples": "", "best_relaxed_path_texts": "", "best_relaxed_query": "",
+            "culprit_triples": culprit_triples, "culprit_depths": culprit_depths,
+            **_blank_relax_fields(),
             "diagnose_error": diagnose_error, "elapsed_sec": elapsed,
         }
 
+    # Calculate coverage for the best relaxed query
+    best_sets, _ = _get_row_sets(best.relaxed_query, store, cfg.limit)
+    if best_sets is None:
+        best_sets = []
+    best_cov, best_exc = _row_coverage_stats(best_sets, gt_sets)
+
     return {
-        **base, "skipped": False, "score_error": score_error or gt_error or "",
-        "original_f1": round(original_f1, 6),
+        **common,
         "num_bgp_culprits": num_bgp_culprits, "num_filter_culprits": num_filter_culprits,
+        "culprit_triples": culprit_triples, "culprit_depths": culprit_depths,
         "best_found_at_depth": best.found_at_depth,
         "best_relaxed_f1": round(best_f1, 6),
+        "best_relaxed_row_coverage": best_cov, "best_relaxed_excess_rows": best_exc,
         "delta_f1": round(best_f1 - original_f1, 6),
         "best_relaxed_triples": " | ".join(t.triple for t in best.triples),
         "best_relaxed_path_texts": " | ".join(t.path_text or "" for t in best.triples),
         "best_relaxed_query": best.relaxed_query,
         "diagnose_error": diagnose_error, "elapsed_sec": elapsed,
+    }
+
+
+def _diagnose_only_row(text: str, gen_query: str, cfg: EvalConfig, common: dict, query_id: str, building: str) -> dict:
+    """Runs just `diagnose()` — no endpoint resolution, no path search, no
+    candidate scoring — and reports which triples/filters were flagged as
+    culprits. Used by `--diagnose-only`, where the relax phase's cost isn't
+    wanted at all."""
+    if cfg.verbose:
+        print(f"  [{query_id}] {building}  -> diagnosing...", flush=True)
+
+    t0 = time.monotonic()
+    diagnose_error = ""
+    num_bgp_culprits = num_filter_culprits = 0
+    culprit_triples = culprit_depths = ""
+    try:
+        # Same rationale as the diagnose_and_relax timeout wrapper below:
+        # diagnosis's own reduced-query re-execution can occasionally be
+        # expensive too, and isn't internally timeout-bounded the way
+        # relaxation is.
+        executor = ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(sparql_relax_rs.diagnose, text, gen_query, depth=cfg.ablation_depth)
+        try:
+            diagnosis = future.result(timeout=cfg.timeout)
+        finally:
+            executor.shutdown(wait=False)
+        num_bgp_culprits = len(diagnosis.culprits)
+        num_filter_culprits = len(diagnosis.filter_culprits)
+        culprit_triples = " | ".join(" && ".join(c.triples) for c in diagnosis.culprits)
+        culprit_depths = " | ".join(str(c.depth) for c in diagnosis.culprits)
+        if cfg.verbose:
+            print(
+                f"    diagnose took {round(time.monotonic() - t0, 3)}s -> "
+                f"{num_bgp_culprits} triple culprit(s), {num_filter_culprits} filter culprit(s)",
+                flush=True,
+            )
+    except FutureTimeoutError:
+        diagnose_error = f"timed out after {cfg.timeout}s"
+        if cfg.verbose:
+            print(f"    diagnose timed out after {cfg.timeout}s (abandoned; moving on)", flush=True)
+    except Exception as exc:  # noqa: BLE001 - keep going across the whole batch
+        diagnose_error = str(exc)
+        if cfg.verbose:
+            print(f"    diagnose errored after {round(time.monotonic() - t0, 3)}s: {exc}", flush=True)
+
+    return {
+        **common,
+        "num_bgp_culprits": num_bgp_culprits, "num_filter_culprits": num_filter_culprits,
+        "culprit_triples": culprit_triples, "culprit_depths": culprit_depths,
+        **_blank_relax_fields(),
+        "diagnose_error": diagnose_error, "elapsed_sec": round(time.monotonic() - t0, 3),
     }
 
 
@@ -323,6 +479,32 @@ def main() -> None:
     parser.add_argument("--ablation-depth", type=int, default=3, metavar="N")
     parser.add_argument("--max-depth", type=int, default=None, metavar="N", help="Omit for the adaptive default (2 point-to-point / 1 anchor-only)")
     parser.add_argument("--sample-limit", type=int, default=5, metavar="N")
+    parser.add_argument(
+        "--diagnose-only", action="store_true",
+        help="Skip relaxation entirely: run diagnose() instead of diagnose_and_relax(), reporting "
+             "which triples/filters are flagged as culprits with no endpoint resolution, path "
+             "search, or candidate scoring. Cheaper per row and useful for iterating on ablation "
+             "diagnosis on its own. --sample-limit and --max-depth (relaxation-only knobs) are "
+             "ignored in this mode.",
+    )
+    parser.add_argument(
+        "--timeout", type=float, default=20.0, metavar="SECONDS",
+        help="Per-row cap on diagnose_and_relax (or diagnose, with --diagnose-only); a handful of "
+             "queries need a genuinely expensive reduced-query evaluation that no search-ordering "
+             "fix avoids, so this bounds worst-case latency instead of letting one row stall the "
+             "whole batch (default: 20s)",
+    )
+    parser.add_argument(
+        "--workers", type=int, default=8, metavar="N",
+        help="Number of rows to process concurrently via a thread pool (default: 8). Safe because "
+             "the Rust core releases the GIL during its search (see sparql-relax-py/src/lib.rs), so "
+             "this gives real concurrency across rows rather than fighting the GIL.",
+    )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="If --output already exists, skip rows already present in it (matched by "
+             "source_csv/query_id/building) and append rather than overwrite.",
+    )
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -339,7 +521,7 @@ def main() -> None:
     cfg = EvalConfig(
         threshold=args.threshold, limit=limit,
         ablation_depth=args.ablation_depth, max_depth=args.max_depth, sample_limit=args.sample_limit,
-        verbose=args.verbose,
+        verbose=args.verbose, timeout=args.timeout, diagnose_only=args.diagnose_only,
     )
     skip_buildings = set(args.skip_buildings)
     rng = random.Random(args.seed)
@@ -362,48 +544,82 @@ def main() -> None:
     if args.max_queries is not None:
         work_items = work_items[: args.max_queries]
 
+    out_path = Path(args.output)
+    resuming = args.resume and out_path.exists()
+    if resuming:
+        with out_path.open("r", newline="", encoding="utf-8") as f:
+            done_keys = {
+                (existing.get("source_csv", ""), existing.get("query_id", ""), existing.get("building", ""))
+                for existing in csv.DictReader(f)
+            }
+        before = len(work_items)
+        work_items = [
+            (row, csv_path) for row, csv_path in work_items
+            if (csv_path, str(row.get("query_id", "")), str(row.get("building", ""))) not in done_keys
+        ]
+        print(
+            f"  --resume: {len(done_keys)} rows already in {out_path}, "
+            f"{before - len(work_items)} skipped, {len(work_items)} remaining",
+            flush=True,
+        )
+
     print(f"\n{'=' * 70}\n  Total rows to process: {len(work_items)}\n{'=' * 70}\n", flush=True)
 
-    out_path = Path(args.output)
-    with out_path.open("w", newline="", encoding="utf-8") as f:
+    total = len(work_items)
+    file_mode = "a" if resuming else "w"
+    with out_path.open(file_mode, newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
-        writer.writeheader()
+        if not resuming:
+            writer.writeheader()
 
-        n_processed = n_skipped = n_relaxed_found = n_improved = 0
+        n_processed = n_skipped = n_relaxed_found = n_improved = n_with_culprits = 0
         deltas: list[float] = []
         t_start = time.monotonic()
 
-        for i, (row, csv_path) in enumerate(work_items, start=1):
-            out_row = process_row(row, csv_path, cache, cfg)
-            if out_row is None:
-                continue
-            writer.writerow(out_row)
-            f.flush()
-            n_processed += 1
-            if out_row["skipped"]:
-                n_skipped += 1
-            elif out_row["best_relaxed_f1"] != "":
-                n_relaxed_found += 1
-                delta = out_row["delta_f1"]
-                deltas.append(delta)
-                if delta > 0:
-                    n_improved += 1
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(process_row, row, csv_path, cache, cfg) for row, csv_path in work_items]
+            for i, future in enumerate(as_completed(futures), start=1):
+                out_row = future.result()
+                if out_row is None:
+                    continue
+                writer.writerow(out_row)
+                f.flush()
+                n_processed += 1
+                if out_row["skipped"]:
+                    n_skipped += 1
+                else:
+                    if out_row["num_bgp_culprits"] or out_row["num_filter_culprits"]:
+                        n_with_culprits += 1
+                    if out_row["best_relaxed_f1"] != "":
+                        n_relaxed_found += 1
+                        delta = out_row["delta_f1"]
+                        deltas.append(delta)
+                        if delta > 0:
+                            n_improved += 1
 
-            if i % 25 == 0 or i == len(work_items):
-                print(f"  [{i}/{len(work_items)}] processed={n_processed} skipped={n_skipped} "
-                      f"relaxed={n_relaxed_found} improved={n_improved}", flush=True)
+                if i % 25 == 0 or i == total:
+                    if cfg.diagnose_only:
+                        print(f"  [{i}/{total}] processed={n_processed} skipped={n_skipped} "
+                              f"with_culprits={n_with_culprits}", flush=True)
+                    else:
+                        print(f"  [{i}/{total}] processed={n_processed} skipped={n_skipped} "
+                              f"relaxed={n_relaxed_found} improved={n_improved}", flush=True)
 
     elapsed_total = round(time.monotonic() - t_start, 1)
     print(f"\n{'=' * 70}", flush=True)
     print(f"Done in {elapsed_total}s. Results written to: {out_path}", flush=True)
     print(f"  processed:        {n_processed}", flush=True)
     print(f"  already >= threshold (skipped): {n_skipped}", flush=True)
-    print(f"  relaxation attempted:  {n_processed - n_skipped}", flush=True)
-    print(f"  relaxation found a fix (any culprit with a path): {n_relaxed_found}", flush=True)
-    print(f"  strictly improved F1:  {n_improved}", flush=True)
-    if deltas:
-        avg_delta = sum(deltas) / len(deltas)
-        print(f"  avg delta_f1 among relaxed: {avg_delta:+.4f}", flush=True)
+    if cfg.diagnose_only:
+        print(f"  diagnosed:        {n_processed - n_skipped}", flush=True)
+        print(f"  rows with a culprit flagged (triple or filter): {n_with_culprits}", flush=True)
+    else:
+        print(f"  relaxation attempted:  {n_processed - n_skipped}", flush=True)
+        print(f"  relaxation found a fix (any culprit with a path): {n_relaxed_found}", flush=True)
+        print(f"  strictly improved F1:  {n_improved}", flush=True)
+        if deltas:
+            avg_delta = sum(deltas) / len(deltas)
+            print(f"  avg delta_f1 among relaxed: {avg_delta:+.4f}", flush=True)
     print(f"{'=' * 70}", flush=True)
 
 

@@ -1,0 +1,89 @@
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/DA-KGQA/gemini-flash-2.5.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/DA-KGQA/llama.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/DA-KGQA/o3-mini.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(100)/deepseek-r1.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(100)/gemini-flash-2.5.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(100)/llama.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(100)/o3-mini.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(100)/o4-mini.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(5000)/gemini-flash-2.5.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(5000)/llama.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(5000)/o3-mini.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(noKG)/gemini-flash-2.5.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(noKG)/llama.csv  (188/188 rows selected)
+  /Users/lazlopaul/Desktop/223p/experiments/sparql-relax-rs/eval/Experiment_Results/ReAct(noKG)/o3-mini.csv  (188/188 rows selected)
+  --resume: 142 rows already in current-relax-all.csv, 998 skipped, 1634 remaining
+
+======================================================================
+  Total rows to process: 1634
+======================================================================
+
+  loaded bldg11.ttl (62577 triples) in 0.17s
+  loaded b59.ttl (46376 triples) in 0.577s
+  [25/1634] processed=25 skipped=3 relaxed=0 improved=0
+  [50/1634] processed=50 skipped=7 relaxed=0 improved=0
+  loaded TUC_building.ttl (1855 triples) in 0.64s
+  [75/1634] processed=75 skipped=7 relaxed=0 improved=0
+  loaded dflexlibs_multizone.ttl (629 triples) in 0.017s
+  [100/1634] processed=100 skipped=8 relaxed=0 improved=0
+  [125/1634] processed=125 skipped=19 relaxed=0 improved=0
+  [150/1634] processed=150 skipped=35 relaxed=0 improved=0
+  [175/1634] processed=175 skipped=52 relaxed=0 improved=0
+  [200/1634] processed=200 skipped=74 relaxed=1 improved=0
+  [225/1634] processed=225 skipped=96 relaxed=2 improved=1
+  [250/1634] processed=250 skipped=113 relaxed=2 improved=1
+  [275/1634] processed=275 skipped=123 relaxed=2 improved=1
+  [300/1634] processed=300 skipped=126 relaxed=2 improved=1
+  [325/1634] processed=325 skipped=130 relaxed=3 improved=1
+  [350/1634] processed=350 skipped=136 relaxed=3 improved=1
+  [375/1634] processed=375 skipped=146 relaxed=3 improved=1
+  [400/1634] processed=400 skipped=155 relaxed=3 improved=1
+  [425/1634] processed=425 skipped=163 relaxed=4 improved=2
+  [450/1634] processed=450 skipped=175 relaxed=4 improved=2
+  [475/1634] processed=475 skipped=176 relaxed=4 improved=2
+  [500/1634] processed=500 skipped=176 relaxed=4 improved=2
+  [525/1634] processed=525 skipped=183 relaxed=4 improved=2
+  [550/1634] processed=550 skipped=193 relaxed=4 improved=2
+  [575/1634] processed=575 skipped=208 relaxed=4 improved=2
+  [600/1634] processed=600 skipped=219 relaxed=4 improved=2
+  [625/1634] processed=625 skipped=233 relaxed=4 improved=2
+  [650/1634] processed=650 skipped=258 relaxed=4 improved=2
+  [675/1634] processed=675 skipped=280 relaxed=4 improved=2
+  [700/1634] processed=700 skipped=294 relaxed=4 improved=2
+  [725/1634] processed=725 skipped=300 relaxed=4 improved=2
+  [750/1634] processed=750 skipped=300 relaxed=4 improved=2
+  [775/1634] processed=775 skipped=307 relaxed=4 improved=2
+  [800/1634] processed=800 skipped=307 relaxed=4 improved=2
+  [825/1634] processed=825 skipped=311 relaxed=4 improved=2
+  [850/1634] processed=850 skipped=318 relaxed=4 improved=2
+  [875/1634] processed=875 skipped=329 relaxed=4 improved=2
+  [900/1634] processed=900 skipped=349 relaxed=4 improved=2
+  [925/1634] processed=925 skipped=373 relaxed=4 improved=2
+  [950/1634] processed=950 skipped=397 relaxed=4 improved=2
+  [975/1634] processed=975 skipped=414 relaxed=4 improved=2
+  [1000/1634] processed=1000 skipped=422 relaxed=4 improved=2
+  [1025/1634] processed=1025 skipped=428 relaxed=4 improved=2
+  [1050/1634] processed=1050 skipped=434 relaxed=4 improved=2
+  [1075/1634] processed=1075 skipped=437 relaxed=4 improved=2
+  [1100/1634] processed=1100 skipped=437 relaxed=4 improved=2
+  [1125/1634] processed=1125 skipped=445 relaxed=4 improved=2
+  [1150/1634] processed=1150 skipped=452 relaxed=4 improved=2
+  [1175/1634] processed=1175 skipped=460 relaxed=4 improved=2
+  [1200/1634] processed=1200 skipped=462 relaxed=4 improved=2
+  [1225/1634] processed=1225 skipped=464 relaxed=4 improved=2
+  [1250/1634] processed=1250 skipped=465 relaxed=4 improved=2
+  [1275/1634] processed=1275 skipped=466 relaxed=4 improved=2
+  [1300/1634] processed=1300 skipped=466 relaxed=4 improved=2
+  [1325/1634] processed=1325 skipped=466 relaxed=4 improved=2
+  [1350/1634] processed=1350 skipped=466 relaxed=4 improved=2
+  [1375/1634] processed=1375 skipped=466 relaxed=4 improved=2
+  [1400/1634] processed=1400 skipped=466 relaxed=4 improved=2
+  [1425/1634] processed=1425 skipped=467 relaxed=4 improved=2
+  [1450/1634] processed=1450 skipped=469 relaxed=4 improved=2
+  [1475/1634] processed=1475 skipped=469 relaxed=4 improved=2
+  [1500/1634] processed=1500 skipped=469 relaxed=4 improved=2
+  [1525/1634] processed=1525 skipped=474 relaxed=5 improved=2
+  [1550/1634] processed=1550 skipped=482 relaxed=5 improved=2
+  [1575/1634] processed=1575 skipped=487 relaxed=5 improved=2
+  [1600/1634] processed=1600 skipped=489 relaxed=5 improved=2
+  [1625/1634] processed=1625 skipped=489 relaxed=5 improved=2

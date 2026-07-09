@@ -15,7 +15,7 @@ just single ones: pass `depth > 1` to `diagnose`/`diagnose_and_relax`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 from ._sparql_relax_rs import diagnose as _diagnose
 from ._sparql_relax_rs import diagnose_and_relax as _diagnose_and_relax
@@ -30,7 +30,24 @@ __all__ = [
     "RelaxReport",
     "diagnose",
     "diagnose_and_relax",
+    "DEFAULT_RELAX_NAMESPACES",
+    "DEFAULT_RELAX_TIMEOUT",
 ]
+
+DEFAULT_RELAX_NAMESPACES: tuple[str, ...] = (
+    "https://brickschema.org/schema/Brick#",  # brick:
+    "https://brickschema.org/schema/Brick/",  # ref: (covers both ref# and bare Brick/)
+    "http://data.ashrae.org/standard223#",  # s223:
+    "http://www.w3.org/2000/01/rdf-schema#",  # rdfs:
+    "http://qudt.org/schema/qudt/",  # qudt:
+)
+"""Namespace prefixes `diagnose_and_relax` restricts path search to by default: the
+building-automation ontologies (Brick, ASHRAE 223P, RDFS, QUDT) this tool is normally used
+against. Pass a different sequence via `allowed_namespaces`, or `None` for no restriction."""
+
+DEFAULT_RELAX_TIMEOUT: float = 5.0
+"""Default `timeout` (seconds) for `diagnose_and_relax`: the SPARQL query work needed to relax
+each culprit combination is normally well under this. Pass `None` to leave it unbounded."""
 
 
 @dataclass
@@ -96,6 +113,19 @@ class RelaxedCulprit:
     """Row count of `relaxed_query` when re-executed. Zero if no combined relaxation was built, or
     it still returns nothing."""
 
+    pruned_query: str
+    """The original query with every triple in this combination simply removed (no path
+    substitution). Not a real fix — it silently drops a constraint rather than relaxing it, so its
+    rows shouldn't be trusted as answers — but always present (its text needs no store access to
+    build, so it's there even if `timeout` cuts off everything else for this combination), so it's
+    a fallback when `relaxed_query` is `None` or still returns nothing."""
+
+    pruned_row_count: int
+    """Row count of `pruned_query` when re-executed. Guaranteed non-empty under normal operation —
+    an empty result here would mean this combination was never a genuine culprit to begin with —
+    *except* when `timeout` cuts off the verification itself before it can complete, in which case
+    this falls back to `0` even though `pruned_query` is still known to return rows."""
+
     @property
     def fixed(self) -> bool:
         """Whether a relaxed query was found that returns at least one row."""
@@ -157,6 +187,9 @@ def diagnose_and_relax(
     ablation_depth: int = 3,
     max_depth: Optional[int] = None,
     sample_limit: Optional[int] = 5,
+    result_limit: Optional[int] = 50_000,
+    allowed_namespaces: Optional[Sequence[str]] = DEFAULT_RELAX_NAMESPACES,
+    timeout: Optional[float] = DEFAULT_RELAX_TIMEOUT,
 ) -> RelaxReport:
     """Diagnoses `query` and searches for a real forward/inverse graph path fixing each culprit
     combination found.
@@ -172,31 +205,61 @@ def diagnose_and_relax(
 
     Sometimes a broken triple's other side isn't bound anywhere else in the query at all (e.g.
     `?sensor` in `building hasSensor ?sensor` if nothing else constrains `?sensor`) — there's no
-    specific target to search for then, only whichever single side did resolve to explore outward
-    from. In that case the returned path(s) are suggestions related to that one known side, not
-    verified fixes; the real correctness check is always the re-executed row count.
+    specific target to search for then, only whichever single side did resolve. Such a triple is
+    skipped entirely rather than searched: without a fixed goal, path search would just be an
+    undirected exploration with nothing to verify a suggestion against except re-running the whole
+    query, which isn't worth the cost of searching for.
 
     A combination is only relaxed as a whole: if any one of its triples has no discoverable path,
     no combined relaxed query is built (the others being fixable wouldn't help, since they were
     only broken *together*). Filters flagged by diagnosis are included in `filter_results` as-is;
     no relaxation is attempted for them.
 
+    Every result also carries `pruned_query`: the original query with every triple in the
+    combination simply removed, no path substitution. It isn't a real fix (it silently drops a
+    constraint instead of relaxing it), but it's always present and guaranteed non-empty — useful
+    as a fallback when `relaxed_query` is `None` or still returns nothing, so you're never left with
+    no query at all.
+
     `ablation_depth` is passed through to `diagnose` to control how many triples may be jointly
     removed while searching for a culprit (see `diagnose`'s `depth`; same default of 3).
 
-    `max_depth` bounds the path search itself. Left as `None` (the default), it adapts to how much
-    of a triple resolved: depth 2 when both its subject and object are bound (a concrete,
-    target-bounded search), or the shallower depth 1 when only one side is bound (an undirected
-    exploration with no fixed goal, so more expensive per level). Pass an explicit integer to
-    override both cases uniformly.
+    `max_depth` bounds the path search itself; defaults to 2 (`None`).
 
     `sample_limit` caps how many distinct bound pairs are considered per triple; defaults to 5 (a
     representative sample rather than every row). Pass `None` to consider every distinct pair
     instead of stopping early (only worth doing for small graphs/result sets, since it means
     examining every row the reduced query returns).
+
+    `result_limit` caps how many rows a relaxed query's `LIMIT` allows; defaults to 50,000, since a
+    relaxed path (especially an alternation of several distinct paths) can match far more broadly
+    than the original triple did. Only ever tightens a `LIMIT` already present in the original
+    query, never loosens it. Pass `None` to leave it unbounded.
+
+    `allowed_namespaces` restricts path search to predicates whose IRI starts with one of these
+    prefixes; a real edge outside every listed namespace is invisible to the search even if it
+    would otherwise connect the two endpoints. Defaults to `DEFAULT_RELAX_NAMESPACES` (Brick,
+    ASHRAE 223P, RDFS, QUDT) — the common case for this tool's building-automation use case, where
+    a real but out-of-domain predicate is rarely a fix anyone actually wants suggested. Pass `None`
+    explicitly for no restriction (any real predicate found in the graph is fair game), or your own
+    sequence of namespace prefixes to restrict to something else.
+
+    `timeout` (seconds) bounds the SPARQL query work needed to relax *each* culprit combination
+    (resolving endpoints, verifying a candidate fix) — not diagnosis, and not path search itself,
+    which never touches the query engine. A combination that can't finish within its budget falls
+    back to `pruned_query` rather than hanging or failing the whole call. Defaults to
+    `DEFAULT_RELAX_TIMEOUT` (5 seconds); pass `None` to leave it unbounded.
     """
     original_row_count, results, filter_results = _diagnose_and_relax(
-        data, query, format, ablation_depth, max_depth, sample_limit
+        data,
+        query,
+        format,
+        ablation_depth,
+        max_depth,
+        sample_limit,
+        result_limit,
+        allowed_namespaces=list(allowed_namespaces) if allowed_namespaces is not None else None,
+        timeout=timeout,
     )
     return RelaxReport(
         original_row_count=original_row_count,
@@ -206,8 +269,10 @@ def diagnose_and_relax(
                 triples=[RelaxedTriple(triple=t, path_text=p) for t, p in triples],
                 relaxed_query=relaxed_query,
                 row_count=row_count,
+                pruned_query=pruned_query,
+                pruned_row_count=pruned_row_count,
             )
-            for found_at_depth, triples, relaxed_query, row_count in results
+            for found_at_depth, triples, relaxed_query, row_count, pruned_query, pruned_row_count in results
         ],
         filter_results=[
             FilterReport(expression=e, row_count_without_filter=n) for e, n in filter_results

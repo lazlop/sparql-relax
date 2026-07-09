@@ -333,6 +333,34 @@ pub fn with_pattern(query: &Query, new_pattern: GraphPattern) -> Query {
     }
 }
 
+/// Wraps `pattern` with a `LIMIT` of at most `limit` results. If `pattern`
+/// already has an outer `Slice` (an explicit `LIMIT`/`OFFSET` in the
+/// original query), only tightens it — never loosens an already-smaller
+/// limit — rather than nesting a redundant second `Slice`.
+pub fn with_limit(pattern: GraphPattern, limit: usize) -> GraphPattern {
+    if let GraphPattern::Slice { inner, start, length } = pattern {
+        let tightened = Some(length.map_or(limit, |l| l.min(limit)));
+        return GraphPattern::Slice { inner, start, length: tightened };
+    }
+    GraphPattern::Slice { inner: Box::new(pattern), start: 0, length: Some(limit) }
+}
+
+/// Builds an `ASK` query with `pattern` as its body, carrying over `query`'s
+/// dataset and base IRI regardless of `query`'s own form. Used where only
+/// existence of a solution matters (not the actual bindings): `ASK`
+/// evaluation short-circuits on the first matching solution, which is
+/// strictly cheaper than a `SELECT` that has to be told to stop separately.
+pub fn ask_query(query: &Query, pattern: GraphPattern) -> Query {
+    match query {
+        Query::Select { dataset, base_iri, .. }
+        | Query::Construct { dataset, base_iri, .. }
+        | Query::Describe { dataset, base_iri, .. }
+        | Query::Ask { dataset, base_iri, .. } => {
+            Query::Ask { dataset: dataset.clone(), pattern, base_iri: base_iri.clone() }
+        }
+    }
+}
+
 /// The top-level `GraphPattern` of any query form.
 pub fn pattern_of(query: &Query) -> &GraphPattern {
     match query {
