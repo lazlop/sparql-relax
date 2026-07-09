@@ -7,11 +7,21 @@
 //! further restrict which real edges are eligible to walk at all — a
 //! predicate outside every listed namespace is invisible to the search,
 //! even if it would otherwise connect the two nodes.
+//!
+//! This never touches the SPARQL query engine (it's direct `Store` quad
+//! lookups), so it can't use Oxigraph's `CancellationToken` the way
+//! [`crate::diagnose`]/[`crate::relax`]'s query executions do. A `deadline`
+//! is checked by hand instead, once per frontier node expanded — cheap
+//! relative to the quad lookups themselves, but frequent enough that even a
+//! single high-fan-out hub node (common in real building graphs — a
+//! `building` entity wired to hundreds of sensors, say) can't run past its
+//! budget unnoticed the way it could with only a depth-count bound.
 
 use oxigraph::model::{GraphNameRef, NamedNode, NamedOrBlankNode, Term};
 use oxigraph::store::Store;
 use spargebra::algebra::PropertyPathExpression;
 use std::collections::HashSet;
+use std::time::Instant;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Hop {
@@ -22,10 +32,21 @@ pub enum Hop {
 /// Bounded-depth breadth-first search from `start` to `goal` over the
 /// store's real edges, in either direction. Returns the shortest hop
 /// sequence found (`Some(vec![])` if `start == goal` already), or `None`
-/// if no path exists within `max_depth` hops. `allowed_namespaces` restricts
-/// which predicates are eligible hops (see [`neighbors`]); `None` means any
-/// real predicate is fair game.
-pub fn find_path(store: &Store, start: &Term, goal: &Term, max_depth: usize, allowed_namespaces: Option<&[String]>) -> Option<Vec<Hop>> {
+/// if no path exists within `max_depth` hops — or if `deadline` passes
+/// before the search finishes; a search cut off partway through hasn't
+/// proven there's no path, only that none was found *yet*, so this stays
+/// consistent with the `max_depth`-exhausted case rather than erroring
+/// (see the module docs on why `deadline` is checked by hand here).
+/// `allowed_namespaces` restricts which predicates are eligible hops (see
+/// [`neighbors`]); `None` means any real predicate is fair game.
+pub fn find_path(
+    store: &Store,
+    start: &Term,
+    goal: &Term,
+    max_depth: usize,
+    allowed_namespaces: Option<&[String]>,
+    deadline: Option<Instant>,
+) -> Option<Vec<Hop>> {
     if start == goal {
         return Some(Vec::new());
     }
@@ -36,6 +57,9 @@ pub fn find_path(store: &Store, start: &Term, goal: &Term, max_depth: usize, all
     for _ in 0..max_depth {
         let mut next_frontier = Vec::new();
         for (node, path) in &frontier {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                return None;
+            }
             for (hop, neighbor) in neighbors(store, node, allowed_namespaces) {
                 if &neighbor == goal {
                     let mut full = path.clone();

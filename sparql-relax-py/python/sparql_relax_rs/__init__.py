@@ -10,6 +10,11 @@ only ever reported, never relaxed.
 
 Diagnosis can also look for *combinations* of jointly-broken triples, not
 just single ones: pass `depth > 1` to `diagnose`/`diagnose_and_relax`.
+
+The module-level `diagnose`/`diagnose_and_relax` functions each parse `data`
+into a fresh in-memory graph on every call. For more than one query against
+the same graph, build a `Store` once and call its methods instead — see its
+docstring.
 """
 
 from __future__ import annotations
@@ -17,8 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
-from ._sparql_relax_rs import diagnose as _diagnose
-from ._sparql_relax_rs import diagnose_and_relax as _diagnose_and_relax
+from ._sparql_relax_rs import Store as _Store
 
 __all__ = [
     "Culprit",
@@ -28,10 +32,12 @@ __all__ = [
     "RelaxedCulprit",
     "FilterReport",
     "RelaxReport",
+    "Store",
     "diagnose",
     "diagnose_and_relax",
     "DEFAULT_RELAX_NAMESPACES",
     "DEFAULT_RELAX_TIMEOUT",
+    "DEFAULT_ABLATION_TIMEOUT",
 ]
 
 DEFAULT_RELAX_NAMESPACES: tuple[str, ...] = (
@@ -48,6 +54,12 @@ against. Pass a different sequence via `allowed_namespaces`, or `None` for no re
 DEFAULT_RELAX_TIMEOUT: float = 5.0
 """Default `timeout` (seconds) for `diagnose_and_relax`: the SPARQL query work needed to relax
 each culprit combination is normally well under this. Pass `None` to leave it unbounded."""
+
+DEFAULT_ABLATION_TIMEOUT: float = 5.0
+"""Default `timeout` for `diagnose`, and default `diagnose_timeout` for `diagnose_and_relax`
+(seconds): a single ablation check is normally well under this. Pass `None` to leave it unbounded
+— but see `diagnose`'s docs for why an internally-enforced timeout matters even when the caller
+has its own external one."""
 
 
 @dataclass
@@ -147,7 +159,98 @@ class RelaxReport:
     filter_results: List[FilterReport]
 
 
-def diagnose(data: str, query: str, format: str = "turtle", depth: int = 3) -> Diagnosis:
+def _diagnosis_from_tuples(original_row_count: int, culprits, filter_culprits) -> Diagnosis:
+    return Diagnosis(
+        original_row_count=original_row_count,
+        culprits=[Culprit(triples=triples, depth=culprit_depth) for triples, culprit_depth in culprits],
+        filter_culprits=[
+            FilterCulprit(expression=e, row_count_without_filter=n) for e, n in filter_culprits
+        ],
+    )
+
+
+def _relax_report_from_tuples(original_row_count: int, results, filter_results) -> RelaxReport:
+    return RelaxReport(
+        original_row_count=original_row_count,
+        results=[
+            RelaxedCulprit(
+                found_at_depth=found_at_depth,
+                triples=[RelaxedTriple(triple=t, path_text=p) for t, p in triples],
+                relaxed_query=relaxed_query,
+                row_count=row_count,
+                pruned_query=pruned_query,
+                pruned_row_count=pruned_row_count,
+            )
+            for found_at_depth, triples, relaxed_query, row_count, pruned_query, pruned_row_count in results
+        ],
+        filter_results=[
+            FilterReport(expression=e, row_count_without_filter=n) for e, n in filter_results
+        ],
+    )
+
+
+class Store:
+    """An RDF graph loaded once and held for repeated `diagnose`/`diagnose_and_relax` calls
+    against it.
+
+    The module-level `diagnose`/`diagnose_and_relax` functions each parse `data` and build a fresh
+    in-memory store from scratch on every call — fine for a one-off query, but wasteful for the
+    common case of running many queries against the same graph (e.g. evaluating a batch of
+    generated queries against one building's data), where that parse-and-index work is identical
+    and pointless to repeat. Build a `Store` once and call its methods instead:
+
+    ```python
+    store = Store(building_ttl_text)
+    for query in generated_queries:
+        report = store.diagnose_and_relax(query)
+    ```
+
+    Each method carries the same parameters as its module-level counterpart of the same name,
+    just without `data`/`format`, which are fixed for the lifetime of the `Store` (set once here,
+    in `__init__`).
+    """
+
+    def __init__(self, data: str, format: str = "turtle") -> None:
+        self._store = _Store(data, format)
+
+    def diagnose(self, query: str, depth: int = 3, timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT) -> Diagnosis:
+        """See the module-level `diagnose` for what this does and what `depth`/`timeout` control."""
+        original_row_count, culprits, filter_culprits = self._store.diagnose(query, depth=depth, timeout=timeout)
+        return _diagnosis_from_tuples(original_row_count, culprits, filter_culprits)
+
+    def diagnose_and_relax(
+        self,
+        query: str,
+        ablation_depth: int = 3,
+        max_depth: Optional[int] = None,
+        sample_limit: Optional[int] = 5,
+        result_limit: Optional[int] = 50_000,
+        allowed_namespaces: Optional[Sequence[str]] = DEFAULT_RELAX_NAMESPACES,
+        timeout: Optional[float] = DEFAULT_RELAX_TIMEOUT,
+        diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
+    ) -> RelaxReport:
+        """See the module-level `diagnose_and_relax` for what this does and what its parameters
+        control."""
+        original_row_count, results, filter_results = self._store.diagnose_and_relax(
+            query,
+            ablation_depth=ablation_depth,
+            max_depth=max_depth,
+            sample_limit=sample_limit,
+            result_limit=result_limit,
+            allowed_namespaces=list(allowed_namespaces) if allowed_namespaces is not None else None,
+            timeout=timeout,
+            diagnose_timeout=diagnose_timeout,
+        )
+        return _relax_report_from_tuples(original_row_count, results, filter_results)
+
+
+def diagnose(
+    data: str,
+    query: str,
+    format: str = "turtle",
+    depth: int = 3,
+    timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
+) -> Diagnosis:
     """Diagnoses which BGP triple(s)/FILTER(s) in `query` are likely broken against `data`.
 
     `data` is RDF text in the given `format` (default Turtle); `query` must be a SPARQL SELECT.
@@ -169,15 +272,26 @@ def diagnose(data: str, query: str, format: str = "turtle", depth: int = 3) -> D
     This only identifies *which* triple(s)/filter(s) are broken — it does no variable-binding
     work, so it's cheap even on large result sets. Use `diagnose_and_relax` to also resolve what a
     culprit's variables are bound to and search for a fix.
+
+    `timeout` (seconds) bounds every SPARQL query this call runs — the original query itself, and
+    every triple-combo/filter ablation check, all sharing one deadline rather than a fresh budget
+    per check — so the *whole* call is bounded by roughly `timeout` regardless of how many
+    candidates there are to work through. A check that can't finish in time is treated as "not a
+    culprit"; if the *original* query can't even be evaluated within the budget, this raises rather
+    than returning a result, since there's nothing meaningful to diagnose without it. Defaults to
+    `DEFAULT_ABLATION_TIMEOUT` (5 seconds); pass `None` to leave it unbounded.
+
+    Note that abandoning this call from the caller's side (e.g. a `concurrent.futures.Future`'s
+    `result(timeout=...)`) does *not* stop it from running to completion in the background —
+    Python threads can't be force-cancelled. A real, internally-enforced `timeout` here is what
+    actually bounds the work; without it, a batch of many rows each abandoning slow calls will
+    accumulate orphaned background searches that keep consuming CPU and threads indefinitely,
+    starving every subsequent row rather than just the one that was slow.
+
+    Builds a throwaway `Store` from `data` on every call — for more than one query against the
+    same graph, build a `Store` once instead and call its `diagnose` method.
     """
-    original_row_count, culprits, filter_culprits = _diagnose(data, query, format, depth)
-    return Diagnosis(
-        original_row_count=original_row_count,
-        culprits=[Culprit(triples=triples, depth=culprit_depth) for triples, culprit_depth in culprits],
-        filter_culprits=[
-            FilterCulprit(expression=e, row_count_without_filter=n) for e, n in filter_culprits
-        ],
-    )
+    return Store(data, format).diagnose(query, depth=depth, timeout=timeout)
 
 
 def diagnose_and_relax(
@@ -190,6 +304,7 @@ def diagnose_and_relax(
     result_limit: Optional[int] = 50_000,
     allowed_namespaces: Optional[Sequence[str]] = DEFAULT_RELAX_NAMESPACES,
     timeout: Optional[float] = DEFAULT_RELAX_TIMEOUT,
+    diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
 ) -> RelaxReport:
     """Diagnoses `query` and searches for a real forward/inverse graph path fixing each culprit
     combination found.
@@ -244,37 +359,28 @@ def diagnose_and_relax(
     explicitly for no restriction (any real predicate found in the graph is fair game), or your own
     sequence of namespace prefixes to restrict to something else.
 
-    `timeout` (seconds) bounds the SPARQL query work needed to relax *each* culprit combination
-    (resolving endpoints, verifying a candidate fix) — not diagnosis, and not path search itself,
-    which never touches the query engine. A combination that can't finish within its budget falls
-    back to `pruned_query` rather than hanging or failing the whole call. Defaults to
+    `timeout` (seconds) bounds all the work needed to relax *each* culprit combination — resolving
+    endpoints, the path search itself, and verifying a candidate fix — not diagnosis, which has its
+    own separate budget (see `diagnose_timeout`). A combination that can't finish within its budget
+    falls back to `pruned_query` rather than hanging or failing the whole call. Defaults to
     `DEFAULT_RELAX_TIMEOUT` (5 seconds); pass `None` to leave it unbounded.
+
+    `diagnose_timeout` (seconds) is passed straight through to `diagnose`'s own `timeout` — see its
+    docs for what it bounds and why an internally-enforced timeout matters even when the caller has
+    its own external one. Independent of `timeout` above: diagnosis runs once, before any
+    relaxation work starts, so the two budgets don't interact. Also defaults to
+    `DEFAULT_ABLATION_TIMEOUT` (5 seconds).
+
+    Builds a throwaway `Store` from `data` on every call — for more than one query against the
+    same graph, build a `Store` once instead and call its `diagnose_and_relax` method.
     """
-    original_row_count, results, filter_results = _diagnose_and_relax(
-        data,
+    return Store(data, format).diagnose_and_relax(
         query,
-        format,
-        ablation_depth,
-        max_depth,
-        sample_limit,
-        result_limit,
-        allowed_namespaces=list(allowed_namespaces) if allowed_namespaces is not None else None,
+        ablation_depth=ablation_depth,
+        max_depth=max_depth,
+        sample_limit=sample_limit,
+        result_limit=result_limit,
+        allowed_namespaces=allowed_namespaces,
         timeout=timeout,
-    )
-    return RelaxReport(
-        original_row_count=original_row_count,
-        results=[
-            RelaxedCulprit(
-                found_at_depth=found_at_depth,
-                triples=[RelaxedTriple(triple=t, path_text=p) for t, p in triples],
-                relaxed_query=relaxed_query,
-                row_count=row_count,
-                pruned_query=pruned_query,
-                pruned_row_count=pruned_row_count,
-            )
-            for found_at_depth, triples, relaxed_query, row_count, pruned_query, pruned_row_count in results
-        ],
-        filter_results=[
-            FilterReport(expression=e, row_count_without_filter=n) for e, n in filter_results
-        ],
+        diagnose_timeout=diagnose_timeout,
     )

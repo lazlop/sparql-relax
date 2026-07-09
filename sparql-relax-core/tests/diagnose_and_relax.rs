@@ -1,8 +1,8 @@
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::store::Store;
 use sparql_relax_core::bfs::Hop;
-use sparql_relax_core::{NamespaceScope, diagnose, diagnose_and_relax, diagnose_and_relax_default};
-use std::time::Duration;
+use sparql_relax_core::{NamespaceScope, RelaxError, diagnose, diagnose_and_relax, diagnose_and_relax_default, diagnose_default};
+use std::time::{Duration, Instant};
 
 const TTL: &str = r#"
     @prefix ex: <urn:example#> .
@@ -28,7 +28,7 @@ const BROKEN_QUERY: &str = r#"
 #[test]
 fn diagnoses_the_wrong_predicate_as_a_culprit() {
     let store = test_store();
-    let diagnosis = diagnose(BROKEN_QUERY, &store, 1).unwrap();
+    let diagnosis = diagnose(BROKEN_QUERY, &store, 1, None).unwrap();
 
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1);
@@ -39,9 +39,68 @@ fn diagnoses_the_wrong_predicate_as_a_culprit() {
 }
 
 #[test]
+fn diagnose_default_still_finds_the_culprit_with_its_internal_timeout() {
+    let store = test_store();
+    let diagnosis = diagnose_default(BROKEN_QUERY, &store).unwrap();
+    assert_eq!(diagnosis.culprits.len(), 1);
+}
+
+#[test]
+fn diagnose_errors_with_timeout_when_even_the_original_query_cant_run_in_time() {
+    // An effectively-zero timeout means the deadline is already passed by
+    // the time diagnose_parsed's very first query (the original query
+    // itself) would run — there's nothing meaningful to diagnose without
+    // knowing its row count, so this is a hard error, not a graceful
+    // "no culprits found".
+    let store = test_store();
+    let result = diagnose(BROKEN_QUERY, &store, 1, Some(Duration::from_nanos(1)));
+    assert!(matches!(result, Err(RelaxError::Timeout)), "expected a Timeout error");
+}
+
+#[test]
+fn find_path_respects_a_past_deadline_even_when_a_real_path_exists() {
+    // Isolates the BFS-specific deadline check (as opposed to the SPARQL
+    // query timeouts diagnose_and_relax's own tests exercise): the *only*
+    // thing that differs between these two calls is `deadline`, so a
+    // real, existing path being missed proves the search itself is what's
+    // being cut off, not some unrelated query.
+    let store = test_store();
+    let start = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#building223").unwrap());
+    let goal = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#sensor1").unwrap());
+
+    let found = sparql_relax_core::bfs::find_path(&store, &start, &goal, 2, None, None);
+    assert!(found.is_some(), "sanity check: the real hasPart/hasSensor path should be found with no deadline");
+
+    let past_deadline = Instant::now() - Duration::from_secs(1);
+    let cut_off = sparql_relax_core::bfs::find_path(&store, &start, &goal, 2, None, Some(past_deadline));
+    assert!(cut_off.is_none(), "a deadline already in the past should stop the search before it finds the path");
+}
+
+#[test]
+fn diagnose_and_relax_propagates_a_timeout_error_when_diagnose_timeout_is_exceeded() {
+    // diagnose_timeout is independent of the relax-phase `timeout` param —
+    // an effectively-zero diagnose_timeout should fail the whole call the
+    // same way a standalone `diagnose` call would, regardless of what the
+    // relax-phase timeout is set to.
+    let store = test_store();
+    let result = diagnose_and_relax(
+        BROKEN_QUERY,
+        &store,
+        1,
+        Some(4),
+        Some(5),
+        None,
+        NamespaceScope::Unrestricted,
+        None,
+        Some(Duration::from_nanos(1)),
+    );
+    assert!(matches!(result, Err(RelaxError::Timeout)), "expected a Timeout error");
+}
+
+#[test]
 fn finds_a_real_forward_forward_path_and_fixes_the_query() {
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
 
     assert_eq!(report.original_row_count, 0);
     assert_eq!(report.results.len(), 1);
@@ -68,7 +127,7 @@ fn query_with_no_broken_triples_reports_no_culprits() {
             ?sensor a ex:TempSensor .
         }
     "#;
-    let diagnosis = diagnose(query, &store, 1).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None).unwrap();
     assert_eq!(diagnosis.original_row_count, 1);
     assert!(diagnosis.culprits.is_empty());
 }
@@ -97,7 +156,7 @@ fn finds_an_inverse_hop_path() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let relaxed_triple = &report.results[0].triples[0];
     assert_eq!(
@@ -111,7 +170,7 @@ fn finds_an_inverse_hop_path() {
 #[test]
 fn reports_no_relaxation_when_depth_is_too_small() {
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(1), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(1), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
     assert!(result.triples[0].hop_alternatives.is_empty());
@@ -130,7 +189,7 @@ fn pruned_query_is_present_even_when_a_real_relaxation_is_found() {
     // even alongside a successful relaxed_query, so callers can compare
     // the two or fall back later without a second call.
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
     let result = &report.results[0];
     assert!(result.relaxed_query.is_some(), "sanity check: a real relaxation was found here");
     assert!(!result.pruned_query.contains("hasSensor"), "the culprit triple should be dropped, not replaced");
@@ -166,10 +225,10 @@ fn pruned_row_count_respects_result_limit() {
         }
     "#;
 
-    let unbounded = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let unbounded = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(unbounded.results[0].pruned_row_count, 2);
 
-    let capped = diagnose_and_relax(query, &store, 1, Some(4), Some(5), Some(1), NamespaceScope::Unrestricted, None).unwrap();
+    let capped = diagnose_and_relax(query, &store, 1, Some(4), Some(5), Some(1), NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(capped.results[0].pruned_row_count, 1, "result_limit tightens pruned_row_count too");
 }
 
@@ -190,6 +249,7 @@ fn falls_back_to_pruned_query_when_the_relaxation_timeout_is_exceeded() {
         None,
         NamespaceScope::Unrestricted,
         Some(Duration::from_nanos(1)),
+        None,
     )
     .unwrap();
     assert_eq!(report.results.len(), 1);
@@ -227,7 +287,7 @@ fn diagnoses_an_overly_restrictive_filter_as_a_culprit() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None).unwrap();
     assert_eq!(diagnosis.original_row_count, 0);
     assert!(diagnosis.culprits.is_empty(), "no BGP triple is broken here, only the filter");
     assert_eq!(diagnosis.filter_culprits.len(), 1);
@@ -246,7 +306,7 @@ fn does_not_flag_a_filter_that_is_not_excluding_anything() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None).unwrap();
     assert_eq!(diagnosis.original_row_count, 1);
     assert!(diagnosis.filter_culprits.is_empty());
 }
@@ -263,7 +323,7 @@ fn diagnose_and_relax_reports_filters_without_attempting_a_relaxation() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert!(report.results.is_empty());
     assert_eq!(report.filter_results.len(), 1);
     assert_eq!(report.filter_results[0].row_count_without_filter, 1);
@@ -299,11 +359,11 @@ fn combines_distinct_paths_from_different_bound_pairs_as_alternatives() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None).unwrap();
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1);
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
 
@@ -340,10 +400,10 @@ fn sample_limit_none_samples_every_distinct_bound_pair() {
         }
     "#;
 
-    let capped = diagnose_and_relax(query, &store, 1, Some(2), Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let capped = diagnose_and_relax(query, &store, 1, Some(2), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(capped.results[0].triples[0].hop_alternatives.len(), 5, "capped sampling stops at the limit");
 
-    let uncapped = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None).unwrap();
+    let uncapped = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(
         uncapped.results[0].triples[0].hop_alternatives.len(),
         6,
@@ -383,10 +443,10 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
         }
     "#;
 
-    let depth_1 = diagnose(query, &store, 1).unwrap();
+    let depth_1 = diagnose(query, &store, 1, None).unwrap();
     assert!(depth_1.culprits.is_empty(), "no single triple's removal alone unblocks the query");
 
-    let depth_3 = diagnose(query, &store, 3).unwrap();
+    let depth_3 = diagnose(query, &store, 3, None).unwrap();
     assert_eq!(depth_3.culprits.len(), 1, "exactly one joint 2-triple culprit should be found");
     let culprit = &depth_3.culprits[0];
     assert_eq!(culprit.depth, 2, "found at depth 2, so depth 3 never had to run");
@@ -398,7 +458,7 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
     // Relaxation: the hasSensor triple has a real path (hasZone/hasSensor),
     // but the hasUnit triple genuinely has none (nothing connects sensor1
     // to Fahrenheit), so the combination as a whole should not be relaxed.
-    let report = diagnose_and_relax(query, &store, 3, Some(4), None, None, NamespaceScope::Unrestricted, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 3, Some(4), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
     assert_eq!(result.triples.len(), 2);
@@ -438,10 +498,10 @@ fn does_not_relax_when_the_object_is_unconstrained_elsewhere() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None).unwrap();
     assert_eq!(diagnosis.culprits.len(), 1, "building has no direct hasSensor edge");
 
-    let report = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let relaxed_triple = &report.results[0].triples[0];
     assert!(relaxed_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
@@ -473,7 +533,7 @@ fn does_not_relax_when_the_subject_is_unconstrained_elsewhere() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let relaxed_triple = &report.results[0].triples[0];
     assert!(relaxed_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
@@ -539,7 +599,7 @@ fn default_max_depth_is_2_for_pair_search() {
             ?sensor a ex:TempSensor .
         }
     "#;
-    let pair_report = diagnose_and_relax(pair_query, &store, 1, None, Some(5), None, NamespaceScope::Unrestricted, None).unwrap();
+    let pair_report = diagnose_and_relax(pair_query, &store, 1, None, Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(pair_report.results[0].row_count, 1, "default pair-search depth (2) finds the 2-hop path");
 }
 
@@ -569,11 +629,11 @@ fn namespace_scope_restricts_path_search_to_allowed_prefixes() {
         }
     "#;
 
-    let unrestricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None).unwrap();
+    let unrestricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(unrestricted.results[0].triples[0].hop_alternatives.len(), 1, "the real altPath edge should be found");
     assert_eq!(unrestricted.results[0].row_count, 1);
 
-    let brick_restricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::default(), None).unwrap();
+    let brick_restricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::default(), None, None).unwrap();
     assert!(
         brick_restricted.results[0].triples[0].hop_alternatives.is_empty(),
         "ex:altPath isn't in any allowed namespace, so it shouldn't be found"
@@ -588,6 +648,7 @@ fn namespace_scope_restricts_path_search_to_allowed_prefixes() {
         None,
         None,
         NamespaceScope::Only(vec!["urn:example#alt".to_string()]),
+        None,
         None,
     )
     .unwrap();

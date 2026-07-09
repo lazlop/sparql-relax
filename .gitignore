@@ -2,3 +2,6 @@
 **/__pycache__/
 *.so
 .venv/
+*.csv
+*.log
+.DS_Store

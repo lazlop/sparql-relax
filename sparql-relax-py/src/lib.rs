@@ -32,6 +32,25 @@ fn default_relax_timeout() -> Option<f64> {
     Some(sparql_relax_core::DEFAULT_RELAX_TIMEOUT.as_secs_f64())
 }
 
+/// Default value for `diagnose_timeout`/`timeout` (on `diagnose_and_relax`
+/// and `diagnose` respectively) when the Python caller doesn't pass one:
+/// `DEFAULT_ABLATION_TIMEOUT`, in seconds. Passing `None` explicitly opts
+/// out to unbounded diagnosis instead.
+fn default_ablation_timeout() -> Option<f64> {
+    Some(sparql_relax_core::DEFAULT_ABLATION_TIMEOUT.as_secs_f64())
+}
+
+/// Converts a `timeout` argument (seconds) to a `Duration`, rejecting
+/// negative/non-finite values rather than letting `Duration::from_secs_f64`
+/// panic on them.
+fn parse_timeout_seconds(timeout: Option<f64>) -> PyResult<Option<Duration>> {
+    match timeout {
+        Some(seconds) if seconds.is_finite() && seconds >= 0.0 => Ok(Some(Duration::from_secs_f64(seconds))),
+        Some(_) => Err(PyValueError::new_err("timeout must be a non-negative, finite number of seconds")),
+        None => Ok(None),
+    }
+}
+
 fn resolve_format(name: &str) -> PyResult<RdfFormat> {
     match name.to_ascii_lowercase().as_str() {
         "ttl" | "turtle" => Ok(RdfFormat::Turtle),
@@ -54,6 +73,59 @@ type CulpritTuple = (Vec<String>, usize);
 type FilterCulpritTuple = (String, usize);
 type RelaxedTripleTuple = (String, Option<String>);
 type RelaxResultTuple = (usize, Vec<RelaxedTripleTuple>, Option<String>, usize, String, usize);
+type DiagnoseTuples = (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>);
+type RelaxTuples = (usize, Vec<RelaxResultTuple>, Vec<FilterCulpritTuple>);
+
+/// Runs `diagnose` against an already-loaded `store` and converts the result
+/// to the plain tuples the Python layer returns. Shared by the free
+/// `diagnose` pyfunction (which loads a throwaway `store` first) and
+/// `RdfStore::diagnose` (which reuses one built once, up front) so the two
+/// entry points can't drift apart.
+fn diagnose_tuples(store: &Store, query: &str, depth: usize, timeout: Option<Duration>) -> Result<DiagnoseTuples, sparql_relax_core::RelaxError> {
+    let diagnosis = core_diagnose(query, store, depth, timeout)?;
+    let culprits = diagnosis
+        .culprits
+        .into_iter()
+        .map(|c| (c.triples.iter().map(ToString::to_string).collect(), c.depth))
+        .collect();
+    let filter_culprits = diagnosis
+        .filter_culprits
+        .into_iter()
+        .map(|f| (f.expression.to_string(), f.row_count_without_filter))
+        .collect();
+    Ok((diagnosis.original_row_count, culprits, filter_culprits))
+}
+
+/// Same as [`diagnose_tuples`], but for `diagnose_and_relax` — shared by the
+/// free `diagnose_and_relax` pyfunction and `RdfStore::diagnose_and_relax`.
+#[allow(clippy::too_many_arguments)]
+fn diagnose_and_relax_tuples(
+    store: &Store,
+    query: &str,
+    ablation_depth: usize,
+    max_depth: Option<usize>,
+    sample_limit: Option<usize>,
+    result_limit: Option<usize>,
+    scope: NamespaceScope,
+    timeout: Option<Duration>,
+    diagnose_timeout: Option<Duration>,
+) -> Result<RelaxTuples, sparql_relax_core::RelaxError> {
+    let report = core_relax(query, store, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout)?;
+    let results = report
+        .results
+        .into_iter()
+        .map(|r| {
+            let triples = r.triples.into_iter().map(|t| (t.triple_text, t.path_text)).collect();
+            (r.found_at_depth, triples, r.relaxed_query, r.row_count, r.pruned_query, r.pruned_row_count)
+        })
+        .collect();
+    let filter_results = report
+        .filter_results
+        .into_iter()
+        .map(|f| (f.expression_text, f.row_count_without_filter))
+        .collect();
+    Ok((report.original_row_count, results, filter_results))
+}
 
 #[pymodule]
 mod _sparql_relax_rs {
@@ -87,38 +159,49 @@ mod _sparql_relax_rs {
     /// sets. Use `diagnose_and_relax` to also resolve what a culprit's
     /// variables are bound to and search for a fix.
     ///
+    /// `timeout` (seconds) bounds every SPARQL query this call runs — the
+    /// original query itself, and every triple-combo/filter ablation check,
+    /// all sharing one deadline rather than a fresh budget per check — so
+    /// the *whole* call is bounded by roughly `timeout` regardless of how
+    /// many candidates there are to work through. A check that can't finish
+    /// in time is treated as "not a culprit"; if the *original* query can't
+    /// even be evaluated within the budget, this raises rather than
+    /// returning a result, since there's nothing meaningful to diagnose
+    /// without it. Defaults to 5.0 seconds; pass `None` to leave it
+    /// unbounded — but note that abandoning this call from the Python side
+    /// (e.g. `future.result(timeout=...)`) does *not* stop it from running
+    /// to completion in the background, since Python threads can't be
+    /// force-cancelled; a real, enforced `timeout` here is what actually
+    /// bounds the work and lets a slow row's search release its threads
+    /// instead of piling up behind an abandoned future.
+    ///
     /// Returns `(original_row_count, culprits, filter_culprits)`. Each
     /// culprit is `(triples, depth)`: `triples` is a list of triple texts in
     /// the combination (just one unless `depth > 1` was needed), and `depth`
     /// is the combination size at which it was found. Each filter culprit is
     /// `(expression_text, row_count_without_filter)`.
+    ///
+    /// Builds a throwaway store from `data` on every call — for more than
+    /// one query against the same graph, build a `Store` once instead and
+    /// call its `diagnose` method, which reuses it.
     #[pyfunction]
-    #[pyo3(signature = (data, query, format="turtle", depth=3))]
+    #[pyo3(signature = (data, query, format="turtle", depth=3, timeout=default_ablation_timeout()))]
     fn diagnose(
         py: Python<'_>,
         data: &str,
         query: &str,
         format: &str,
         depth: usize,
-    ) -> PyResult<(usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>)> {
+        timeout: Option<f64>,
+    ) -> PyResult<DiagnoseTuples> {
         let store = load_store(data, format)?;
+        let timeout = parse_timeout_seconds(timeout)?;
         // Releases the GIL for the (potentially long-running, internally
         // multi-threaded) search: without this, a Python-side timeout
         // wrapper around this call couldn't actually regain control until
         // the search finished on its own, since no other Python thread
         // could run while this one held the GIL.
-        let diagnosis = py.detach(|| core_diagnose(query, &store, depth)).map_err(to_py_err)?;
-        let culprits = diagnosis
-            .culprits
-            .into_iter()
-            .map(|c| (c.triples.iter().map(ToString::to_string).collect(), c.depth))
-            .collect();
-        let filter_culprits = diagnosis
-            .filter_culprits
-            .into_iter()
-            .map(|f| (f.expression.to_string(), f.row_count_without_filter))
-            .collect();
-        Ok((diagnosis.original_row_count, culprits, filter_culprits))
+        py.detach(|| diagnose_tuples(&store, query, depth, timeout)).map_err(to_py_err)
     }
 
     /// Diagnoses `query` and, for each culprit combination found, searches
@@ -166,13 +249,20 @@ mod _sparql_relax_rs {
     /// (Brick, ASHRAE 223P, RDFS, QUDT). Pass `None` explicitly for no
     /// restriction (any real predicate found in the graph is fair game).
     ///
-    /// `timeout` (seconds) bounds the SPARQL query work needed to relax
-    /// *each* culprit combination (resolving endpoints, verifying a
-    /// candidate fix) — not diagnosis, and not path search itself, which
-    /// never touches the query engine. A combination that can't finish
-    /// within its budget falls back to `pruned_query` rather than hanging
-    /// or failing the whole call. Defaults to 5.0 seconds; pass `None` to
-    /// leave it unbounded.
+    /// `timeout` (seconds) bounds all the work needed to relax *each*
+    /// culprit combination — resolving endpoints, the path search itself,
+    /// and verifying a candidate fix — not diagnosis, which has its own
+    /// separate budget (see `diagnose_timeout`). A combination that can't
+    /// finish within its budget falls back to `pruned_query` rather than
+    /// hanging or failing the whole call. Defaults to 5.0 seconds; pass
+    /// `None` to leave it unbounded.
+    ///
+    /// `diagnose_timeout` (seconds) is passed straight through to
+    /// `diagnose`'s own `timeout` — see its docs for what it bounds and why
+    /// an internally-enforced timeout matters even when the caller has its
+    /// own external one. Independent of `timeout` above: diagnosis runs
+    /// once, before any relaxation work starts, so the two budgets don't
+    /// interact. Also defaults to 5.0 seconds.
     ///
     /// Returns `(original_row_count, results, filter_results)`. Each result
     /// is `(found_at_depth, triples, relaxed_query, row_count, pruned_query,
@@ -188,11 +278,17 @@ mod _sparql_relax_rs {
     /// as a fallback when `relaxed_query` is `None` or still returns
     /// nothing. Each filter result is `(expression_text,
     /// row_count_without_filter)`.
+    ///
+    /// Builds a throwaway store from `data` on every call — for more than
+    /// one query against the same graph, build a `Store` once instead and
+    /// call its `diagnose_and_relax` method, which reuses it.
     #[pyfunction]
     #[pyo3(signature = (
         data, query, format="turtle", ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
-        allowed_namespaces=default_relax_namespaces(), timeout=default_relax_timeout()
+        allowed_namespaces=default_relax_namespaces(), timeout=default_relax_timeout(),
+        diagnose_timeout=default_ablation_timeout()
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn diagnose_and_relax(
         py: Python<'_>,
         data: &str,
@@ -204,35 +300,89 @@ mod _sparql_relax_rs {
         result_limit: Option<usize>,
         allowed_namespaces: Option<Vec<String>>,
         timeout: Option<f64>,
-    ) -> PyResult<(usize, Vec<RelaxResultTuple>, Vec<FilterCulpritTuple>)> {
+        diagnose_timeout: Option<f64>,
+    ) -> PyResult<RelaxTuples> {
         let store = load_store(data, format)?;
         let scope = namespace_scope(allowed_namespaces);
-        let timeout = match timeout {
-            Some(seconds) if seconds.is_finite() && seconds >= 0.0 => Some(Duration::from_secs_f64(seconds)),
-            Some(_) => return Err(PyValueError::new_err("timeout must be a non-negative, finite number of seconds")),
-            None => None,
-        };
+        let timeout = parse_timeout_seconds(timeout)?;
+        let diagnose_timeout = parse_timeout_seconds(diagnose_timeout)?;
         // See the comment on `diagnose` above: releasing the GIL here is
         // what lets a Python-side timeout wrapper actually regain control if
         // a particular query needs an expensive reduced-query evaluation
         // (e.g. removing a triple leaves the rest of the query essentially
         // unconstrained).
-        let report = py
-            .detach(|| core_relax(query, &store, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout))
-            .map_err(to_py_err)?;
-        let results = report
-            .results
-            .into_iter()
-            .map(|r| {
-                let triples = r.triples.into_iter().map(|t| (t.triple_text, t.path_text)).collect();
-                (r.found_at_depth, triples, r.relaxed_query, r.row_count, r.pruned_query, r.pruned_row_count)
+        py.detach(|| {
+            diagnose_and_relax_tuples(&store, query, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout)
+        })
+        .map_err(to_py_err)
+    }
+
+    /// An RDF graph loaded once and held for repeated `diagnose`/
+    /// `diagnose_and_relax` calls against it.
+    ///
+    /// The free `diagnose`/`diagnose_and_relax` functions each parse `data`
+    /// and build a fresh in-memory store from scratch on every call — fine
+    /// for a one-off query, but wasteful for the common case of running many
+    /// queries against the same graph (e.g. evaluating a batch of generated
+    /// queries against one building's data), where that parse-and-index
+    /// work is identical and pointless to repeat. Build a `Store` once and
+    /// call its methods instead; they carry the same `depth`/`timeout`/etc.
+    /// parameters as their free-function counterparts, just without
+    /// `data`/`format`, which were already fixed when the `Store` was built.
+    #[pyclass(name = "Store")]
+    struct RdfStore {
+        inner: Store,
+    }
+
+    #[pymethods]
+    impl RdfStore {
+        #[new]
+        #[pyo3(signature = (data, format="turtle"))]
+        fn new(data: &str, format: &str) -> PyResult<Self> {
+            Ok(Self { inner: load_store(data, format)? })
+        }
+
+        #[pyo3(signature = (query, depth=3, timeout=default_ablation_timeout()))]
+        fn diagnose(&self, py: Python<'_>, query: &str, depth: usize, timeout: Option<f64>) -> PyResult<DiagnoseTuples> {
+            let timeout = parse_timeout_seconds(timeout)?;
+            py.detach(|| diagnose_tuples(&self.inner, query, depth, timeout)).map_err(to_py_err)
+        }
+
+        #[pyo3(signature = (
+            query, ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
+            allowed_namespaces=default_relax_namespaces(), timeout=default_relax_timeout(),
+            diagnose_timeout=default_ablation_timeout()
+        ))]
+        #[allow(clippy::too_many_arguments)]
+        fn diagnose_and_relax(
+            &self,
+            py: Python<'_>,
+            query: &str,
+            ablation_depth: usize,
+            max_depth: Option<usize>,
+            sample_limit: Option<usize>,
+            result_limit: Option<usize>,
+            allowed_namespaces: Option<Vec<String>>,
+            timeout: Option<f64>,
+            diagnose_timeout: Option<f64>,
+        ) -> PyResult<RelaxTuples> {
+            let scope = namespace_scope(allowed_namespaces);
+            let timeout = parse_timeout_seconds(timeout)?;
+            let diagnose_timeout = parse_timeout_seconds(diagnose_timeout)?;
+            py.detach(|| {
+                diagnose_and_relax_tuples(
+                    &self.inner,
+                    query,
+                    ablation_depth,
+                    max_depth,
+                    sample_limit,
+                    result_limit,
+                    scope,
+                    timeout,
+                    diagnose_timeout,
+                )
             })
-            .collect();
-        let filter_results = report
-            .filter_results
-            .into_iter()
-            .map(|f| (f.expression_text, f.row_count_without_filter))
-            .collect();
-        Ok((report.original_row_count, results, filter_results))
+            .map_err(to_py_err)
+        }
     }
 }

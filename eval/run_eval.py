@@ -25,12 +25,13 @@ worker-recycling supervisor to stay within memory), sparql-relax-rs's
 Rust core does one bounded search per query, so this script is a plain
 sequential loop — no process pool, no memory-based worker recycling.
 
-The one real cost worth knowing about: `diagnose_and_relax` takes the RDF
-graph as raw text and reparses it inside Rust on every call (there's no
-store-caching entry point yet). For the ~1-2MB building graphs referenced
-by these CSVs that's still fast (well under the query-execution time,
-in practice), but it means this doesn't scale to graphs of very different
-size without that API gaining a cached-store path.
+`sparql_relax_rs.diagnose`/`diagnose_and_relax` each reparse and reindex
+their RDF graph from scratch on every call if you pass them raw text — on
+a ~1-2MB building graph, that alone costs roughly as much as the search
+itself. `BuildingCache` below avoids paying that per row: it builds one
+`sparql_relax_rs.Store` per building (see that class's docstring) and
+reuses it for every row referencing that building, so the graph is parsed
+exactly once no matter how many rows this script processes against it.
 
 Usage:
   # Quick smoke run: 25 sampled rows per CSV (the default)
@@ -77,39 +78,47 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 # ==============================================================================
 
 
-def _value_set(query_text: str, store: pyoxigraph.Store, limit: Optional[int]) -> tuple[Optional[set], Optional[str]]:
-    """Runs a SELECT query and flattens every bound term across every
-    row/column into a set of string values. Returns (values, error)."""
+def calculate_f1(gen_values: Optional[set], gt_values: Optional[set]) -> float:
+    """Computes F1 score between two sets of values."""
+    if gen_values is None or gt_values is None:
+        return 0.0
+    if not gt_values and not gen_values:
+        return 1.0
+    if not gt_values or not gen_values:
+        return 0.0
+    tp = len(gen_values & gt_values)
+    precision = tp / len(gen_values)
+    recall = tp / len(gt_values)
+    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0.0
+    return f1
+
+
+def _get_full_query_stats(query_text: str, store: pyoxigraph.Store, limit: Optional[int]) -> tuple[Optional[set], Optional[int], Optional[int], Optional[list[frozenset]], Optional[str]]:
+    """Runs a SELECT query and returns (values, row_count, col_count, row_sets, error)."""
     q = query_text
     if limit and "LIMIT" not in query_text.upper():
         q = f"{query_text}\nLIMIT {limit}"
     try:
         solutions = store.query(q)
         values = set()
+        row_sets = []
+        row_count = 0
+        col_count = 0
         for solution in solutions:
+            row_count += 1
+            if row_count == 1:
+                col_count = len(solution)
+            row_vals = frozenset(str(term) for term in solution.values() if term is not None)
+            row_sets.append(row_vals)
             for term in solution:
                 if term is not None:
                     values.add(str(term))
-        return values, None
-    except Exception as exc:  # noqa: BLE001 - want to record any query failure
-        return None, str(exc)
-
-
-def _get_row_sets(query_text: str, store: pyoxigraph.Store, limit: Optional[int]) -> tuple[Optional[list[frozenset]], Optional[str]]:
-    """Runs a SELECT query and returns a list of frozensets, one per row,
-    containing all bound values in that row."""
-    q = query_text
-    if limit and "LIMIT" not in query_text.upper():
-        q = f"{query_text}\nLIMIT {limit}"
-    try:
-        solutions = store.query(q)
-        row_sets = []
-        for solution in solutions:
-            values = frozenset(str(term) for term in solution.values() if term is not None)
-            row_sets.append(values)
-        return row_sets, None
+        return values, row_count, col_count, row_sets, None
     except Exception as exc:
-        return None, str(exc)
+        return None, None, None, None, str(exc)
+
+
+# (deleted _get_row_sets)
 
 
 def _row_coverage_stats(res_sets: list[frozenset], gt_sets: list[frozenset]) -> tuple[int, int]:
@@ -126,20 +135,9 @@ def _row_coverage_stats(res_sets: list[frozenset], gt_sets: list[frozenset]) -> 
 
 def value_set_f1(query_text: str, gt_values: set, store: pyoxigraph.Store, limit: Optional[int]) -> tuple[float, Optional[str]]:
     """Scores `query_text`'s value set against a precomputed ground-truth
-    value set. A query that errors scores 0.0 (matching the prior Python
-    eval's convention) rather than being excluded."""
-    gen_values, error = _value_set(query_text, store, limit)
-    if gen_values is None:
-        return 0.0, error
-    if not gt_values and not gen_values:
-        return 1.0, None
-    if not gt_values or not gen_values:
-        return 0.0, None
-    tp = len(gen_values & gt_values)
-    precision = tp / len(gen_values)
-    recall = tp / len(gt_values)
-    f1 = (2 * precision * recall) / (precision + recall) if (precision + recall) else 0.0
-    return f1, None
+    value set. A query that errors scores 0.0."""
+    gen_values, _, _, _, error = _get_full_query_stats(query_text, store, limit)
+    return calculate_f1(gen_values, gt_values), error
 
 
 # ==============================================================================
@@ -148,14 +146,22 @@ def value_set_f1(query_text: str, gt_values: set, store: pyoxigraph.Store, limit
 
 
 class BuildingCache:
-    """Loads each building's TTL once (as both raw text, for
-    `diagnose_and_relax`, and a `pyoxigraph.Store`, for fast scoring
-    queries) and reuses it for every row referencing that building."""
+    """Loads each building's TTL once — as a `pyoxigraph.Store` for fast scoring queries, and a
+    `sparql_relax_rs.Store` for `diagnose`/`diagnose_and_relax` — and reuses both for every row
+    referencing that building.
+
+    Building the `sparql_relax_rs.Store` here (once) rather than passing raw text to
+    `diagnose`/`diagnose_and_relax` on every row (which would each reparse and reindex the whole
+    graph from scratch) is the single biggest lever available for a batch like this one, worth far
+    more than any of the search-side tuning knobs below: on `b59.ttl` (46k triples, ~1.5MB), a
+    throwaway per-call parse costs roughly 100ms *before* any diagnosis work even starts, and this
+    script runs thousands of rows against a handful of buildings.
+    """
 
     def __init__(self, buildings_dir: Path):
         self.buildings_dir = buildings_dir
         self._stores: dict[str, Optional[pyoxigraph.Store]] = {}
-        self._texts: dict[str, Optional[str]] = {}
+        self._relax_stores: dict[str, Optional[sparql_relax_rs.Store]] = {}
         # Guards the check-and-load below: with concurrent rows (--workers > 1),
         # two threads racing to first-load the same building would otherwise
         # parse the same TTL twice.
@@ -171,23 +177,24 @@ class BuildingCache:
         if not path.exists():
             print(f"  warning: building graph not found: {path}", file=sys.stderr, flush=True)
             self._stores[building] = None
-            self._texts[building] = None
+            self._relax_stores[building] = None
             return
         t0 = time.monotonic()
         text = path.read_text()
         store = pyoxigraph.Store()
         store.load(text.encode("utf-8"), format=pyoxigraph.RdfFormat.TURTLE)
+        relax_store = sparql_relax_rs.Store(text)
         print(f"  loaded {path.name} ({len(store)} triples) in {round(time.monotonic() - t0, 3)}s", flush=True)
         self._stores[building] = store
-        self._texts[building] = text
+        self._relax_stores[building] = relax_store
 
     def store(self, building: str) -> Optional[pyoxigraph.Store]:
         self._ensure_loaded(building)
         return self._stores[building]
 
-    def text(self, building: str) -> Optional[str]:
+    def relax_store(self, building: str) -> Optional[sparql_relax_rs.Store]:
         self._ensure_loaded(building)
-        return self._texts[building]
+        return self._relax_stores[building]
 
 
 # ==============================================================================
@@ -215,24 +222,26 @@ def load_rows(csv_path: str) -> pd.DataFrame:
 
 OUTPUT_FIELDS = [
     "source_csv", "query_id", "question", "building", "approach", "model_name",
-    "skipped", "score_error",
-    "original_f1", "original_row_coverage", "original_excess_rows",
-    "num_bgp_culprits", "num_filter_culprits", "culprit_triples", "culprit_depths",
-    "best_found_at_depth", "best_relaxed_f1", "best_relaxed_row_coverage", "best_relaxed_excess_rows", "delta_f1",
-    "best_relaxed_triples", "best_relaxed_path_texts", "best_relaxed_query",
-    "diagnose_error", "elapsed_sec",
+    "skipped", "original_value_set_f1", "best_value_set_f1", "best_stmt_index",
+    "best_stmt_type", "best_stmt_text", "removed_statements", "original_sparql",
+    "best_sparql", "delta_value_set_f1", "result_row_count", "result_col_count",
+    "result_unique_value_count", "gt_row_count", "gt_col_count", "gt_unique_value_count",
+    "syntax_ok", "timed_out", "error", "elapsed_sec", "relax_attempted",
+    "relax_value_set_f1", "relax_result_row_count", "relax_result_col_count",
+    "relax_sparql", "relax_delta_value_set_f1", "relax_elapsed_sec",
+    "gt_rows_covered", "excess_result_rows", "relax_gt_rows_covered", "relax_excess_result_rows"
 ]
 
 
 def _blank_relax_fields() -> dict:
-    """The relaxation-only output columns, blank: shared by every code path
-    that doesn't run (or didn't finish) the relax phase — a skipped row, a
-    diagnose-only row, or a row where diagnosis found culprits but no
-    relaxed_query was built for any of them."""
+    """Default values for relaxation columns when no relaxation is performed or found."""
     return {
-        "best_found_at_depth": "", "best_relaxed_f1": "", "best_relaxed_row_coverage": "",
-        "best_relaxed_excess_rows": "", "delta_f1": "",
-        "best_relaxed_triples": "", "best_relaxed_path_texts": "", "best_relaxed_query": "",
+        "best_value_set_f1": "", "best_stmt_index": -1, "best_stmt_type": "baseline",
+        "best_stmt_text": "", "removed_statements": "[]", "best_sparql": "",
+        "delta_value_set_f1": "", "relax_attempted": False, "relax_value_set_f1": "",
+        "relax_result_row_count": "", "relax_result_col_count": "", "relax_sparql": "",
+        "relax_delta_value_set_f1": "", "relax_elapsed_sec": "",
+        "relax_gt_rows_covered": "", "relax_excess_result_rows": "",
     }
 
 
@@ -251,8 +260,8 @@ class EvalConfig:
 def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig) -> Optional[dict]:
     building = str(row.get("building", ""))
     store = cache.store(building)
-    text = cache.text(building)
-    if store is None or text is None:
+    relax_store = cache.relax_store(building)
+    if store is None or relax_store is None:
         return None
 
     base = {
@@ -268,190 +277,195 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     gt_query = str(row["ground_truth_sparql"])
 
     t_score0 = time.monotonic()
-    gt_values, gt_error = _value_set(gt_query, store, cfg.limit)
+    gt_values, gt_rows, gt_cols, gt_sets, gt_error = _get_full_query_stats(gt_query, store, cfg.limit)
     if gt_values is None:
-        gt_values = set()  # ground truth itself failed to run; treat as empty
+        gt_values, gt_rows, gt_cols, gt_sets = set(), 0, 0, []
 
-    gt_sets, _ = _get_row_sets(gt_query, store, cfg.limit)
-    if gt_sets is None:
-        gt_sets = []
+    gen_values, gen_rows, gen_cols, gen_sets, gen_error = _get_full_query_stats(gen_query, store, cfg.limit)
+    if gen_values is None:
+        gen_values, gen_rows, gen_cols, gen_sets = set(), 0, 0, []
 
-    original_f1, score_error = value_set_f1(gen_query, gt_values, store, cfg.limit)
-    
-    gen_sets, _ = _get_row_sets(gen_query, store, cfg.limit)
-    if gen_sets is None:
-        gen_sets = []
+    original_f1 = calculate_f1(gen_values, gt_values)
     orig_cov, orig_exc = _row_coverage_stats(gen_sets, gt_sets)
-
     t_score = round(time.monotonic() - t_score0, 3)
+
     if cfg.verbose:
         print(f"    scored original+GT in {t_score}s -> original_f1={original_f1:.3f}, cov={orig_cov}, exc={orig_exc}", flush=True)
 
     if original_f1 >= cfg.threshold:
         return {
-            **base, "skipped": True, "score_error": score_error or gt_error or "",
-            "original_f1": round(original_f1, 6),
-            "original_row_coverage": orig_cov, "original_excess_rows": orig_exc,
-            "num_bgp_culprits": "", "num_filter_culprits": "", "culprit_triples": "", "culprit_depths": "",
+            **base, "skipped": True,
+            "original_value_set_f1": round(original_f1, 6),
+            "result_row_count": gen_rows, "result_col_count": gen_cols,
+            "result_unique_value_count": len(gen_values),
+            "gt_row_count": gt_rows, "gt_col_count": gt_cols,
+            "gt_unique_value_count": len(gt_values),
+            "syntax_ok": gen_error == "", "timed_out": "timed out" in (gen_error or "").lower(),
+            "error": gen_error or "", "elapsed_sec": t_score,
+            "gt_rows_covered": orig_cov, "excess_result_rows": orig_exc,
+            "original_sparql": gen_query, "best_sparql": gen_query,
+            "best_value_set_f1": round(original_f1, 6),
+            "best_stmt_index": -1, "best_stmt_type": "baseline",
+            "best_stmt_text": "", "removed_statements": "[]",
+            "delta_value_set_f1": 0.0,
             **_blank_relax_fields(),
-            "diagnose_error": "", "elapsed_sec": "",
         }
 
     common = {
-        **base, "skipped": False, "score_error": score_error or gt_error or "",
-        "original_f1": round(original_f1, 6),
-        "original_row_coverage": orig_cov, "original_excess_rows": orig_exc,
+        **base, "skipped": False,
+        "original_value_set_f1": round(original_f1, 6),
+        "result_row_count": gen_rows, "result_col_count": gen_cols,
+        "result_unique_value_count": len(gen_values),
+        "gt_row_count": gt_rows, "gt_col_count": gt_cols,
+        "gt_unique_value_count": len(gt_values),
+        "syntax_ok": gen_error == "", "timed_out": "timed out" in (gen_error or "").lower(),
+        "error": gen_error or "", "elapsed_sec": t_score,
+        "gt_rows_covered": orig_cov, "excess_result_rows": orig_exc,
+        "original_sparql": gen_query,
+        "relax_attempted": True,
     }
 
     if cfg.diagnose_only:
-        return _diagnose_only_row(text, gen_query, cfg, common, base["query_id"], building)
+        return _diagnose_only_row(relax_store, gen_query, cfg, common, base["query_id"], building)
 
     if cfg.verbose:
         print(f"  [{base['query_id']}] {building}  original_f1={original_f1:.3f} -> relaxing...", flush=True)
 
     t0 = time.monotonic()
-    diagnose_error = ""
     best_f1 = -1.0
     best = None
-    num_bgp_culprits = 0
-    num_filter_culprits = 0
-    culprit_triples = culprit_depths = ""
+    best_idx = -1
+    
+    # Diagnose phase
+    t_diag_start = time.monotonic()
+    try:
+        diag_executor = ThreadPoolExecutor(max_workers=1)
+        diag_future = diag_executor.submit(relax_store.diagnose, gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
+        try:
+            diag_future.result(timeout=cfg.timeout)
+        finally:
+            diag_executor.shutdown(wait=False)
+    except Exception:
+        pass
+    t_diag_elapsed = time.monotonic() - t_diag_start
+
+    # Relaxation phase
+    t_relax_start = time.monotonic()
     try:
         t_relax0 = time.monotonic()
-        # A handful of queries turn out to need a genuinely expensive
-        # reduced-query evaluation (e.g. removing the one type-constraining
-        # triple leaves the rest of the query essentially unconstrained,
-        # forcing a large join) — that's a real SPARQL execution cost, not
-        # something our search algorithm can avoid. Bound it with a timeout
-        # rather than letting one pathological row stall the whole batch.
-        # A fresh single-worker executor per row (rather than a shared pool)
-        # means an abandoned/still-running worker from a timed-out row can
-        # never block a later row's submission.
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(
-            sparql_relax_rs.diagnose_and_relax,
-            text, gen_query,
+            relax_store.diagnose_and_relax,
+            gen_query,
             ablation_depth=cfg.ablation_depth,
             max_depth=cfg.max_depth,
             sample_limit=cfg.sample_limit,
+            timeout=cfg.timeout,
+            diagnose_timeout=cfg.timeout,
         )
         try:
             report = future.result(timeout=cfg.timeout)
+            t_candidates0 = time.monotonic()
+            for idx, culprit in enumerate(report.results):
+                if not culprit.relaxed_query:
+                    continue
+                f1, _ = value_set_f1(culprit.relaxed_query, gt_values, store, cfg.limit)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best = culprit
+                    best_idx = idx
         finally:
             executor.shutdown(wait=False)
-        t_relax = round(time.monotonic() - t_relax0, 3)
-        num_bgp_culprits = len(report.results)
-        num_filter_culprits = len(report.filter_results)
-        culprit_triples = " | ".join(" && ".join(t.triple for t in c.triples) for c in report.results)
-        culprit_depths = " | ".join(str(c.found_at_depth) for c in report.results)
-        if cfg.verbose:
-            print(
-                f"    diagnose_and_relax took {t_relax}s -> "
-                f"{num_bgp_culprits} triple culprit(s), {num_filter_culprits} filter culprit(s)",
-                flush=True,
-            )
-        t_candidates0 = time.monotonic()
-        for culprit in report.results:
-            if not culprit.relaxed_query:
-                continue
-            f1, _ = value_set_f1(culprit.relaxed_query, gt_values, store, cfg.limit)
-            if f1 > best_f1:
-                best_f1 = f1
-                best = culprit
-        if cfg.verbose:
-            print(f"    scored {num_bgp_culprits} candidate(s) in {round(time.monotonic() - t_candidates0, 3)}s", flush=True)
     except FutureTimeoutError:
-        diagnose_error = f"timed out after {cfg.timeout}s"
-        if cfg.verbose:
-            print(f"    diagnose_and_relax timed out after {cfg.timeout}s (abandoned; moving on)", flush=True)
-    except Exception as exc:  # noqa: BLE001 - keep going across the whole batch
-        diagnose_error = str(exc)
-        if cfg.verbose:
-            print(f"    diagnose_and_relax errored after {round(time.monotonic() - t0, 3)}s: {exc}", flush=True)
+        best_f1 = -1.0
+    except Exception:
+        best_f1 = -1.0
+    t_relax_elapsed = time.monotonic() - t_relax_start
 
-    elapsed = round(time.monotonic() - t0, 3)
-    if cfg.verbose:
-        print(f"    row total: {elapsed}s", flush=True)
+    # Total time for baseline + diagnosis
+    total_elapsed_sec = round(t_score + t_diag_elapsed, 3)
+    t_relax_elapsed = round(t_relax_elapsed, 3)
 
-    if best is None:
+    if best is None or best_f1 <= original_f1:
         return {
             **common,
-            "num_bgp_culprits": num_bgp_culprits, "num_filter_culprits": num_filter_culprits,
-            "culprit_triples": culprit_triples, "culprit_depths": culprit_depths,
-            **_blank_relax_fields(),
-            "diagnose_error": diagnose_error, "elapsed_sec": elapsed,
+            "best_value_set_f1": round(original_f1, 6),
+            "best_stmt_index": -1, "best_stmt_type": "baseline",
+            "best_stmt_text": "", "removed_statements": "[]",
+            "best_sparql": gen_query,
+            "delta_value_set_f1": 0.0,
+            "relax_value_set_f1": round(best_f1, 6) if best_f1 >= 0 else "",
+            "relax_result_row_count": "", "relax_result_col_count": "",
+            "relax_sparql": "", "relax_delta_value_set_f1": "",
+            "relax_elapsed_sec": t_relax_elapsed,
+            "relax_gt_rows_covered": "", "relax_excess_result_rows": "",
+            "elapsed_sec": total_elapsed_sec,
         }
 
-    # Calculate coverage for the best relaxed query
-    best_sets, _ = _get_row_sets(best.relaxed_query, store, cfg.limit)
-    if best_sets is None:
-        best_sets = []
-    best_cov, best_exc = _row_coverage_stats(best_sets, gt_sets)
+    rel_values, rel_rows, rel_cols, rel_sets, _ = _get_full_query_stats(best.relaxed_query, store, cfg.limit)
+    if rel_values is None:
+        rel_values, rel_rows, rel_cols, rel_sets = set(), 0, 0, []
+    rel_cov, rel_exc = _row_coverage_stats(rel_sets, gt_sets)
 
     return {
         **common,
-        "num_bgp_culprits": num_bgp_culprits, "num_filter_culprits": num_filter_culprits,
-        "culprit_triples": culprit_triples, "culprit_depths": culprit_depths,
-        "best_found_at_depth": best.found_at_depth,
-        "best_relaxed_f1": round(best_f1, 6),
-        "best_relaxed_row_coverage": best_cov, "best_relaxed_excess_rows": best_exc,
-        "delta_f1": round(best_f1 - original_f1, 6),
-        "best_relaxed_triples": " | ".join(t.triple for t in best.triples),
-        "best_relaxed_path_texts": " | ".join(t.path_text or "" for t in best.triples),
-        "best_relaxed_query": best.relaxed_query,
-        "diagnose_error": diagnose_error, "elapsed_sec": elapsed,
+        "best_value_set_f1": round(best_f1, 6),
+        "best_stmt_index": best_idx,
+        "best_stmt_type": "relaxed",
+        "best_stmt_text": " | ".join(t.triple for t in best.triples),
+        "removed_statements": str([t.triple for t in best.triples]),
+        "best_sparql": best.relaxed_query,
+        "delta_value_set_f1": round(best_f1 - original_f1, 6),
+        "relax_value_set_f1": round(best_f1, 6),
+        "relax_result_row_count": rel_rows,
+        "relax_result_col_count": rel_cols,
+        "relax_sparql": best.relaxed_query,
+        "relax_delta_value_set_f1": round(best_f1 - original_f1, 6),
+        "relax_elapsed_sec": t_relax_elapsed,
+        "relax_gt_rows_covered": rel_cov,
+        "relax_excess_result_rows": rel_exc,
+        "elapsed_sec": total_elapsed_sec,
     }
 
 
-def _diagnose_only_row(text: str, gen_query: str, cfg: EvalConfig, common: dict, query_id: str, building: str) -> dict:
-    """Runs just `diagnose()` — no endpoint resolution, no path search, no
+def _diagnose_only_row(
+    relax_store: sparql_relax_rs.Store, gen_query: str, cfg: EvalConfig, common: dict, query_id: str, building: str
+) -> dict:
+    """Runs just `Store.diagnose()` — no endpoint resolution, no path search, no
     candidate scoring — and reports which triples/filters were flagged as
     culprits. Used by `--diagnose-only`, where the relax phase's cost isn't
     wanted at all."""
     if cfg.verbose:
         print(f"  [{query_id}] {building}  -> diagnosing...", flush=True)
 
-    t0 = time.monotonic()
+    t_diag_start = time.monotonic()
     diagnose_error = ""
-    num_bgp_culprits = num_filter_culprits = 0
-    culprit_triples = culprit_depths = ""
     try:
-        # Same rationale as the diagnose_and_relax timeout wrapper below:
-        # diagnosis's own reduced-query re-execution can occasionally be
-        # expensive too, and isn't internally timeout-bounded the way
-        # relaxation is.
         executor = ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(sparql_relax_rs.diagnose, text, gen_query, depth=cfg.ablation_depth)
+        future = executor.submit(relax_store.diagnose, gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
         try:
-            diagnosis = future.result(timeout=cfg.timeout)
+            future.result(timeout=cfg.timeout)
         finally:
             executor.shutdown(wait=False)
-        num_bgp_culprits = len(diagnosis.culprits)
-        num_filter_culprits = len(diagnosis.filter_culprits)
-        culprit_triples = " | ".join(" && ".join(c.triples) for c in diagnosis.culprits)
-        culprit_depths = " | ".join(str(c.depth) for c in diagnosis.culprits)
-        if cfg.verbose:
-            print(
-                f"    diagnose took {round(time.monotonic() - t0, 3)}s -> "
-                f"{num_bgp_culprits} triple culprit(s), {num_filter_culprits} filter culprit(s)",
-                flush=True,
-            )
     except FutureTimeoutError:
         diagnose_error = f"timed out after {cfg.timeout}s"
-        if cfg.verbose:
-            print(f"    diagnose timed out after {cfg.timeout}s (abandoned; moving on)", flush=True)
-    except Exception as exc:  # noqa: BLE001 - keep going across the whole batch
+    except Exception as exc:
         diagnose_error = str(exc)
-        if cfg.verbose:
-            print(f"    diagnose errored after {round(time.monotonic() - t0, 3)}s: {exc}", flush=True)
+    t_diag_elapsed = time.monotonic() - t_diag_start
 
     return {
         **common,
-        "num_bgp_culprits": num_bgp_culprits, "num_filter_culprits": num_filter_culprits,
-        "culprit_triples": culprit_triples, "culprit_depths": culprit_depths,
+        "best_value_set_f1": common["original_value_set_f1"],
+        "best_stmt_index": -1, "best_stmt_type": "baseline",
+        "best_stmt_text": "", "removed_statements": "[]",
+        "best_sparql": common["original_sparql"],
+        "delta_value_set_f1": 0.0,
         **_blank_relax_fields(),
-        "diagnose_error": diagnose_error, "elapsed_sec": round(time.monotonic() - t0, 3),
+        "relax_attempted": True,
+        "error": diagnose_error or common["error"],
+        "elapsed_sec": round(common["elapsed_sec"] + t_diag_elapsed, 3),
     }
+
 
 
 # ==============================================================================

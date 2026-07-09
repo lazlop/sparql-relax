@@ -41,7 +41,7 @@ use spargebra::SparqlParser;
 use spargebra::algebra::{Expression, GraphPattern};
 use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// One or more BGP triples whose *joint* removal unblocks the query, and
 /// which never jointly hold for any binding of the rest of the query — the
@@ -74,10 +74,17 @@ pub struct Diagnosis {
 /// bad query, so this stays small to keep the (combinatorial) search cheap.
 pub const DEFAULT_ABLATION_DEPTH: usize = 3;
 
-/// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`].
-/// A convenient default for callers who don't need to tune the search.
+/// Default for `timeout`: a single ablation check is normally well under
+/// this; five seconds is enough headroom for that while still bounding the
+/// rare reduced query that turns into a much larger join than the original
+/// (see the `timeout` docs on [`diagnose`]).
+pub const DEFAULT_ABLATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`]
+/// and [`DEFAULT_ABLATION_TIMEOUT`]. A convenient default for callers who
+/// don't need to tune the search.
 pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
-    diagnose(query_text, store, DEFAULT_ABLATION_DEPTH)
+    diagnose(query_text, store, DEFAULT_ABLATION_DEPTH, Some(DEFAULT_ABLATION_TIMEOUT))
 }
 
 /// Diagnoses `query_text` against `store`. Only `SELECT` queries are
@@ -91,11 +98,26 @@ pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
 /// query (there may be more than one such combination; all are returned),
 /// or once the combination size would exceed the number of candidate
 /// triples. `depth = 1` reproduces single-triple-only diagnosis.
-pub fn diagnose(query_text: &str, store: &Store, depth: usize) -> Result<Diagnosis> {
+///
+/// `timeout` bounds every SPARQL query this call runs — the original query
+/// itself, each candidate combination's ablation check, and each filter's
+/// ablation check — with one shared deadline rather than a fresh budget per
+/// check, so the *whole* call is bounded by roughly `timeout` regardless of
+/// how many candidates there are to work through. A combination or filter
+/// that can't be checked in time is treated as "not a culprit" (a
+/// conservative false rather than a risky claim based on partial evidence);
+/// if the *original* query itself can't even be evaluated within the
+/// budget, [`RelaxError::Timeout`](crate::error::RelaxError::Timeout) is
+/// returned, since there's nothing meaningful to diagnose without it. Pass
+/// `None` to leave it unbounded — but see the module docs: an abandoned
+/// caller-side timeout (e.g. a Python `future.result(timeout=...)`) doesn't
+/// stop this function from still running to completion in the background,
+/// so a real, enforced `timeout` here is what actually bounds the work.
+pub fn diagnose(query_text: &str, store: &Store, depth: usize, timeout: Option<Duration>) -> Result<Diagnosis> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
-    diagnose_parsed(query_text, &query, &pattern, store, depth)
+    diagnose_parsed(&query, &pattern, store, depth, timeout)
 }
 
 pub(crate) fn ensure_select(query: &Query) -> Result<()> {
@@ -106,17 +128,29 @@ pub(crate) fn ensure_select(query: &Query) -> Result<()> {
 }
 
 /// Same as [`diagnose`], but takes an already-parsed `query`/`pattern`
-/// instead of re-parsing `query_text` itself (still needed to actually run
-/// the *original* query once, unmodified). [`crate::relax::diagnose_and_relax`]
-/// uses this — rather than calling [`diagnose`] and then separately
-/// re-parsing the same text a second time for its own use — so the culprit
-/// triples it gets back are guaranteed to be the exact same values it can
-/// later find and remove from its own copy of the pattern. Two independent
-/// parses of identical text are not guaranteed to produce identical
-/// `TriplePattern` values in every case, which would otherwise make a
-/// culprit "disappear" when relaxation tries to remove it.
-pub(crate) fn diagnose_parsed(query_text: &str, query: &Query, pattern: &GraphPattern, store: &Store, depth: usize) -> Result<Diagnosis> {
-    let original_rows = run_select(query_text, store)?;
+/// instead of re-parsing query text itself.
+/// [`crate::relax::diagnose_and_relax`] uses this — rather than calling
+/// [`diagnose`] and then separately re-parsing the same text a second time
+/// for its own use — so the culprit triples it gets back are guaranteed to
+/// be the exact same values it can later find and remove from its own copy
+/// of the pattern. Two independent parses of identical text are not
+/// guaranteed to produce identical `TriplePattern` values in every case,
+/// which would otherwise make a culprit "disappear" when relaxation tries
+/// to remove it.
+pub(crate) fn diagnose_parsed(
+    query: &Query,
+    pattern: &GraphPattern,
+    store: &Store,
+    depth: usize,
+    timeout: Option<Duration>,
+) -> Result<Diagnosis> {
+    // One shared deadline for every query this call runs, rather than a
+    // fresh budget per check — see the `timeout` docs on [`diagnose`].
+    let deadline = timeout.map(|t| Instant::now() + t);
+
+    let Some(original_rows) = run_select_query_with_deadline(query.clone(), store, deadline)? else {
+        return Err(RelaxError::Timeout);
+    };
 
     let triple_candidates: Vec<TriplePattern> = collect_bgp_triples(pattern)
         .into_iter()
@@ -140,7 +174,7 @@ pub(crate) fn diagnose_parsed(query_text: &str, query: &Query, pattern: &GraphPa
         // once a query has more than a handful of candidate triples.
         let found: Vec<Culprit> = combinations(&triple_candidates, k)
             .into_par_iter()
-            .filter(|combo| is_culprit_combo(query, pattern, combo, store, original_rows.is_empty()))
+            .filter(|combo| is_culprit_combo(query, pattern, combo, store, original_rows.is_empty(), deadline))
             .map(|triples| Culprit { triples, depth: k })
             .collect();
 
@@ -157,7 +191,7 @@ pub(crate) fn diagnose_parsed(query_text: &str, query: &Query, pattern: &GraphPa
         .into_par_iter()
         .filter_map(|expression| {
             let reduced_pattern = remove_filter(pattern, &expression)?;
-            let reduced_rows = run_select_query(with_pattern(query, reduced_pattern), store).ok()?;
+            let reduced_rows = run_select_query_with_deadline(with_pattern(query, reduced_pattern), store, deadline).ok().flatten()?;
             // Removing a FILTER can only ever keep or grow the result set
             // (it's a pure restriction), so a strict increase means this
             // filter was actually excluding rows. (Unlike triple combos,
@@ -186,32 +220,56 @@ pub(crate) fn diagnose_parsed(query_text: &str, query: &Query, pattern: &GraphPa
 /// it's skipped entirely in favor of a single cheap existence check
 /// ([`pattern_has_solution`]). This only holds when the original query is
 /// empty; otherwise the full per-row check below is still needed.
-fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern], store: &Store, original_is_empty: bool) -> bool {
+///
+/// `deadline` bounds the query work the same way as
+/// [`run_select_query_with_deadline`]. Hitting it is treated as "not a
+/// culprit" (`false`) rather than a hang: claiming culprit-hood on
+/// unfinished evaluation would be a false positive (see the per-row loop
+/// below, which only saw *some* of the reduced query's rows before being
+/// cut off — not enough to conclude none of them jointly satisfy `combo`).
+fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern], store: &Store, original_is_empty: bool, deadline: Option<Instant>) -> bool {
     let Some(reduced_pattern) = combo.iter().try_fold(pattern.clone(), |p, t| remove_triple(&p, t)) else {
         return false;
     };
 
     if original_is_empty {
-        return pattern_has_solution(query, reduced_pattern, store);
+        return pattern_has_solution(query, reduced_pattern, store, deadline);
+    }
+
+    let cancellation_token = match deadline {
+        None => None,
+        Some(deadline) => match deadline_token(deadline) {
+            Some(token) => Some(token),
+            None => return false, // budget already exhausted before this combo could even start
+        },
+    };
+    let mut evaluator = SparqlEvaluator::new();
+    if let Some(token) = cancellation_token {
+        evaluator = evaluator.with_cancellation_token(token);
     }
 
     // Streams the reduced query's solutions one at a time rather than
-    // collecting them all first (unlike [`run_select`]): the common case is
-    // a combo that *does* jointly hold somewhere (not a culprit), and that
-    // can stop at the very first matching row instead of paying to
+    // collecting them all first (unlike [`run_select_query`]): the common
+    // case is a combo that *does* jointly hold somewhere (not a culprit),
+    // and that can stop at the very first matching row instead of paying to
     // materialize a potentially large result set that removing constraining
     // triples tends to produce.
-    let Ok(results) = SparqlEvaluator::new().for_query(with_pattern(query, reduced_pattern)).on_store(store).execute() else {
+    let Ok(results) = evaluator.for_query(with_pattern(query, reduced_pattern)).on_store(store).execute() else {
         return false;
     };
     let QueryResults::Solutions(solutions) = results else { return false };
 
     let mut any_row = false;
     for solution in solutions {
-        let Ok(row) = solution else { break };
-        any_row = true;
-        if combo.iter().all(|t| triple_holds_for_row(store, t, &row)) {
-            return false; // some binding satisfies every triple in the combo; not a genuine culprit set
+        match solution {
+            Ok(row) => {
+                any_row = true;
+                if combo.iter().all(|t| triple_holds_for_row(store, t, &row)) {
+                    return false; // some binding satisfies every triple in the combo; not a genuine culprit set
+                }
+            }
+            Err(QueryEvaluationError::Cancelled) => return false, // saw only some rows; not enough to conclude "not a culprit"
+            Err(_) => break,
         }
     }
     any_row // non-empty, and no row ever satisfied the whole combo jointly
@@ -220,12 +278,23 @@ fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePatter
 /// Whether `pattern` has at least one solution against `store`, evaluated as
 /// a SPARQL `ASK` (short-circuits on the first matching solution) rather
 /// than a `SELECT` that has to be told to stop separately or fully
-/// materialized to find out.
-fn pattern_has_solution(query: &Query, pattern: GraphPattern, store: &Store) -> bool {
-    let Ok(results) = SparqlEvaluator::new().for_query(ask_query(query, pattern)).on_store(store).execute() else {
-        return false;
+/// materialized to find out. `deadline` bounds the evaluation the same way
+/// as [`run_select_query_with_deadline`]; hitting it is treated as "no
+/// solution found" (`false`) rather than a hang, since claiming a solution
+/// exists on unfinished evaluation would be a false positive.
+fn pattern_has_solution(query: &Query, pattern: GraphPattern, store: &Store, deadline: Option<Instant>) -> bool {
+    let cancellation_token = match deadline {
+        None => None,
+        Some(deadline) => match deadline_token(deadline) {
+            Some(token) => Some(token),
+            None => return false,
+        },
     };
-    matches!(results, QueryResults::Boolean(true))
+    let mut evaluator = SparqlEvaluator::new();
+    if let Some(token) = cancellation_token {
+        evaluator = evaluator.with_cancellation_token(token);
+    }
+    matches!(evaluator.for_query(ask_query(query, pattern)).on_store(store).execute(), Ok(QueryResults::Boolean(true)))
 }
 
 /// All distinct size-`k` combinations of `items` (order-independent, no
@@ -286,24 +355,8 @@ fn triple_holds_for_row(store: &Store, triple: &TriplePattern, row: &QuerySoluti
         .is_some()
 }
 
-pub(crate) fn run_select(query_text: &str, store: &Store) -> Result<Vec<QuerySolution>> {
-    let results = SparqlEvaluator::new().parse_query(query_text)?.on_store(store).execute()?;
-    match results {
-        QueryResults::Solutions(iter) => {
-            let mut rows = Vec::new();
-            for solution in iter {
-                rows.push(solution?);
-            }
-            Ok(rows)
-        }
-        _ => Err(RelaxError::UnsupportedQueryForm("SELECT")),
-    }
-}
-
-/// Same as [`run_select`], but takes an already-parsed `query` instead of
-/// text — skips the serialize-then-reparse round trip for callers that
-/// built `query` from the algebra tree themselves (e.g. a reduced pattern)
-/// rather than starting from SPARQL text.
+/// Runs an already-parsed `query` (e.g. one built from a reduced pattern
+/// rather than starting from SPARQL text) to completion, unbounded.
 fn run_select_query(query: Query, store: &Store) -> Result<Vec<QuerySolution>> {
     let results = SparqlEvaluator::new().for_query(query).on_store(store).execute()?;
     match results {
@@ -318,6 +371,30 @@ fn run_select_query(query: Query, store: &Store) -> Result<Vec<QuerySolution>> {
     }
 }
 
+/// A cancellation token a background timer will cancel once `deadline`
+/// passes, or `None` if `deadline` is already in the past — nothing left to
+/// run, so there's no point starting a query only to cancel it immediately.
+/// Shared by every deadline-aware query execution in this module so the
+/// "spawn a timer, cancel on timeout" wiring only needs writing once.
+///
+/// Backed by Oxigraph's own `CancellationToken`, checked by the query
+/// engine on every underlying quad lookup — a real mid-evaluation abort,
+/// not just a wrapper that gives up waiting while the query keeps running
+/// in the background (see the module docs on why that distinction matters).
+fn deadline_token(deadline: Instant) -> Option<CancellationToken> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    let cancellation_token = CancellationToken::new();
+    let timer_token = cancellation_token.clone();
+    thread::spawn(move || {
+        thread::sleep(remaining);
+        timer_token.cancel();
+    });
+    Some(cancellation_token)
+}
+
 /// Same as [`run_select_query`], but aborts the evaluation rather than
 /// running it unbounded if it doesn't finish by `deadline` (`None` means no
 /// deadline — delegates straight to [`run_select_query`]). `Ok(None)`
@@ -328,26 +405,13 @@ fn run_select_query(query: Query, store: &Store) -> Result<Vec<QuerySolution>> {
 /// reduced-query evaluation (e.g. removing a triple leaves the rest of the
 /// query essentially unconstrained, forcing a large join) shouldn't be able
 /// to hang or fail a caller that's relaxing many culprits at once.
-///
-/// Backed by Oxigraph's own `CancellationToken`, checked by the query
-/// engine on every underlying quad lookup — a real mid-evaluation abort,
-/// not just a wrapper that gives up waiting while the query keeps running
-/// in the background.
 pub(crate) fn run_select_query_with_deadline(query: Query, store: &Store, deadline: Option<Instant>) -> Result<Option<Vec<QuerySolution>>> {
     let Some(deadline) = deadline else {
         return run_select_query(query, store).map(Some);
     };
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
+    let Some(cancellation_token) = deadline_token(deadline) else {
         return Ok(None);
-    }
-
-    let cancellation_token = CancellationToken::new();
-    let timer_token = cancellation_token.clone();
-    thread::spawn(move || {
-        thread::sleep(remaining);
-        timer_token.cancel();
-    });
+    };
 
     let results = match SparqlEvaluator::new().with_cancellation_token(cancellation_token).for_query(query).on_store(store).execute() {
         Ok(results) => results,

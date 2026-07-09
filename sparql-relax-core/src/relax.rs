@@ -25,19 +25,30 @@
 //! predicate falls outside every listed namespace are simply invisible to
 //! the search, even if they'd otherwise connect the two endpoints.
 //!
-//! Relaxing one culprit combination can itself be expensive — resolving
+//! Relaxing one culprit combination can itself be expensive: resolving
 //! endpoints or verifying a candidate fix both re-run a SPARQL query that,
 //! with the broken triple(s) out of the way, can turn into a much larger
-//! join than the original ever was. Each combination gets its own `timeout`
-//! budget for that query work; if it can't finish in time, that combination
-//! falls back to its [`RelaxedCulprit::pruned_query`] (the broken triple(s)
-//! simply dropped, already known cheap and non-empty from diagnosis) rather
-//! than hanging or failing the whole [`diagnose_and_relax`] call over one
-//! slow combination.
+//! join than the original ever was, and the path search in between can run
+//! long too on a real graph with a high-fan-out hub node. Each combination
+//! gets its own `timeout` budget covering all three; if it can't finish in
+//! time, that combination falls back to its
+//! [`RelaxedCulprit::pruned_query`] (the broken triple(s) simply dropped,
+//! already known cheap and non-empty from diagnosis) rather than hanging or
+//! failing the whole [`diagnose_and_relax`] call over one slow combination.
+//!
+//! Diagnosis has the same kind of internally-enforced budget, independent
+//! of `timeout` above (see `diagnose_timeout` on [`diagnose_and_relax`] and
+//! the `timeout` docs on [`crate::diagnose::diagnose`]) — it matters just as
+//! much there: a caller that gives up waiting on a slow diagnosis call (a
+//! Python `future.result(timeout=...)`, say) doesn't make the call actually
+//! stop running unless *something* inside it is enforcing a real deadline.
 
 use crate::algebra::{pattern_of, replace_triple_with_path, with_limit, with_pattern};
 use crate::bfs::{Hop, find_path, path_to_property_path};
-use crate::diagnose::{Culprit, DEFAULT_ABLATION_DEPTH, diagnose_parsed, ensure_select, resolve_term_pattern, run_select_query_with_deadline};
+use crate::diagnose::{
+    Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, diagnose_parsed, ensure_select, resolve_term_pattern,
+    run_select_query_with_deadline,
+};
 use crate::error::{RelaxError, Result};
 use oxigraph::model::Term;
 use oxigraph::store::Store;
@@ -191,9 +202,10 @@ pub struct RelaxReport {
 /// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`],
 /// [`DEFAULT_SAMPLE_LIMIT`], [`DEFAULT_PAIR_SEARCH_DEPTH`],
 /// [`NamespaceScope::default`] (restricted to [`DEFAULT_RELAX_NAMESPACES`]),
-/// and [`DEFAULT_RELAX_TIMEOUT`], and attempts to relax each broken culprit
-/// combination found. A convenient default for callers who don't need to
-/// tune the search.
+/// [`DEFAULT_RELAX_TIMEOUT`], and
+/// [`DEFAULT_ABLATION_TIMEOUT`](crate::diagnose::DEFAULT_ABLATION_TIMEOUT),
+/// and attempts to relax each broken culprit combination found. A
+/// convenient default for callers who don't need to tune the search.
 pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<RelaxReport> {
     diagnose_and_relax(
         query_text,
@@ -204,6 +216,7 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
         Some(DEFAULT_RESULT_LIMIT),
         NamespaceScope::default(),
         Some(DEFAULT_RELAX_TIMEOUT),
+        Some(DEFAULT_ABLATION_TIMEOUT),
     )
 }
 
@@ -234,13 +247,21 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
 /// traverse (see [`NamespaceScope`]); pass [`NamespaceScope::Unrestricted`]
 /// to search any real predicate found in the store, with no restriction.
 ///
-/// `timeout` bounds the SPARQL query work needed to relax *each* culprit
-/// combination (resolving endpoints, verifying a candidate fix) — not
-/// diagnosis, and not path search itself, which never touches the query
-/// engine (see the module docs). A combination that can't finish within its
-/// budget falls back to [`RelaxedCulprit::pruned_query`] rather than hanging
-/// or failing the whole call. Defaults to [`DEFAULT_RELAX_TIMEOUT`] via
+/// `timeout` bounds all the work needed to relax *each* culprit combination:
+/// resolving endpoints, the path search itself (bounded by hand rather than
+/// via query cancellation — see the `bfs` module docs), and verifying a
+/// candidate fix — not diagnosis, which has its own separate budget (see
+/// `diagnose_timeout`). A combination that can't finish within its budget
+/// falls back to [`RelaxedCulprit::pruned_query`] rather than hanging or
+/// failing the whole call. Defaults to [`DEFAULT_RELAX_TIMEOUT`] via
 /// [`diagnose_and_relax_default`]; pass `None` to leave it unbounded.
+///
+/// `diagnose_timeout` is passed straight through to
+/// [`crate::diagnose::diagnose`] — see its docs for what it bounds and why
+/// an internally-enforced timeout (rather than relying on the caller to
+/// abandon a slow call) matters. Independent of `timeout` above: diagnosis
+/// runs once, before any relaxation work starts, so the two phases'
+/// budgets don't interact.
 pub fn diagnose_and_relax(
     query_text: &str,
     store: &Store,
@@ -250,11 +271,12 @@ pub fn diagnose_and_relax(
     result_limit: Option<usize>,
     namespace_scope: NamespaceScope,
     timeout: Option<Duration>,
+    diagnose_timeout: Option<Duration>,
 ) -> Result<RelaxReport> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
-    let diagnosis = diagnose_parsed(query_text, &query, &pattern, store, ablation_depth)?;
+    let diagnosis = diagnose_parsed(&query, &pattern, store, ablation_depth, diagnose_timeout)?;
     let allowed_namespaces = namespace_scope.as_filter();
 
     // Every culprit combination is relaxed independently against the same
@@ -353,11 +375,19 @@ fn bind_endpoints(
 /// Candidate hop sequences (subject → object) for one bound endpoint pair.
 /// `max_depth_override` of `None` picks [`DEFAULT_PAIR_SEARCH_DEPTH`];
 /// `Some(n)` uses `n` instead. `allowed_namespaces` restricts which
-/// predicates the search may traverse (see [`NamespaceScope`]).
-fn candidates_for(store: &Store, endpoint: &BoundEndpoint, max_depth_override: Option<usize>, allowed_namespaces: Option<&[String]>) -> Vec<Vec<Hop>> {
+/// predicates the search may traverse (see [`NamespaceScope`]). `deadline`
+/// bounds the search itself (see the `bfs` module docs on why it's checked
+/// by hand rather than via a `CancellationToken`).
+fn candidates_for(
+    store: &Store,
+    endpoint: &BoundEndpoint,
+    max_depth_override: Option<usize>,
+    allowed_namespaces: Option<&[String]>,
+    deadline: Option<Instant>,
+) -> Vec<Vec<Hop>> {
     let (s, o) = endpoint;
     let depth = max_depth_override.unwrap_or(DEFAULT_PAIR_SEARCH_DEPTH);
-    find_path(store, s, o, depth, allowed_namespaces).into_iter().collect()
+    find_path(store, s, o, depth, allowed_namespaces, deadline).into_iter().collect()
 }
 
 fn relax_combo(
@@ -395,7 +425,7 @@ fn relax_combo(
 
             let found: Vec<Vec<Hop>> = sampled
                 .par_iter()
-                .flat_map(|endpoint| candidates_for(store, endpoint, max_depth, allowed_namespaces).into_par_iter())
+                .flat_map(|endpoint| candidates_for(store, endpoint, max_depth, allowed_namespaces, deadline).into_par_iter())
                 .filter(|hops| !hops.is_empty())
                 .collect();
 

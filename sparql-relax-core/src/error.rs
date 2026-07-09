@@ -13,6 +13,8 @@ pub enum RelaxError {
     NoTriples,
     #[error("culprit triple {0:?} could not be located while relaxing the query it was diagnosed from")]
     CulpritNotFound(String),
+    #[error("diagnosis timed out before the original query could even be evaluated")]
+    Timeout,
 }
 
 pub type Result<T> = std::result::Result<T, RelaxError>;
