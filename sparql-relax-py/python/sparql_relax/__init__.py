@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
-from ._sparql_relax_rs import Store as _Store
+from ._sparql_relax import Store as _Store
 
 __all__ = [
     "Culprit",

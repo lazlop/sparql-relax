@@ -161,6 +161,12 @@ pub(crate) fn diagnose_parsed(
         return Err(RelaxError::NoTriples);
     }
 
+    // One shared cancellation token (and its one timer thread) for every
+    // combination/filter checked below, rather than one per check — see
+    // `SharedDeadline`'s docs on why that matters once a query has enough
+    // candidate triples for `depth` 2 or 3 to mean hundreds of combinations.
+    let guard = SharedDeadline::new(deadline);
+
     let mut culprits = Vec::new();
     let max_depth = depth.max(1);
     for k in 1..=max_depth {
@@ -174,7 +180,7 @@ pub(crate) fn diagnose_parsed(
         // once a query has more than a handful of candidate triples.
         let found: Vec<Culprit> = combinations(&triple_candidates, k)
             .into_par_iter()
-            .filter(|combo| is_culprit_combo(query, pattern, combo, store, original_rows.is_empty(), deadline))
+            .filter(|combo| is_culprit_combo(query, pattern, combo, store, original_rows.is_empty(), &guard))
             .map(|triples| Culprit { triples, depth: k })
             .collect();
 
@@ -191,7 +197,7 @@ pub(crate) fn diagnose_parsed(
         .into_par_iter()
         .filter_map(|expression| {
             let reduced_pattern = remove_filter(pattern, &expression)?;
-            let reduced_rows = run_select_query_with_deadline(with_pattern(query, reduced_pattern), store, deadline).ok().flatten()?;
+            let reduced_rows = run_select_query_with_guard(with_pattern(query, reduced_pattern), store, &guard).ok().flatten()?;
             // Removing a FILTER can only ever keep or grow the result set
             // (it's a pure restriction), so a strict increase means this
             // filter was actually excluding rows. (Unlike triple combos,
@@ -221,27 +227,27 @@ pub(crate) fn diagnose_parsed(
 /// ([`pattern_has_solution`]). This only holds when the original query is
 /// empty; otherwise the full per-row check below is still needed.
 ///
-/// `deadline` bounds the query work the same way as
-/// [`run_select_query_with_deadline`]. Hitting it is treated as "not a
+/// `guard` bounds the query work the same way as
+/// [`run_select_query_with_deadline`], but is built once per [`diagnose_parsed`]
+/// call and shared (via a cheap token clone) across every combination
+/// checked here, rather than spawning a fresh timer thread per combination —
+/// see [`SharedDeadline`]. Hitting the deadline is treated as "not a
 /// culprit" (`false`) rather than a hang: claiming culprit-hood on
 /// unfinished evaluation would be a false positive (see the per-row loop
 /// below, which only saw *some* of the reduced query's rows before being
 /// cut off — not enough to conclude none of them jointly satisfy `combo`).
-fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern], store: &Store, original_is_empty: bool, deadline: Option<Instant>) -> bool {
+fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern], store: &Store, original_is_empty: bool, guard: &SharedDeadline) -> bool {
     let Some(reduced_pattern) = combo.iter().try_fold(pattern.clone(), |p, t| remove_triple(&p, t)) else {
         return false;
     };
 
     if original_is_empty {
-        return pattern_has_solution(query, reduced_pattern, store, deadline);
+        return pattern_has_solution(query, reduced_pattern, store, guard);
     }
 
-    let cancellation_token = match deadline {
-        None => None,
-        Some(deadline) => match deadline_token(deadline) {
-            Some(token) => Some(token),
-            None => return false, // budget already exhausted before this combo could even start
-        },
+    let cancellation_token = match guard.token() {
+        Some(token) => token,
+        None => return false, // budget already exhausted before this combo could even start
     };
     let mut evaluator = SparqlEvaluator::new();
     if let Some(token) = cancellation_token {
@@ -278,23 +284,67 @@ fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePatter
 /// Whether `pattern` has at least one solution against `store`, evaluated as
 /// a SPARQL `ASK` (short-circuits on the first matching solution) rather
 /// than a `SELECT` that has to be told to stop separately or fully
-/// materialized to find out. `deadline` bounds the evaluation the same way
-/// as [`run_select_query_with_deadline`]; hitting it is treated as "no
-/// solution found" (`false`) rather than a hang, since claiming a solution
-/// exists on unfinished evaluation would be a false positive.
-fn pattern_has_solution(query: &Query, pattern: GraphPattern, store: &Store, deadline: Option<Instant>) -> bool {
-    let cancellation_token = match deadline {
-        None => None,
-        Some(deadline) => match deadline_token(deadline) {
-            Some(token) => Some(token),
-            None => return false,
-        },
+/// materialized to find out. `guard` bounds the evaluation the same way as
+/// [`run_select_query_with_deadline`] (see [`SharedDeadline`]); hitting it is
+/// treated as "no solution found" (`false`) rather than a hang, since
+/// claiming a solution exists on unfinished evaluation would be a false
+/// positive.
+fn pattern_has_solution(query: &Query, pattern: GraphPattern, store: &Store, guard: &SharedDeadline) -> bool {
+    let cancellation_token = match guard.token() {
+        Some(token) => token,
+        None => return false,
     };
     let mut evaluator = SparqlEvaluator::new();
     if let Some(token) = cancellation_token {
         evaluator = evaluator.with_cancellation_token(token);
     }
     matches!(evaluator.for_query(ask_query(query, pattern)).on_store(store).execute(), Ok(QueryResults::Boolean(true)))
+}
+
+/// One shared cancellation token — and the single background timer thread
+/// backing it — for every ablation combination/filter [`diagnose_parsed`]
+/// checks against the same deadline, built once per call rather than once
+/// per combination checked. A query with a few dozen candidate triples can
+/// have hundreds of combinations to check at `depth` 2 or 3; building a
+/// fresh [`CancellationToken`] (and the `thread::spawn` timer inside
+/// [`deadline_token`]) for each one would mean hundreds of throwaway OS
+/// threads racing to enforce what is, logically, one shared deadline.
+/// [`CancellationToken`] is cheap to clone (see its own docs), so every
+/// check just clones this one token instead.
+pub(crate) enum SharedDeadline {
+    /// No `timeout` was requested: every check proceeds unbounded.
+    Unbounded,
+    /// A `timeout` was requested but had already elapsed by the time this
+    /// was constructed: every check should short-circuit as "not enough
+    /// budget to even start" rather than kicking off a query only to have it
+    /// cancelled immediately.
+    Expired,
+    /// A `timeout` was requested and is still live: every check shares this
+    /// one token (and the one timer thread behind it).
+    Active(CancellationToken),
+}
+
+impl SharedDeadline {
+    fn new(deadline: Option<Instant>) -> Self {
+        match deadline {
+            None => SharedDeadline::Unbounded,
+            Some(deadline) => match deadline_token(deadline) {
+                Some(token) => SharedDeadline::Active(token),
+                None => SharedDeadline::Expired,
+            },
+        }
+    }
+
+    /// `None` if the deadline has already passed (caller should give up
+    /// without starting a query); `Some(None)` to run unbounded; `Some(Some(token))`
+    /// to run with a (cloned, still shared) cancellation token.
+    fn token(&self) -> Option<Option<CancellationToken>> {
+        match self {
+            SharedDeadline::Unbounded => Some(None),
+            SharedDeadline::Expired => None,
+            SharedDeadline::Active(token) => Some(Some(token.clone())),
+        }
+    }
 }
 
 /// All distinct size-`k` combinations of `items` (order-independent, no
@@ -406,11 +456,19 @@ fn deadline_token(deadline: Instant) -> Option<CancellationToken> {
 /// query essentially unconstrained, forcing a large join) shouldn't be able
 /// to hang or fail a caller that's relaxing many culprits at once.
 pub(crate) fn run_select_query_with_deadline(query: Query, store: &Store, deadline: Option<Instant>) -> Result<Option<Vec<QuerySolution>>> {
-    let Some(deadline) = deadline else {
-        return run_select_query(query, store).map(Some);
-    };
-    let Some(cancellation_token) = deadline_token(deadline) else {
+    run_select_query_with_guard(query, store, &SharedDeadline::new(deadline))
+}
+
+/// Same as [`run_select_query_with_deadline`], but takes an already-built
+/// [`SharedDeadline`] instead of constructing one (and its background timer
+/// thread) fresh — for call sites that check many combinations/filters
+/// against the same deadline and want to share one guard across all of them.
+pub(crate) fn run_select_query_with_guard(query: Query, store: &Store, guard: &SharedDeadline) -> Result<Option<Vec<QuerySolution>>> {
+    let Some(cancellation_token) = guard.token() else {
         return Ok(None);
+    };
+    let Some(cancellation_token) = cancellation_token else {
+        return run_select_query(query, store).map(Some);
     };
 
     let results = match SparqlEvaluator::new().with_cancellation_token(cancellation_token).for_query(query).on_store(store).execute() {

@@ -18,7 +18,7 @@ uses) and re-serialized to text, rather than via regex text substitution.
 ## Usage
 
 ```python
-from sparql_relax_rs import diagnose, diagnose_and_relax
+from sparql_relax import diagnose, diagnose_and_relax
 
 data = open("model.ttl").read()
 query = """

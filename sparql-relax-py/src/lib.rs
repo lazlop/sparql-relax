@@ -128,7 +128,7 @@ fn diagnose_and_relax_tuples(
 }
 
 #[pymodule]
-mod _sparql_relax_rs {
+mod _sparql_relax {
     use super::*;
 
     /// Diagnoses `query` against the RDF graph in `data` (parsed as `format`).
