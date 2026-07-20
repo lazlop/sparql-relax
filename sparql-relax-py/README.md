@@ -17,6 +17,8 @@ uses) and re-serialized to text, rather than via regex text substitution.
 
 ## Usage
 
+For a detailed walkthrough, see the [tutorial.ipynb](../tutorial.ipynb).
+
 ```python
 from sparql_relax import diagnose, diagnose_and_relax
 

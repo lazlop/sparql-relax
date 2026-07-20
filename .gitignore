@@ -10,3 +10,4 @@ analyze_regression*
 compare_results*
 *.csv
 ref-code.py
+.claude
