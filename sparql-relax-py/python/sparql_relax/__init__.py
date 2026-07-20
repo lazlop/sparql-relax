@@ -20,7 +20,7 @@ docstring.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from ._sparql_relax import Store as _Store
 
@@ -32,12 +32,16 @@ __all__ = [
     "RelaxedCulprit",
     "FilterReport",
     "RelaxReport",
+    "Term",
+    "QueryResult",
     "Store",
     "diagnose",
     "diagnose_and_relax",
+    "query",
     "DEFAULT_RELAX_NAMESPACES",
     "DEFAULT_RELAX_TIMEOUT",
     "DEFAULT_ABLATION_TIMEOUT",
+    "DEFAULT_QUERY_TIMEOUT",
 ]
 
 DEFAULT_RELAX_NAMESPACES: tuple[str, ...] = (
@@ -60,6 +64,12 @@ DEFAULT_ABLATION_TIMEOUT: float = 5.0
 (seconds): a single ablation check is normally well under this. Pass `None` to leave it unbounded
 — but see `diagnose`'s docs for why an internally-enforced timeout matters even when the caller
 has its own external one."""
+
+DEFAULT_QUERY_TIMEOUT: float = 10.0
+"""Default `timeout` for `query` (seconds): more generous than `DEFAULT_ABLATION_TIMEOUT`, since a
+query run through this path is normally one `diagnose`/`diagnose_and_relax` has already confirmed
+works, and the caller now wants full results for rather than a cheap yes/no check. Pass `None` to
+leave it unbounded."""
 
 
 @dataclass
@@ -159,6 +169,82 @@ class RelaxReport:
     filter_results: List[FilterReport]
 
 
+@dataclass
+class Term:
+    """A single RDF term, split the same way as the SPARQL 1.1 Query Results JSON Format's `type`
+    field, so it's a one-to-one translation for anything already speaking that shape."""
+
+    kind: str
+    """`"uri"`, `"bnode"`, or `"literal"`."""
+
+    value: str
+    """The IRI, blank node label, or literal lexical value."""
+
+    datatype: Optional[str] = None
+    """The literal's datatype IRI. Only set when `kind` is `"literal"`."""
+
+    language: Optional[str] = None
+    """The literal's language tag, if any. Only ever set when `kind` is `"literal"`."""
+
+
+@dataclass
+class QueryResult:
+    """The result of `query`/`Store.query`, shaped by which SPARQL query form produced it.
+
+    Exactly one of `boolean`, `(variables, rows)`, or `triples` is populated, matching `form`
+    (`"boolean"`, `"solutions"`, or `"graph"` respectively) — the others are left at their default
+    of `None`.
+    """
+
+    form: str
+    """`"boolean"` (from `ASK`), `"solutions"` (from `SELECT`), or `"graph"` (from `CONSTRUCT`/
+    `DESCRIBE`)."""
+
+    boolean: Optional[bool] = None
+    """The `ASK` result. Only set when `form == "boolean"`."""
+
+    variables: Optional[List[str]] = None
+    """The `SELECT` column order. Only set when `form == "solutions"`."""
+
+    rows: Optional[List[List[Optional[Term]]]] = None
+    """Each row aligned to `variables` position-for-position, with `None` wherever that variable
+    was left unbound in that particular row. Only set when `form == "solutions"`; see `bindings`
+    for a more convenient per-row shape."""
+
+    triples: Optional[List[Tuple[Term, Term, Term]]] = None
+    """The `CONSTRUCT`/`DESCRIBE` result graph, as `(subject, predicate, object)` tuples. Only set
+    when `form == "graph"`."""
+
+    @property
+    def bindings(self) -> List[Dict[str, Term]]:
+        """`rows` reshaped into one `{variable: Term}` dict per row, omitting any variable left
+        unbound in that row rather than carrying a `None` placeholder for it. `[]` for any form
+        other than `"solutions"`."""
+        if self.form != "solutions" or self.variables is None or self.rows is None:
+            return []
+        return [{var: term for var, term in zip(self.variables, row) if term is not None} for row in self.rows]
+
+
+def _term_from_tuple(t: Tuple[str, str, Optional[str], Optional[str]]) -> Term:
+    kind, value, datatype, language = t
+    return Term(kind=kind, value=value, datatype=datatype, language=language)
+
+
+def _query_result_from_tuple(t) -> QueryResult:
+    form, boolean, variables, rows, triples = t
+    return QueryResult(
+        form=form,
+        boolean=boolean,
+        variables=variables,
+        rows=[[None if term is None else _term_from_tuple(term) for term in row] for row in rows]
+        if rows is not None
+        else None,
+        triples=[(_term_from_tuple(s), _term_from_tuple(p), _term_from_tuple(o)) for s, p, o in triples]
+        if triples is not None
+        else None,
+    )
+
+
 def _diagnosis_from_tuples(original_row_count: int, culprits, filter_culprits) -> Diagnosis:
     return Diagnosis(
         original_row_count=original_row_count,
@@ -242,6 +328,13 @@ class Store:
             diagnose_timeout=diagnose_timeout,
         )
         return _relax_report_from_tuples(original_row_count, results, filter_results)
+
+    def query(
+        self, query: str, row_limit: Optional[int] = None, timeout: Optional[float] = DEFAULT_QUERY_TIMEOUT
+    ) -> QueryResult:
+        """See the module-level `query` for what this does and what `row_limit`/`timeout`
+        control."""
+        return _query_result_from_tuple(self._store.query(query, row_limit=row_limit, timeout=timeout))
 
 
 def diagnose(
@@ -384,3 +477,40 @@ def diagnose_and_relax(
         timeout=timeout,
         diagnose_timeout=diagnose_timeout,
     )
+
+
+def query(
+    data: str,
+    query: str,
+    format: str = "turtle",
+    row_limit: Optional[int] = None,
+    timeout: Optional[float] = DEFAULT_QUERY_TIMEOUT,
+) -> QueryResult:
+    """Runs `query` (any SPARQL query form — SELECT, ASK, CONSTRUCT, DESCRIBE) against the RDF
+    graph in `data` and returns its actual results.
+
+    Unlike `diagnose`/`diagnose_and_relax`, which exist to explain and fix a query that returns
+    nothing (or wrongly), this is the ordinary case of running one that already works. The
+    intended workflow is: call `diagnose` (or `diagnose_and_relax`) first — it's cheap even when
+    the query succeeds, and if it doesn't, it tells you exactly which triple or filter is at fault
+    instead of just an empty result — then call `query` once you're getting rows back, to fetch
+    the full result set rather than diagnosis's row counts and samples.
+
+    `row_limit` caps how many rows a SELECT/CONSTRUCT/DESCRIBE result may return, applied as a
+    LIMIT on the query itself before evaluation — only ever tightening a LIMIT already present in
+    the query, never loosening it — so an oversized result is bounded during evaluation rather
+    than computed in full and then truncated. Has no effect on ASK, which only ever returns one
+    boolean. Defaults to `None` (unbounded).
+
+    `timeout` (seconds) bounds evaluation; a query that doesn't finish in time raises rather than
+    continuing to run unobserved in the background — see `diagnose`'s docs for why an
+    internally-enforced timeout matters even when the caller has its own external one. Defaults to
+    `DEFAULT_QUERY_TIMEOUT` (10 seconds); pass `None` to leave it unbounded.
+
+    Returns a `QueryResult` tagged by `form`: `"boolean"` (ASK), `"solutions"` (SELECT, via
+    `variables`/`rows`/`bindings`), or `"graph"` (CONSTRUCT/DESCRIBE, via `triples`).
+
+    Builds a throwaway `Store` from `data` on every call — for more than one query against the
+    same graph, build a `Store` once instead and call its `query` method.
+    """
+    return Store(data, format).query(query, row_limit=row_limit, timeout=timeout)

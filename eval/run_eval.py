@@ -2,22 +2,33 @@
 """
 run_eval.py
 
-Evaluates sparql-relax-rs's `diagnose_and_relax` against the LLM-generated
-SPARQL queries in Experiment_Results/*.csv, scored against each row's
-ground-truth query.
+Evaluates sparql-relax-rs's `diagnose`/`diagnose_and_relax` against the
+LLM-generated SPARQL queries in Experiment_Results/*.csv that *originally*
+returned zero rows (per that CSV's own `gen_num_rows`/`returns_results`
+columns, recorded when those queries were first generated) — the queries
+diagnosis exists for — scored against each row's ground-truth query.
 
-For every (query_id, building) row below --threshold on a value-set F1
-metric (recomputed here at runtime against the real graph — the same
-"flatten every bound value across every row/column into a set, then
-precision/recall/F1 against ground truth" metric the previous Python
-implementation's eval used, for comparability), this:
+For every such row, this:
 
-  1. Runs `diagnose_and_relax` on the generated query.
-  2. Scores every culprit combination's `relaxed_query` (if one was built)
-     the same way.
-  3. Records the best relaxed score found, alongside diagnosis details
-     (how many culprits, how many combinations diagnosis needed >1 triple
-     for, how many filters were flagged).
+  1. Runs `diagnose_and_relax` on the generated query (`ablation_depth=3`
+     by default), which runs diagnosis internally before attempting to
+     relax any culprit it finds.
+  2. Scores the original query's own value set against ground truth
+     (value-set F1, GT rows covered, excess result rows — the same
+     "flatten every bound value across every row/column into a set, then
+     precision/recall/F1 against ground truth" metric the previous Python
+     implementation's eval used, for comparability) — the diagnose-stage
+     metrics.
+  3. Scores every culprit combination's `relaxed_query` (if one was built)
+     the same way, and records the best-scoring one — the relax-stage
+     metrics, alongside diagnosis details (how many culprits, how many
+     combinations diagnosis needed >1 triple for, how many filters were
+     flagged).
+
+Every zero-result row is processed; there's no F1-threshold skip, since a
+query with zero original rows can't already be a perfect match (barring an
+empty ground truth too, which scores 1.0 either way and isn't worth
+special-casing).
 
 Unlike the old pure-Python ablation (which brute-forced dozens of
 predicate-substitution variants per triple and needed a multiprocess
@@ -34,10 +45,10 @@ reuses it for every row referencing that building, so the graph is parsed
 exactly once no matter how many rows this script processes against it.
 
 Usage:
-  # Quick smoke run: 25 sampled rows per CSV (the default)
+  # Quick smoke run: 25 sampled zero-result rows per CSV (the default)
   python3 run_eval.py
 
-  # Every row in every CSV (slow — see the note above)
+  # Every zero-result row in every CSV (slow — see the note above)
   python3 run_eval.py --all
 
   # A couple of specific CSVs, a bigger sample, custom output path
@@ -199,12 +210,24 @@ def find_csvs(results_dir: Path) -> list[str]:
 
 
 def load_rows(csv_path: str) -> pd.DataFrame:
+    """Loads `csv_path` and filters to rows whose *original* generated query — as recorded in the
+    Experiment_Results CSV itself, not recomputed here — returned zero rows. That's what
+    `gen_num_rows`/`returns_results` capture: both are written once, when the query was first
+    generated, so they reflect the original run rather than anything this script computes."""
     df = pd.read_csv(csv_path)
     if "generated_sparql" not in df.columns or "ground_truth_sparql" not in df.columns:
         return pd.DataFrame()
     df = df.dropna(subset=["generated_sparql", "ground_truth_sparql", "building"]).copy()
     df = df[df["generated_sparql"].str.strip() != ""]
     df = df[df["ground_truth_sparql"].str.strip() != ""]
+    if "gen_num_rows" in df.columns:
+        df = df[df["gen_num_rows"].fillna(0).astype(int) == 0]
+    elif "returns_results" in df.columns:
+        df = df[df["returns_results"].fillna(True) == False]  # noqa: E712
+    else:
+        print(f"  warning: {csv_path} has neither gen_num_rows nor returns_results — "
+              f"cannot filter to originally-zero-result rows, skipping file", file=sys.stderr, flush=True)
+        return pd.DataFrame()
     return df
 
 
@@ -239,7 +262,6 @@ def _blank_relax_fields() -> dict:
 
 @dataclass
 class EvalConfig:
-    threshold: float
     limit: Optional[int]
     ablation_depth: int
     max_depth: Optional[int]
@@ -283,25 +305,6 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
 
     if cfg.verbose:
         print(f"    scored original+GT in {t_score}s -> original_f1={original_f1:.3f}, cov={orig_cov}, exc={orig_exc}", flush=True)
-
-    if original_f1 >= cfg.threshold:
-        return {
-            **base, "skipped": True,
-            "original_value_set_f1": round(original_f1, 6),
-            "result_row_count": gen_rows, "result_col_count": gen_cols,
-            "result_unique_value_count": len(gen_values),
-            "gt_row_count": gt_rows, "gt_col_count": gt_cols,
-            "gt_unique_value_count": len(gt_values),
-            "syntax_ok": gen_error == "", "timed_out": "timed out" in (gen_error or "").lower(),
-            "error": gen_error or "", "elapsed_sec": t_score,
-            "gt_rows_covered": orig_cov, "excess_result_rows": orig_exc,
-            "original_sparql": gen_query, "best_sparql": gen_query,
-            "best_value_set_f1": round(original_f1, 6),
-            "best_stmt_index": -1, "best_stmt_type": "baseline",
-            "best_stmt_text": "", "removed_statements": "[]",
-            "delta_value_set_f1": 0.0,
-            **_blank_relax_fields(),
-        }
 
     common = {
         **base, "skipped": False,
@@ -449,14 +452,20 @@ def main() -> None:
         metavar="DIR",
     )
     parser.add_argument("--output", default=str(SCRIPT_DIR / "eval_results.csv"), metavar="FILE")
-    parser.add_argument("--threshold", type=float, default=1.0, metavar="F", help="Only relax rows with original_f1 < F")
     parser.add_argument("--limit", type=int, default=20_000, metavar="N", help="LIMIT added to queries that lack one (0 = off)")
-    parser.add_argument("--sample-per-csv", type=int, default=25, metavar="N", help="Random rows per CSV (default: 25)")
-    parser.add_argument("--all", action="store_true", help="Process every row instead of sampling")
+    parser.add_argument(
+        "--sample-per-csv", type=int, default=25, metavar="N",
+        help="Random originally-zero-result rows per CSV (default: 25)",
+    )
+    parser.add_argument("--all", action="store_true", help="Process every originally-zero-result row instead of sampling")
     parser.add_argument("--max-queries", type=int, default=None, metavar="N", help="Stop after N total rows (across all CSVs)")
     parser.add_argument("--seed", type=int, default=0, help="Sampling seed, for reproducible --sample-per-csv runs")
     parser.add_argument("--skip-buildings", nargs="+", default=[], metavar="NAME")
-    parser.add_argument("--ablation-depth", type=int, default=3, metavar="N")
+    parser.add_argument(
+        "--ablation-depth", type=int, default=3, metavar="N",
+        help="Max combination size diagnosis may remove jointly while searching for a culprit "
+             "(default: 3)",
+    )
     parser.add_argument("--max-depth", type=int, default=None, metavar="N", help="Omit for the adaptive default (2 point-to-point / 1 anchor-only)")
     parser.add_argument("--sample-limit", type=int, default=5, metavar="N")
     parser.add_argument(
@@ -493,7 +502,7 @@ def main() -> None:
 
     limit = args.limit if args.limit > 0 else None
     cfg = EvalConfig(
-        threshold=args.threshold, limit=limit,
+        limit=limit,
         ablation_depth=args.ablation_depth, max_depth=args.max_depth, sample_limit=args.sample_limit,
         verbose=args.verbose, timeout=args.timeout, diagnose_only=args.diagnose_only,
     )
@@ -506,13 +515,13 @@ def main() -> None:
     for csv_path in csv_paths:
         df = load_rows(csv_path)
         if df.empty:
-            print(f"  {Path(csv_path).name}: no usable SPARQL rows – skipped", flush=True)
+            print(f"  {Path(csv_path).name}: no originally-zero-result rows – skipped", flush=True)
             continue
         df = df[~df["building"].astype(str).isin(skip_buildings)]
         rows = df.to_dict("records")
         if not args.all and len(rows) > args.sample_per_csv:
             rows = rng.sample(rows, args.sample_per_csv)
-        print(f"  {csv_path}  ({len(rows)}/{len(df)} rows selected)", flush=True)
+        print(f"  {csv_path}  ({len(rows)}/{len(df)} originally-zero-result rows selected)", flush=True)
         work_items.extend((row, csv_path) for row in rows)
 
     if args.max_queries is not None:
@@ -546,7 +555,7 @@ def main() -> None:
         if not resuming:
             writer.writeheader()
 
-        n_processed = n_skipped = n_relaxed_found = n_improved = n_with_culprits = 0
+        n_processed = n_relaxed_found = n_improved = n_with_culprits = 0
         deltas: list[float] = []
         t_start = time.monotonic()
 
@@ -557,36 +566,30 @@ def main() -> None:
             writer.writerow(out_row)
             f.flush()
             n_processed += 1
-            if out_row["skipped"]:
-                n_skipped += 1
-            else:
-                if out_row["best_stmt_type"] == "relaxed":
-                    n_with_culprits += 1
-                if out_row["relax_value_set_f1"] != "":
-                    n_relaxed_found += 1
-                    delta = out_row["delta_value_set_f1"]
-                    deltas.append(delta)
-                    if delta > 0:
-                        n_improved += 1
+            if out_row["best_stmt_type"] == "relaxed":
+                n_with_culprits += 1
+            if out_row["relax_value_set_f1"] != "":
+                n_relaxed_found += 1
+                delta = out_row["delta_value_set_f1"]
+                deltas.append(delta)
+                if delta > 0:
+                    n_improved += 1
 
             if i % 25 == 0 or i == total:
                 if cfg.diagnose_only:
-                    print(f"  [{i}/{total}] processed={n_processed} skipped={n_skipped} "
+                    print(f"  [{i}/{total}] processed={n_processed} "
                           f"with_culprits={n_with_culprits}", flush=True)
                 else:
-                    print(f"  [{i}/{total}] processed={n_processed} skipped={n_skipped} "
+                    print(f"  [{i}/{total}] processed={n_processed} "
                           f"relaxed={n_relaxed_found} improved={n_improved}", flush=True)
 
     elapsed_total = round(time.monotonic() - t_start, 1)
     print(f"\n{'=' * 70}", flush=True)
     print(f"Done in {elapsed_total}s. Results written to: {out_path}", flush=True)
-    print(f"  processed:        {n_processed}", flush=True)
-    print(f"  already >= threshold (skipped): {n_skipped}", flush=True)
+    print(f"  processed (originally-zero-result rows): {n_processed}", flush=True)
     if cfg.diagnose_only:
-        print(f"  diagnosed:        {n_processed - n_skipped}", flush=True)
         print(f"  rows with a culprit flagged (triple or filter): {n_with_culprits}", flush=True)
     else:
-        print(f"  relaxation attempted:  {n_processed - n_skipped}", flush=True)
         print(f"  relaxation found a fix (any culprit with a path): {n_relaxed_found}", flush=True)
         print(f"  strictly improved F1:  {n_improved}", flush=True)
         if deltas:

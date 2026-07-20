@@ -40,6 +40,22 @@ for result in report.results:
         print(result.relaxed_query)
 ```
 
+Once a query is confirmed working (`diagnose`/`diagnose_and_relax` report no culprits), fetch its
+actual results with `query`, which supports any SPARQL form — `SELECT`, `ASK`, `CONSTRUCT`,
+`DESCRIBE` — rather than the row counts and samples diagnosis reports:
+
+```python
+from sparql_relax import query
+
+result = query(data, "PREFIX ex: <urn:example#> SELECT ?sensor WHERE { ?sensor a ex:TempSensor }")
+for row in result.bindings:
+    print(row["sensor"].value)
+```
+
+For repeated queries against the same graph, build a `Store` once and call its `diagnose`/
+`diagnose_and_relax`/`query` methods instead of the module-level functions, which each reparse
+`data` from scratch on every call.
+
 ## Development
 
 ```sh

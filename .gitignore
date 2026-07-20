@@ -5,3 +5,8 @@
 *.csv
 *.log
 .DS_Store
+.pytest_cache/
+analyze_regression*
+compare_results*
+*.csv
+ref-code.py
