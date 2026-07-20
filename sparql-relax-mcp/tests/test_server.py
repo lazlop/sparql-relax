@@ -123,6 +123,23 @@ async def test_diagnose_explains_a_broken_query_and_suggests_a_fix():
 
 
 @pytest.mark.asyncio
+async def test_diagnose_relax_false_skips_the_path_search():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+
+        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": BROKEN_QUERY, "relax": False}))
+        assert diagnosis["ok"] is False
+        assert diagnosis["row_count"] == 0
+        assert len(diagnosis["culprits"]) == 1
+
+        culprit = diagnosis["culprits"][0]
+        assert culprit["triples"][0]["triple"] == "<https://brickschema.org/schema/Brick#building223> <https://brickschema.org/schema/Brick#hasSensor> ?sensor"
+        assert "relaxed_query" not in culprit, "relax=False shouldn't attempt (or pay for) a path search"
+        assert "discovered_path" not in culprit["triples"][0]
+        assert "fixed" not in culprit
+
+
+@pytest.mark.asyncio
 async def test_query_row_limit_caps_solutions():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})

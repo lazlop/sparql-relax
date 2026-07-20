@@ -89,7 +89,7 @@ def list_datasets() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def diagnose(dataset: str, query: str) -> dict[str, Any]:
+def diagnose(dataset: str, query: str, relax: bool = True) -> dict[str, Any]:
     """Run a SPARQL SELECT query against `dataset` and diagnose it. ALWAYS call this before
     `query` -- even when you expect the query to succeed.
 
@@ -100,6 +100,12 @@ def diagnose(dataset: str, query: str) -> dict[str, Any]:
     on each culprit). That is strictly more useful than the bare empty result a plain query run
     would give you, at little to no extra cost when the query already works.
 
+    `relax` (default true) does that path search for a fix. It's the expensive part of diagnosis
+    -- a bounded breadth-first search over the graph's real edges per culprit, plus re-resolving
+    variable bindings -- so pass `relax=false` for a cheaper check that only reports *which*
+    triple(s)/filter(s) are broken, without attempting to fix them (no `relaxed_query`,
+    `discovered_path`, or fallback fields on each culprit).
+
     Only SELECT queries can be diagnosed (ASK/CONSTRUCT/DESCRIBE aren't supported here -- use
     `query` directly for those). Once this reports `ok: true`, call `query` to fetch the full
     result set: this tool's `row_count` fields are counts, not the actual rows.
@@ -109,32 +115,47 @@ def diagnose(dataset: str, query: str) -> dict[str, Any]:
     namespaces won't be found, though the diagnosis of *which* triple is broken is unaffected.
     """
     store = _require_dataset(dataset)
-    report = store.diagnose_and_relax(query)
 
-    culprits = [
-        {
-            "depth": result.found_at_depth,
-            "triples": [{"triple": t.triple, "discovered_path": t.path_text} for t in result.triples],
-            "fixed": result.fixed,
-            "relaxed_query": result.relaxed_query,
-            "row_count_with_fix": result.row_count,
-            "fallback_query_with_broken_triples_removed": result.pruned_query,
-            "fallback_row_count": result.pruned_row_count,
-        }
-        for result in report.results
-    ]
-    filter_issues = [
-        {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in report.filter_results
-    ]
+    if relax:
+        report = store.diagnose_and_relax(query)
+        original_row_count = report.original_row_count
+        culprits = [
+            {
+                "depth": result.found_at_depth,
+                "triples": [{"triple": t.triple, "discovered_path": t.path_text} for t in result.triples],
+                "fixed": result.fixed,
+                "relaxed_query": result.relaxed_query,
+                "row_count_with_fix": result.row_count,
+                "fallback_query_with_broken_triples_removed": result.pruned_query,
+                "fallback_row_count": result.pruned_row_count,
+            }
+            for result in report.results
+        ]
+        filter_issues = [
+            {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in report.filter_results
+        ]
+    else:
+        diagnosis = store.diagnose(query)
+        original_row_count = diagnosis.original_row_count
+        culprits = [{"depth": c.depth, "triples": [{"triple": t} for t in c.triples]} for c in diagnosis.culprits]
+        filter_issues = [
+            {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in diagnosis.filter_culprits
+        ]
 
-    ok = report.original_row_count > 0 and not culprits and not filter_issues
+    ok = original_row_count > 0 and not culprits and not filter_issues
     if ok:
-        message = f"Query returned {report.original_row_count} row(s) with no issues found. Call `query` to fetch the full results."
+        message = f"Query returned {original_row_count} row(s) with no issues found. Call `query` to fetch the full results."
     elif culprits or filter_issues:
-        message = (
-            "Query is broken. See `culprits`/`filter_issues` for what's wrong, and `relaxed_query` "
-            "on any culprit where a fix was found."
-        )
+        if relax:
+            message = (
+                "Query is broken. See `culprits`/`filter_issues` for what's wrong, and `relaxed_query` "
+                "on any culprit where a fix was found."
+            )
+        else:
+            message = (
+                "Query is broken. See `culprits`/`filter_issues` for what's wrong. Call again with "
+                "`relax=true` (the default) to search for a corrected query."
+            )
     else:
         message = (
             "Query returned 0 rows and no single broken triple/filter could be isolated -- the "
@@ -144,7 +165,7 @@ def diagnose(dataset: str, query: str) -> dict[str, Any]:
 
     return {
         "ok": ok,
-        "row_count": report.original_row_count,
+        "row_count": original_row_count,
         "culprits": culprits,
         "filter_issues": filter_issues,
         "message": message,
