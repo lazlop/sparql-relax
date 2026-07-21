@@ -31,7 +31,8 @@
 //! for combining removals to matter, unlike triples).
 
 use crate::algebra::{
-    ask_query, collect_bgp_triples, collect_filters, collect_required_bgp_triples, pattern_of, remove_filter, remove_triple, with_pattern,
+    ask_query, collect_bgp_triples, collect_filters, collect_required_bgp_triples, pattern_of, remove_filter, remove_triple,
+    variables_of_triples, widen_projection, with_pattern,
 };
 use crate::error::{RelaxError, Result};
 use oxigraph::model::{GraphNameRef, NamedOrBlankNode, Term};
@@ -332,13 +333,20 @@ fn classify_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern]
         evaluator = evaluator.with_cancellation_token(token);
     }
 
+    // Widen the reduced query's projection so `combo`'s subject/object
+    // variables are visible in its rows even if they're plain WHERE-clause
+    // bridge variables never listed in the original SELECT — see
+    // `widen_projection`'s docs for why the original projection alone isn't
+    // enough here.
+    let widened_pattern = widen_projection(&reduced_pattern, &variables_of_triples(combo));
+
     // Streams the reduced query's solutions one at a time rather than
     // collecting them all first (unlike [`run_select_query`]): the common
     // case is a combo that *does* jointly hold somewhere (not a culprit),
     // and that can stop at the very first matching row instead of paying to
     // materialize a potentially large result set that removing constraining
     // triples tends to produce.
-    let Ok(results) = evaluator.for_query(with_pattern(query, reduced_pattern)).on_store(store).execute() else {
+    let Ok(results) = evaluator.for_query(with_pattern(query, widened_pattern)).on_store(store).execute() else {
         return ComboVerdict::NotCulprit;
     };
     let QueryResults::Solutions(solutions) = results else { return ComboVerdict::NotCulprit };
@@ -352,8 +360,13 @@ fn classify_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern]
                     return ComboVerdict::NotCulprit; // some binding satisfies every triple in the combo; not a genuine culprit set
                 }
             }
-            Err(QueryEvaluationError::Cancelled) => return ComboVerdict::NotCulprit, // saw only some rows; not enough to conclude "not a culprit"
-            Err(_) => break,
+            // Cancelled or any other error: only *some* rows were seen
+            // before evaluation stopped — not enough to conclude no row
+            // jointly satisfies `combo`, so this isn't treated as a genuine
+            // culprit. Silently falling through on a non-Cancelled error
+            // would otherwise report a false-positive culprit based on
+            // partial evidence.
+            Err(_) => return ComboVerdict::NotCulprit,
         }
     }
     if any_row { ComboVerdict::Culprit } else { ComboVerdict::NotCulprit } // non-empty, and no row ever satisfied the whole combo jointly

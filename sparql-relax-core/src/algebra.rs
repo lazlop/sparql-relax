@@ -8,7 +8,7 @@
 
 use spargebra::Query;
 use spargebra::algebra::{Expression, GraphPattern, PropertyPathExpression};
-use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
+use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern, Variable};
 use std::collections::HashSet;
 
 /// Every triple pattern appearing in a `Bgp` node anywhere in `pattern`.
@@ -386,6 +386,70 @@ pub fn with_limit(pattern: GraphPattern, limit: usize) -> GraphPattern {
         return GraphPattern::Slice { inner, start, length: tightened };
     }
     GraphPattern::Slice { inner: Box::new(pattern), start: 0, length: Some(limit) }
+}
+
+/// Every distinct variable used as a subject or object across `triples`
+/// (predicates are ignored: every triple this is called with has a concrete
+/// `NamedNode` predicate — see the candidate filter in
+/// [`crate::diagnose::diagnose_parsed`]).
+pub fn variables_of_triples(triples: &[TriplePattern]) -> Vec<Variable> {
+    let mut out = Vec::new();
+    for triple in triples {
+        for term in [&triple.subject, &triple.object] {
+            if let TermPattern::Variable(v) = term
+                && !out.contains(v)
+            {
+                out.push(v.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Widens `pattern`'s `Project` node — found by looking through any
+/// wrapping `Slice`/`Distinct`/`Reduced`/`OrderBy` (the only node kinds
+/// `spargebra` ever nests around `Project` for a plain `SELECT`) — so that,
+/// in addition to whatever it already exposes, every variable in `extra` is
+/// also visible in the resulting solutions.
+///
+/// Needed because [`crate::diagnose`]/[`crate::relax`] re-run a *reduced*
+/// copy of the original query (some BGP triples removed) and then inspect
+/// its rows via [`crate::diagnose::resolve_term_pattern`] to see what a
+/// removed triple's subject/object were bound to. That reduced query is
+/// still built from the *original* query's algebra tree, `Project` node and
+/// all — and per SPARQL semantics, `Project` strips every variable not in
+/// its list from the solutions it yields. A removed triple touching a
+/// variable that never appeared in the original `SELECT` list (a plain
+/// WHERE-clause bridge variable) would otherwise be invisible in every row,
+/// silently defeating both culprit detection and endpoint resolution for
+/// it. Widening only changes what's visible internally to these checks —
+/// the actual `relaxed_query`/`pruned_query` text shown to the caller is
+/// still built with the original, unwidened projection.
+///
+/// Leaves `pattern` unchanged if no `Project` is found (e.g. a `CONSTRUCT`
+/// pattern, which has none).
+pub fn widen_projection(pattern: &GraphPattern, extra: &[Variable]) -> GraphPattern {
+    use GraphPattern::*;
+    match pattern {
+        Project { inner, variables } => {
+            let mut widened = variables.clone();
+            for v in extra {
+                if !widened.contains(v) {
+                    widened.push(v.clone());
+                }
+            }
+            Project { inner: inner.clone(), variables: widened }
+        }
+        Slice { inner, start, length } => {
+            Slice { inner: Box::new(widen_projection(inner, extra)), start: *start, length: *length }
+        }
+        Distinct { inner } => Distinct { inner: Box::new(widen_projection(inner, extra)) },
+        Reduced { inner } => Reduced { inner: Box::new(widen_projection(inner, extra)) },
+        OrderBy { inner, expression } => {
+            OrderBy { inner: Box::new(widen_projection(inner, extra)), expression: expression.clone() }
+        }
+        other => other.clone(),
+    }
 }
 
 /// Builds an `ASK` query with `pattern` as its body, carrying over `query`'s

@@ -95,21 +95,21 @@ def diagnose(dataset: str, query: str, relax: bool = False) -> dict[str, Any]:
 
     On a working query this is nearly free: it just confirms the row count (`ok: true`). On a
     query that returns nothing, or fewer rows than expected, it explains *why* -- which BGP
-    triple(s) or FILTER(s) are responsible. If `relax=True`, it also searches the graph's 
-    actual edges for a real connecting path, often finding a corrected query that actually 
-    returns rows (see `relaxed_query` on each culprit). 
+    triple(s) or FILTER(s) are responsible. If `relax=True`, it also searches the graph's
+    actual edges for a real connecting path, often finding a corrected query that actually
+    returns rows (see `relaxed_query` on each culprit).
 
-    Note: Relaxation is experimental. For AI agents, it is often more effective to use 
-    diagnose with `relax=False`, then allow the agent to correct the query itself based 
+    Note: Relaxation is experimental. For AI agents, it is often more effective to use
+    diagnose with `relax=False`, then allow the agent to correct the query itself based
     on the diagnosis.
 
     Only SELECT queries can be diagnosed (ASK/CONSTRUCT/DESCRIBE aren't supported here -- use
     `query` directly for those). Once this reports `ok: true`, call `query` to fetch the full
     result set: this tool's `row_count` fields are counts, not the actual rows.
 
-    When `relax=True`, path search defaults to predicates in the Brick, ASHRAE 223P, RDFS, 
-    and QUDT namespaces (this tool's usual building-automation domain) -- a real fix outside 
-    those namespaces won't be found, though the diagnosis of *which* triple is broken 
+    When `relax=True`, path search defaults to predicates in the Brick, ASHRAE 223P, RDFS,
+    and QUDT namespaces (this tool's usual building-automation domain) -- a real fix outside
+    those namespaces won't be found, though the diagnosis of *which* triple is broken
     is unaffected.
     """
     store = _require_dataset(dataset)
@@ -152,10 +152,16 @@ def diagnose(dataset: str, query: str, relax: bool = False) -> dict[str, Any]:
     if ok:
         message = f"Query returned {report.original_row_count} row(s) with no issues found. Call `query` to fetch the full results."
     elif culprits or filter_issues:
-        message = (
-            "Query is broken. See `culprits`/`filter_issues` for what's wrong, and `relaxed_query` "
-            "on any culprit where a fix was found."
-        )
+        if relax:
+            message = (
+                "Query is broken. See `culprits`/`filter_issues` for what's wrong, and `relaxed_query` "
+                "on any culprit where a fix was found."
+            )
+        else:
+            message = (
+                "Query is broken. See `culprits`/`filter_issues` for what's wrong. Call again with "
+                "`relax=true` to search for a corrected query."
+            )
     else:
         message = (
             "Query returned 0 rows and no single broken triple/filter could be isolated -- the "
