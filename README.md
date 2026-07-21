@@ -19,8 +19,26 @@ cd sparql-relax-py
 maturin develop --release
 ```
 
+Or add it to another project directly from GitHub with [`uv`](https://docs.astral.sh/uv/) (requires a Rust toolchain, since it builds the PyO3 extension from source):
+```toml
+[tool.uv.sources]
+sparql-relax-rs = { git = "https://github.com/lazlop/sparql-relax", subdirectory = "sparql-relax-py" }
+```
+```bash
+uv add sparql-relax-rs
+```
+
 ### Use with AI Agents (MCP)
 To use SPARQL-Relax as a tool for an AI agent (e.g., Claude), see the [MCP Server README](./sparql-relax-mcp/README.md).
+
+Quick run with `uvx` (no clone needed, requires a Rust toolchain the first time):
+```bash
+uvx --from "git+https://github.com/lazlop/sparql-relax#subdirectory=sparql-relax-mcp" sparql-relax-mcp
+```
+
+> We may publish `sparql-relax-rs` / `sparql-relax-mcp` to PyPI (or ship prebuilt wheels) in the
+> future so these installs don't require a local Rust toolchain. For now, installing from GitHub
+> is the supported path.
 
 ### Learn by Example
 We provide a Jupyter Notebook tutorial to get you started:

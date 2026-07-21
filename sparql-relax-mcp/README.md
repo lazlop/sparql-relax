@@ -23,7 +23,19 @@ which `diagnose` doesn't support).
 ## Setup
 
 Requires [`uv`](https://docs.astral.sh/uv/) and a Rust toolchain (to build the `sparql-relax-rs`
-extension the first time). From this directory:
+extension the first time).
+
+### Option A: run straight from GitHub (no clone)
+
+```sh
+uvx --from "git+https://github.com/lazlop/sparql-relax#subdirectory=sparql-relax-mcp" sparql-relax-mcp
+```
+
+This is the easiest way for collaborators to get the server without checking out the repo. `uv`
+clones it, resolves the local `sparql-relax-rs` dependency, and builds the extension for you
+(cached after the first run).
+
+### Option B: from a local clone
 
 ```sh
 uv sync
@@ -37,7 +49,20 @@ Project-scoped (add to `.mcp.json` in the repo root, or run from anywhere with `
 claude mcp add sparql-relax -- uv --directory /absolute/path/to/sparql-relax-mcp run sparql-relax-mcp
 ```
 
-or by hand, in `.mcp.json`:
+or by hand, in `.mcp.json`, using the GitHub install directly (no local path needed):
+
+```json
+{
+  "mcpServers": {
+    "sparql-relax": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/lazlop/sparql-relax#subdirectory=sparql-relax-mcp", "sparql-relax-mcp"]
+    }
+  }
+}
+```
+
+or pointed at a local clone instead:
 
 ```json
 {
@@ -49,6 +74,10 @@ or by hand, in `.mcp.json`:
   }
 }
 ```
+
+> We may publish `sparql-relax-rs` / `sparql-relax-mcp` to PyPI (or ship prebuilt wheels) in the
+> future so this doesn't require a local Rust toolchain. For now, installing from GitHub is the
+> supported path.
 
 ### Register with Claude Desktop
 
