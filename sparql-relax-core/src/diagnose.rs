@@ -30,7 +30,9 @@
 //! does not apply to them (queries rarely have enough interacting filters
 //! for combining removals to matter, unlike triples).
 
-use crate::algebra::{ask_query, collect_bgp_triples, collect_filters, pattern_of, remove_filter, remove_triple, with_pattern};
+use crate::algebra::{
+    ask_query, collect_bgp_triples, collect_filters, collect_required_bgp_triples, pattern_of, remove_filter, remove_triple, with_pattern,
+};
 use crate::error::{RelaxError, Result};
 use oxigraph::model::{GraphNameRef, NamedOrBlankNode, Term};
 use oxigraph::sparql::{CancellationToken, QueryEvaluationError, QueryResults, QuerySolution, SparqlEvaluator};
@@ -296,12 +298,20 @@ enum ComboVerdict {
 /// before it can answer *at all* — even a plain existence check — depends on
 /// the query engine's own planner, not on which SPARQL query form asked the
 /// question, so there's no branch here that's provably safe to exempt.
+///
+/// The connectivity check itself only looks at the *required* pattern (see
+/// [`crate::algebra::collect_required_bgp_triples`]), skipping every
+/// `OPTIONAL`'s own triples: a variable shared only inside an `OPTIONAL`
+/// doesn't guarantee connectivity for any given solution (the optional side
+/// can be entirely absent), so counting it would hide a real disconnect —
+/// and cartesian risk — in the pattern every solution actually has to
+/// satisfy.
 fn classify_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern], store: &Store, original_is_empty: bool, guard: &SharedDeadline) -> ComboVerdict {
     let Some(reduced_pattern) = combo.iter().try_fold(pattern.clone(), |p, t| remove_triple(&p, t)) else {
         return ComboVerdict::NotCulprit;
     };
 
-    if crate::algebra::has_cartesian_join(&collect_bgp_triples(&reduced_pattern)) {
+    if crate::algebra::has_cartesian_join(&collect_required_bgp_triples(&reduced_pattern)) {
         return ComboVerdict::CartesianRisk;
     }
 

@@ -46,6 +46,48 @@ fn collect_rec(pattern: &GraphPattern, out: &mut Vec<TriplePattern>) {
     }
 }
 
+/// Like [`collect_bgp_triples`], but skips the optional (right) branch of
+/// every `LeftJoin`: only triples that are *required* for a solution to
+/// exist at all. An `OPTIONAL` match can be entirely absent without
+/// eliminating the outer row, so a variable shared only inside one doesn't
+/// actually bridge two otherwise-disconnected clusters of the required
+/// pattern — counting it as a bridge (as [`collect_bgp_triples`] does) masks
+/// a real cartesian-join risk in the required pattern behind a connection
+/// that isn't guaranteed to hold for any given solution. Used by
+/// [`has_cartesian_join`] callers that need the connectivity of the
+/// mandatory pattern specifically, not every candidate triple ablation is
+/// allowed to touch (that's still [`collect_bgp_triples`]'s job).
+pub fn collect_required_bgp_triples(pattern: &GraphPattern) -> Vec<TriplePattern> {
+    let mut out = Vec::new();
+    collect_required_rec(pattern, &mut out);
+    out
+}
+
+fn collect_required_rec(pattern: &GraphPattern, out: &mut Vec<TriplePattern>) {
+    use GraphPattern::*;
+    match pattern {
+        Bgp { patterns } => out.extend(patterns.iter().cloned()),
+        Path { .. } | Values { .. } => {}
+        Join { left, right } | Union { left, right } | Minus { left, right } | Lateral { left, right } => {
+            collect_required_rec(left, out);
+            collect_required_rec(right, out);
+        }
+        LeftJoin { left, .. } => {
+            collect_required_rec(left, out);
+        }
+        Filter { inner, .. }
+        | Graph { inner, .. }
+        | Extend { inner, .. }
+        | OrderBy { inner, .. }
+        | Project { inner, .. }
+        | Distinct { inner }
+        | Reduced { inner }
+        | Slice { inner, .. }
+        | Group { inner, .. }
+        | Service { inner, .. } => collect_required_rec(inner, out),
+    }
+}
+
 /// Every `FILTER` expression appearing anywhere in `pattern`: both plain
 /// `GraphPattern::Filter` nodes and the optional expression attached to an
 /// `OPTIONAL` (`LeftJoin`), e.g. `OPTIONAL { ?s ex:p ?o FILTER(?o > 5) }`.

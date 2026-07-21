@@ -266,7 +266,7 @@ OUTPUT_FIELDS = [
     "uuid", "source_csv", "query_id", "question", "building", "approach", "model_name",
     "gt_rows", "gt_col_count", "gt_unique_value_count",
     "gen_rows",
-    "diagnose_value_set_f1", "diagnose_rows_covered", "diagnose_excess_rows",
+    "diagnose_culprit_found", "diagnose_value_set_f1", "diagnose_rows_covered", "diagnose_excess_rows",
     "relax_attempted", "relax_stmt_index", "relax_stmt_type", "relax_stmt_text",
     "relax_removed_statements", "relax_sparql",
     "relax_value_set_f1", "relax_rows_covered", "relax_excess_rows",
@@ -371,6 +371,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
         **base, "uuid": _uuid_for_row(csv_path, row),
         "gt_rows": gt_rows, "gt_col_count": gt_cols, "gt_unique_value_count": len(gt_values),
         "gen_rows": gen_rows,
+        "diagnose_culprit_found": False,
         "diagnose_value_set_f1": round(diagnose_f1, 6),
         "diagnose_rows_covered": diagnose_cov, "diagnose_excess_rows": diagnose_exc,
         "relax_attempted": not cfg.diagnose_only,
@@ -385,6 +386,8 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     best_f1 = -1.0
     best = None
     best_idx = -1
+    best_diagnose_f1 = -1.0
+    best_diagnose_culprit = None
     relax_error = ""
 
     # Relaxation phase. diagnose_and_relax runs diagnosis internally (so
@@ -407,18 +410,43 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
             diagnose_timeout=cfg.timeout,
         )
         for idx, culprit in enumerate(report.results):
-            if not culprit.relaxed_query:
-                continue
-            f1, _ = value_set_f1(culprit.relaxed_query, gt_values, store, cfg.limit)
-            if f1 > best_f1:
-                best_f1 = f1
-                best = culprit
-                best_idx = idx
+            # Diagnose's own signal: what removing this culprit combination
+            # gets you with no path substitution at all. `pruned_query` is
+            # always present whenever diagnose flags a combination as a
+            # genuine culprit (see `RelaxedCulprit.pruned_query`'s docs —
+            # "guaranteed non-empty under normal operation"), so this is
+            # scored for every combination diagnose found, independent of
+            # whether relax's path search separately confirms a real
+            # substitute for it. This is what `diagnose_value_set_f1` below
+            # actually measures diagnosis's own contribution against — not
+            # the trivially-zero original query.
+            if culprit.pruned_query:
+                f1, _ = value_set_f1(culprit.pruned_query, gt_values, store, cfg.limit)
+                if f1 > best_diagnose_f1:
+                    best_diagnose_f1 = f1
+                    best_diagnose_culprit = culprit
+            # Relax's own signal: a real, graph-verified path substitution.
+            if culprit.relaxed_query:
+                f1, _ = value_set_f1(culprit.relaxed_query, gt_values, store, cfg.limit)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best = culprit
+                    best_idx = idx
     except Exception as exc:
         best_f1 = -1.0
         relax_error = str(exc)
     t_relax_elapsed = round(time.monotonic() - t_relax_start, 3)
     total_elapsed_sec = round(t_gt + t_relax_elapsed, 3)
+
+    if best_diagnose_culprit is not None:
+        diag_values, _, _, diag_sets, _ = _get_full_query_stats(best_diagnose_culprit.pruned_query, store, cfg.limit)
+        if diag_values is None:
+            diag_values, diag_sets = set(), []
+        diag_cov, diag_exc = _row_coverage_stats(diag_sets, gt_sets)
+        common["diagnose_culprit_found"] = True
+        common["diagnose_value_set_f1"] = round(best_diagnose_f1, 6)
+        common["diagnose_rows_covered"] = diag_cov
+        common["diagnose_excess_rows"] = diag_exc
 
     if best is None:
         return {
@@ -745,7 +773,8 @@ def main() -> None:
             if not resuming:
                 writer.writeheader()
 
-            n_processed = n_relaxed_found = n_improved = n_with_culprits = n_watchdog_killed = 0
+            n_processed = n_improved = n_with_culprits = n_watchdog_killed = 0
+            n_diagnose_found = n_diagnose_improved = 0
             relax_f1s: list[float] = []
             t_start = time.monotonic()
 
@@ -770,8 +799,11 @@ def main() -> None:
                 n_processed += 1
                 if out_row["relax_stmt_type"] == "relaxed":
                     n_with_culprits += 1
+                if out_row.get("diagnose_culprit_found") is True:
+                    n_diagnose_found += 1
+                    if out_row["diagnose_value_set_f1"] > 0:
+                        n_diagnose_improved += 1
                 if out_row["relax_value_set_f1"] != "":
-                    n_relaxed_found += 1
                     f1 = out_row["relax_value_set_f1"]
                     relax_f1s.append(f1)
                     if f1 > 0:
@@ -783,7 +815,8 @@ def main() -> None:
                               f"with_culprits={n_with_culprits} watchdog_killed={n_watchdog_killed}", flush=True)
                     else:
                         print(f"  [{i}/{total}] processed={n_processed} "
-                              f"relaxed={n_relaxed_found} improved={n_improved} watchdog_killed={n_watchdog_killed}", flush=True)
+                              f"diagnose_found={n_diagnose_found} diagnose_improved={n_diagnose_improved} "
+                              f"relaxed={n_with_culprits} improved={n_improved} watchdog_killed={n_watchdog_killed}", flush=True)
     finally:
         worker.shutdown()
 
@@ -795,11 +828,13 @@ def main() -> None:
     if cfg.diagnose_only:
         print(f"  rows with a culprit flagged (triple or filter): {n_with_culprits}", flush=True)
     else:
-        print(f"  relaxation found a fix (any culprit with a path): {n_relaxed_found}", flush=True)
-        print(f"  relax_value_set_f1 > 0 (a real, non-trivial fix): {n_improved}", flush=True)
+        print(f"  diagnose found a genuine culprit (pruning it unblocks the query): {n_diagnose_found}", flush=True)
+        print(f"    of which diagnose_value_set_f1 > 0 (pruning it also recovers real GT overlap): {n_diagnose_improved}", flush=True)
+        print(f"  relax additionally confirmed a graph-verified path substitution: {n_with_culprits}", flush=True)
+        print(f"  relax_value_set_f1 > 0 (a real, non-trivial path-substituted fix): {n_improved}", flush=True)
         if relax_f1s:
             avg_relax_f1 = sum(relax_f1s) / len(relax_f1s)
-            print(f"  avg relax_value_set_f1 among relaxed: {avg_relax_f1:.4f}", flush=True)
+            print(f"  avg relax_value_set_f1 among path-substituted fixes: {avg_relax_f1:.4f}", flush=True)
     print(f"{'=' * 70}", flush=True)
 
 

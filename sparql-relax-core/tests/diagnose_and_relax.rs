@@ -722,3 +722,65 @@ fn diagnose_and_relax_does_not_hang_or_error_on_a_disconnected_query() {
     // there's nothing for the relax phase to even attempt.
     assert!(report.results.is_empty());
 }
+
+/// Same shape as `disconnected_store`/`DISCONNECTED_QUERY` (`?sensor` and
+/// `?widget` never share a variable in the required pattern once `T1` is
+/// removed), except an `OPTIONAL` triple also directly mentions both
+/// `?sensor` and `?widget`. An `OPTIONAL` match can be entirely absent
+/// without eliminating the outer row, so that shared pair must not count as
+/// connecting them for cartesian-risk purposes — the *required* pattern is
+/// still disconnected regardless of whether the optional triple happens to
+/// bind for a given solution.
+fn disconnected_with_optional_bridge_store() -> Store {
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:building223 ex:hasSensor ex:sensor1 .
+                ex:sensor1 a ex:TempSensor .
+                ex:widget1 a ex:Widget .
+            "#,
+        )
+        .unwrap();
+    store
+}
+
+const DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY: &str = r#"
+    PREFIX ex: <urn:example#>
+    SELECT ?sensor ?widget WHERE {
+        ex:building223 ex:hasBrokenLink ?sensor .
+        ?sensor a ex:TempSensor .
+        ?widget a ex:Widget .
+        OPTIONAL { ?sensor ex:relatesToWidget ?widget . }
+    }
+"#;
+
+#[test]
+fn an_optional_only_shared_variable_does_not_mask_a_cartesian_risk_in_the_required_pattern() {
+    let store = disconnected_with_optional_bridge_store();
+    let diagnosis = diagnose(DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY, &store, 1, None).unwrap();
+
+    assert_eq!(diagnosis.original_row_count, 0);
+    // Removing the real culprit (`ex:hasBrokenLink`) leaves `?sensor` and
+    // `?widget` disconnected in the required pattern; the `OPTIONAL` triple
+    // mentions both, but must not be treated as bridging them for this
+    // check (see the function docs above). Without the fix, this combo's
+    // reduced pattern (still carrying the OPTIONAL triple) looks connected,
+    // gets evaluated, and — since `?sensor1 a ex:TempSensor` and `?widget1 a
+    // ex:Widget` both hold regardless of the OPTIONAL — is wrongly confirmed
+    // as a culprit.
+    assert!(
+        diagnosis.culprits.is_empty(),
+        "the OPTIONAL-only shared variable must not mask the required pattern's disconnect: this combo should never be evaluated, so it can't be confirmed a culprit"
+    );
+    // Risky combos: removing T1 (`hasBrokenLink`) or T2 (`?sensor a
+    // TempSensor`) each leave the required pattern disconnected across
+    // {?sensor} vs {?widget}; removing the OPTIONAL triple itself leaves the
+    // required pattern (T1, T2, T3) untouched, which is disconnected too
+    // (`?widget` never appears in a required triple). Only removing T3
+    // (`?widget a Widget`) leaves a connected required pattern ({T1, T2}
+    // share `?sensor`), so that's the one combo actually evaluated.
+    assert_eq!(diagnosis.cartesian_risks.len(), 3, "every ablation candidate except removing the ?widget triple should disconnect the required pattern");
+}
