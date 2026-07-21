@@ -8,7 +8,8 @@
 
 use spargebra::Query;
 use spargebra::algebra::{Expression, GraphPattern, PropertyPathExpression};
-use spargebra::term::TriplePattern;
+use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern};
+use std::collections::HashSet;
 
 /// Every triple pattern appearing in a `Bgp` node anywhere in `pattern`.
 /// Property-path triples (`GraphPattern::Path`) are not included: they are
@@ -369,4 +370,73 @@ pub fn pattern_of(query: &Query) -> &GraphPattern {
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
     }
+}
+
+/// Every variable/blank-node identifier `triple` mentions, as join keys
+/// (`?name` for a variable, `_:name` for a blank node — prefixed so a
+/// variable and a blank node that happen to share a spelling are never
+/// mistaken for the same join key). A concrete term (IRI/literal) on any
+/// side contributes nothing: it can't be joined *on*, only matched.
+fn triple_join_keys(triple: &TriplePattern) -> impl Iterator<Item = String> {
+    fn term_key(term: &TermPattern) -> Option<String> {
+        match term {
+            TermPattern::Variable(v) => Some(format!("?{}", v.as_str())),
+            TermPattern::BlankNode(b) => Some(format!("_:{}", b.as_str())),
+            _ => None,
+        }
+    }
+    let subject = term_key(&triple.subject);
+    let predicate = match &triple.predicate {
+        NamedNodePattern::Variable(v) => Some(format!("?{}", v.as_str())),
+        NamedNodePattern::NamedNode(_) => None,
+    };
+    let object = term_key(&triple.object);
+    subject.into_iter().chain(predicate).chain(object)
+}
+
+/// Whether `triples`, evaluated together as a single basic graph pattern,
+/// would force a cartesian product — i.e. its variable/blank-node-sharing
+/// graph has more than one connected component, so at least one triple's
+/// join keys never overlap, even transitively through a chain of other
+/// triples, with another's. This is exactly the shape that can make a query
+/// engine materialize a full N×M cross product before yielding a single row
+/// (see the `diagnose`/`relax` module docs on why an internally-enforced
+/// timeout doesn't reliably bound that).
+///
+/// A triple with no variables or blank nodes at all (every side concrete)
+/// never joins with anything and only ever filters existence rather than
+/// multiplying results, so it's ignored entirely rather than counted as a
+/// second, disconnected component on its own. `triples.len() < 2` is always
+/// `false` for the same reason — nothing to be disconnected *from* yet.
+pub(crate) fn has_cartesian_join(triples: &[TriplePattern]) -> bool {
+    let joinable: Vec<&TriplePattern> = triples.iter().filter(|t| triple_join_keys(t).next().is_some()).collect();
+    if joinable.len() < 2 {
+        return false;
+    }
+
+    let mut parent: Vec<usize> = (0..joinable.len()).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = find(parent, parent[x]);
+        }
+        parent[x]
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+
+    let keys: Vec<HashSet<String>> = joinable.iter().map(|t| triple_join_keys(t).collect()).collect();
+    for i in 0..joinable.len() {
+        for j in (i + 1)..joinable.len() {
+            if keys[i].intersection(&keys[j]).next().is_some() {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+
+    let root0 = find(&mut parent, 0);
+    (1..joinable.len()).any(|i| find(&mut parent, i) != root0)
 }

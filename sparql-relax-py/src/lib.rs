@@ -80,7 +80,10 @@ type CulpritTuple = (Vec<String>, usize);
 type FilterCulpritTuple = (String, usize);
 type RelaxedTripleTuple = (String, Option<String>);
 type RelaxResultTuple = (usize, Vec<RelaxedTripleTuple>, Option<String>, usize, String, usize);
-type DiagnoseTuples = (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>);
+// `CartesianRiskCombo` has the exact same (triples, depth) shape as `Culprit`,
+// so it reuses `CulpritTuple` rather than a duplicate type — the two are
+// kept apart at the Python layer by which list they end up in, not by shape.
+type DiagnoseTuples = (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>);
 type RelaxTuples = (usize, Vec<RelaxResultTuple>, Vec<FilterCulpritTuple>);
 
 /// An RDF term as `(kind, value, datatype, language)`, where `kind` is
@@ -142,7 +145,12 @@ fn diagnose_tuples(store: &Store, query: &str, depth: usize, timeout: Option<Dur
         .into_iter()
         .map(|f| (f.expression.to_string(), f.row_count_without_filter))
         .collect();
-    Ok((diagnosis.original_row_count, culprits, filter_culprits))
+    let cartesian_risks = diagnosis
+        .cartesian_risks
+        .into_iter()
+        .map(|c| (c.triples.iter().map(ToString::to_string).collect(), c.depth))
+        .collect();
+    Ok((diagnosis.original_row_count, culprits, filter_culprits, cartesian_risks))
 }
 
 /// Same as [`diagnose_tuples`], but for `diagnose_and_relax` — shared by the
@@ -224,11 +232,24 @@ mod _sparql_relax {
     /// bounds the work and lets a slow row's search release its threads
     /// instead of piling up behind an abandoned future.
     ///
-    /// Returns `(original_row_count, culprits, filter_culprits)`. Each
-    /// culprit is `(triples, depth)`: `triples` is a list of triple texts in
-    /// the combination (just one unless `depth > 1` was needed), and `depth`
-    /// is the combination size at which it was found. Each filter culprit is
-    /// `(expression_text, row_count_without_filter)`.
+    /// Returns `(original_row_count, culprits, filter_culprits,
+    /// cartesian_risks)`. Each culprit is `(triples, depth)`: `triples` is a
+    /// list of triple texts in the combination (just one unless `depth > 1`
+    /// was needed), and `depth` is the combination size at which it was
+    /// found. Each filter culprit is `(expression_text,
+    /// row_count_without_filter)`.
+    ///
+    /// `cartesian_risks` is shaped exactly like `culprits` (`(triples,
+    /// depth)`), but means something different: each entry is a combination
+    /// whose reduced pattern (with it removed) was never evaluated against
+    /// `data` at all, because doing so would force a cartesian product —
+    /// some of the remaining triples' variables never overlap, even
+    /// transitively, with the rest, which is exactly the shape that can make
+    /// a query engine materialize a full N×M cross product before yielding a
+    /// single row, `timeout` notwithstanding. This is *not* a claim that the
+    /// combination is or isn't a genuine culprit — it's surfaced separately
+    /// so a query this call declined to check doesn't look identical to one
+    /// it actually ruled out.
     ///
     /// Runs `query` (any SPARQL query form — `SELECT`, `ASK`, `CONSTRUCT`,
     /// `DESCRIBE`) against the RDF graph in `data` (parsed as `format`) and

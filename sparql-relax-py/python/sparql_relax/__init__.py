@@ -27,6 +27,7 @@ from ._sparql_relax import Store as _Store
 __all__ = [
     "Culprit",
     "FilterCulprit",
+    "CartesianRiskCombo",
     "Diagnosis",
     "RelaxedTriple",
     "RelaxedCulprit",
@@ -101,10 +102,31 @@ class FilterCulprit:
 
 
 @dataclass
+class CartesianRiskCombo:
+    """A combination of triples whose reduced pattern (with them removed) was never evaluated
+    against the graph at all, because doing so would force a cartesian product — some of the
+    remaining triples' variables never overlap, even transitively, with the rest. That's exactly
+    the shape that can make a query engine materialize a full N×M cross product before yielding a
+    single row, regardless of how tightly `timeout` is set.
+
+    This is *not* a claim that the combination is or isn't a genuine `Culprit` — it's kept
+    separate specifically so a combination this call declined to check doesn't look identical to
+    one it actually checked and ruled out.
+    """
+
+    triples: List[str]
+    """One SPARQL text form per triple in the combination — same shape as `Culprit.triples`."""
+
+    depth: int
+    """The combination size at which this was encountered (see `Culprit.depth`)."""
+
+
+@dataclass
 class Diagnosis:
     original_row_count: int
     culprits: List[Culprit]
     filter_culprits: List[FilterCulprit]
+    cartesian_risks: List[CartesianRiskCombo]
 
 
 @dataclass
@@ -245,13 +267,14 @@ def _query_result_from_tuple(t) -> QueryResult:
     )
 
 
-def _diagnosis_from_tuples(original_row_count: int, culprits, filter_culprits) -> Diagnosis:
+def _diagnosis_from_tuples(original_row_count: int, culprits, filter_culprits, cartesian_risks) -> Diagnosis:
     return Diagnosis(
         original_row_count=original_row_count,
         culprits=[Culprit(triples=triples, depth=culprit_depth) for triples, culprit_depth in culprits],
         filter_culprits=[
             FilterCulprit(expression=e, row_count_without_filter=n) for e, n in filter_culprits
         ],
+        cartesian_risks=[CartesianRiskCombo(triples=triples, depth=d) for triples, d in cartesian_risks],
     )
 
 
@@ -301,8 +324,8 @@ class Store:
 
     def diagnose(self, query: str, depth: int = 3, timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT) -> Diagnosis:
         """See the module-level `diagnose` for what this does and what `depth`/`timeout` control."""
-        original_row_count, culprits, filter_culprits = self._store.diagnose(query, depth=depth, timeout=timeout)
-        return _diagnosis_from_tuples(original_row_count, culprits, filter_culprits)
+        original_row_count, culprits, filter_culprits, cartesian_risks = self._store.diagnose(query, depth=depth, timeout=timeout)
+        return _diagnosis_from_tuples(original_row_count, culprits, filter_culprits, cartesian_risks)
 
     def diagnose_and_relax(
         self,

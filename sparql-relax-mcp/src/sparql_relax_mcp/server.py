@@ -89,43 +89,64 @@ def list_datasets() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def diagnose(dataset: str, query: str) -> dict[str, Any]:
+def diagnose(dataset: str, query: str, relax: bool = False) -> dict[str, Any]:
     """Run a SPARQL SELECT query against `dataset` and diagnose it. ALWAYS call this before
     `query` -- even when you expect the query to succeed.
 
     On a working query this is nearly free: it just confirms the row count (`ok: true`). On a
     query that returns nothing, or fewer rows than expected, it explains *why* -- which BGP
-    triple(s) or FILTER(s) are responsible -- and, by searching the graph's actual edges for a
-    real connecting path, often a corrected query that actually returns rows (see `relaxed_query`
-    on each culprit). That is strictly more useful than the bare empty result a plain query run
-    would give you, at little to no extra cost when the query already works.
+    triple(s) or FILTER(s) are responsible. If `relax=True`, it also searches the graph's 
+    actual edges for a real connecting path, often finding a corrected query that actually 
+    returns rows (see `relaxed_query` on each culprit). 
+
+    Note: Relaxation is experimental. For AI agents, it is often more effective to use 
+    diagnose with `relax=False`, then allow the agent to correct the query itself based 
+    on the diagnosis.
 
     Only SELECT queries can be diagnosed (ASK/CONSTRUCT/DESCRIBE aren't supported here -- use
     `query` directly for those). Once this reports `ok: true`, call `query` to fetch the full
     result set: this tool's `row_count` fields are counts, not the actual rows.
 
-    Relaxation's path search defaults to predicates in the Brick, ASHRAE 223P, RDFS, and QUDT
-    namespaces (this tool's usual building-automation domain) -- a real fix outside those
-    namespaces won't be found, though the diagnosis of *which* triple is broken is unaffected.
+    When `relax=True`, path search defaults to predicates in the Brick, ASHRAE 223P, RDFS, 
+    and QUDT namespaces (this tool's usual building-automation domain) -- a real fix outside 
+    those namespaces won't be found, though the diagnosis of *which* triple is broken 
+    is unaffected.
     """
     store = _require_dataset(dataset)
-    report = store.diagnose_and_relax(query)
-
-    culprits = [
-        {
-            "depth": result.found_at_depth,
-            "triples": [{"triple": t.triple, "discovered_path": t.path_text} for t in result.triples],
-            "fixed": result.fixed,
-            "relaxed_query": result.relaxed_query,
-            "row_count_with_fix": result.row_count,
-            "fallback_query_with_broken_triples_removed": result.pruned_query,
-            "fallback_row_count": result.pruned_row_count,
-        }
-        for result in report.results
-    ]
-    filter_issues = [
-        {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in report.filter_results
-    ]
+    if relax:
+        report = store.diagnose_and_relax(query)
+        culprits = [
+            {
+                "depth": result.found_at_depth,
+                "triples": [{"triple": t.triple, "discovered_path": t.path_text} for t in result.triples],
+                "fixed": result.fixed,
+                "relaxed_query": result.relaxed_query,
+                "row_count_with_fix": result.row_count,
+                "fallback_query_with_broken_triples_removed": result.pruned_query,
+                "fallback_row_count": result.pruned_row_count,
+            }
+            for result in report.results
+        ]
+        filter_issues = [
+            {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in report.filter_results
+        ]
+    else:
+        report = store.diagnose(query)
+        culprits = [
+            {
+                "depth": c.depth,
+                "triples": [{"triple": t, "discovered_path": None} for t in c.triples],
+                "fixed": False,
+                "relaxed_query": None,
+                "row_count_with_fix": None,
+                "fallback_query_with_broken_triples_removed": None,
+                "fallback_row_count": None,
+            }
+            for c in report.culprits
+        ]
+        filter_issues = [
+            {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in report.filter_culprits
+        ]
 
     ok = report.original_row_count > 0 and not culprits and not filter_issues
     if ok:

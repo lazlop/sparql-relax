@@ -56,6 +56,7 @@ use rayon::prelude::*;
 use spargebra::Query;
 use spargebra::SparqlParser;
 use spargebra::algebra::{GraphPattern, PropertyPathExpression};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// Default for `sample_limit`: a representative handful of bound endpoints
@@ -338,13 +339,25 @@ fn bind_endpoints(
         RelaxError::CulpritNotFound(culprit.triples.first().map(ToString::to_string).unwrap_or_default())
     })?;
 
-    let mut pruned_pattern = reduced_pattern.clone();
+    let mut pruned_pattern = reduced_pattern;
     if let Some(limit) = result_limit {
         pruned_pattern = with_limit(pruned_pattern, limit);
     }
-    let pruned_query = with_pattern(query, pruned_pattern).to_string();
+    let pruned_query = with_pattern(query, pruned_pattern.clone()).to_string();
 
-    let reduced_query = with_pattern(query, reduced_pattern);
+    // Note: this doesn't also need a `has_cartesian_join` check of its own.
+    // `culprit` only ever reaches here already having passed exactly that
+    // check on this exact reduced pattern — see `classify_combo` in
+    // `diagnose.rs`, the only place a `Culprit` is ever produced — so
+    // re-checking the identical structural property of the identical
+    // pattern here would be dead code, not defense in depth.
+    //
+    // Executes the *limited* pattern, not the raw `reduced_pattern` — this is
+    // the query most likely to balloon once the culprit triple(s) are gone
+    // (see the module docs), and endpoint sampling below only ever needs
+    // `sample_limit` (a handful) distinct pairs per triple, so there's no
+    // reason to let it materialize more than `result_limit` rows either.
+    let reduced_query = with_pattern(query, pruned_pattern);
     let Some(reduced_rows) = run_select_query_with_deadline(reduced_query, store, deadline)? else {
         let per_triple = culprit.triples.iter().map(|_| Vec::new()).collect();
         return Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count: 0 });
@@ -355,12 +368,13 @@ fn bind_endpoints(
         .iter()
         .map(|triple| {
             let mut endpoints: Vec<BoundEndpoint> = Vec::new();
+            let mut seen: HashSet<BoundEndpoint> = HashSet::new();
             for row in &reduced_rows {
                 let s = resolve_term_pattern(&triple.subject, row);
                 let o = resolve_term_pattern(&triple.object, row);
                 let (Some(s), Some(o)) = (s, o) else { continue };
                 let endpoint = (s, o);
-                if !endpoints.contains(&endpoint) {
+                if seen.insert(endpoint.clone()) {
                     endpoints.push(endpoint);
                 }
             }
@@ -368,7 +382,7 @@ fn bind_endpoints(
         })
         .collect();
 
-    let pruned_row_count = result_limit.map_or(reduced_rows.len(), |limit| reduced_rows.len().min(limit));
+    let pruned_row_count = reduced_rows.len();
     Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count })
 }
 

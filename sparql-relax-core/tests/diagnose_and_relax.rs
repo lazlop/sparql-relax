@@ -658,3 +658,67 @@ fn namespace_scope_restricts_path_search_to_allowed_prefixes() {
         "a caller-supplied namespace covering ex:altPath should find it"
     );
 }
+
+/// `?sensor` (T1/T2) and `?widget` (T3) never share a variable, so removing
+/// either T1 or T2 alone leaves a disconnected two-component BGP — exactly
+/// the shape that forces a cartesian product. T3's own component (`ex:Widget`)
+/// is non-empty, so if this weren't guarded, checking those combos would ask
+/// the query engine to materialize a real (if here, trivially small) cross
+/// product; at real-world scale this is the class of query that can make an
+/// engine block on a full N×M materialization well past any `timeout` (see
+/// `diagnose.rs`'s module docs).
+fn disconnected_store() -> Store {
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:building223 ex:hasSensor ex:sensor1 .
+                ex:sensor1 a ex:TempSensor .
+                ex:widget1 a ex:Widget .
+            "#,
+        )
+        .unwrap();
+    store
+}
+
+const DISCONNECTED_QUERY: &str = r#"
+    PREFIX ex: <urn:example#>
+    SELECT ?sensor ?widget WHERE {
+        ex:building223 ex:hasBrokenLink ?sensor .
+        ?sensor a ex:TempSensor .
+        ?widget a ex:Widget .
+    }
+"#;
+
+#[test]
+fn a_disconnected_reduced_pattern_is_reported_as_a_cartesian_risk_not_silently_ruled_out() {
+    let store = disconnected_store();
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None).unwrap();
+
+    assert_eq!(diagnosis.original_row_count, 0);
+    // Removing the real culprit (T1, `ex:hasBrokenLink`) leaves {T2, T3}
+    // disconnected, and removing T2 leaves {T1, T3} disconnected too — both
+    // are never evaluated, so the real culprit is never confirmed as one.
+    // That's the conservative trade-off this guard makes deliberately (see
+    // `ComboVerdict`'s docs): a query never evaluated can't be claimed
+    // "not a culprit" any more than it can be claimed a culprit.
+    assert!(diagnosis.culprits.is_empty(), "the true culprit's combo is disconnected once isolated, so it's never confirmed — that's expected, not a bug");
+    assert_eq!(diagnosis.cartesian_risks.len(), 2, "both single-triple combos that disconnect the pattern should be reported as risks");
+
+    // Removing T3 alone leaves {T1, T2} connected (they share ?sensor), so
+    // that combo *is* safely evaluated — and correctly comes back as not a
+    // culprit, since T1 is still broken within it.
+    let risky_triples: Vec<String> = diagnosis.cartesian_risks.iter().flat_map(|r| r.triples.iter().map(ToString::to_string)).collect();
+    assert!(!risky_triples.iter().any(|t| t.contains("Widget")), "the T3-removed combo stays connected and is safely evaluated, not flagged as a risk");
+}
+
+#[test]
+fn diagnose_and_relax_does_not_hang_or_error_on_a_disconnected_query() {
+    let store = disconnected_store();
+    let report = diagnose_and_relax(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None).unwrap();
+    // No culprit was ever confirmed (see the diagnosis-only test above), so
+    // there's nothing for the relax phase to even attempt.
+    assert!(report.results.is_empty());
+}

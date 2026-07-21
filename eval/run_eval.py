@@ -10,20 +10,29 @@ diagnosis exists for — scored against each row's ground-truth query.
 
 For every such row, this:
 
-  1. Runs `diagnose_and_relax` on the generated query (`ablation_depth=3`
-     by default), which runs diagnosis internally before attempting to
-     relax any culprit it finds.
-  2. Scores the original query's own value set against ground truth
-     (value-set F1, GT rows covered, excess result rows — the same
-     "flatten every bound value across every row/column into a set, then
-     precision/recall/F1 against ground truth" metric the previous Python
-     implementation's eval used, for comparability) — the diagnose-stage
-     metrics.
-  3. Scores every culprit combination's `relaxed_query` (if one was built)
-     the same way, and records the best-scoring one — the relax-stage
-     metrics, alongside diagnosis details (how many culprits, how many
-     combinations diagnosis needed >1 triple for, how many filters were
-     flagged).
+  1. Assigns it a stable `uuid` — a `uuid5` hash of
+     (source_csv, query_id, building, generated_sparql), so the same row
+     gets the same id on every run rather than a fresh random one; that's
+     what lets `--resume` and any cross-run comparison join on `uuid` alone.
+  2. Records `gt_rows` (the ground-truth query's row count) and `gen_rows`
+     (the generated query's row count) — the latter is always 0, exactly
+     because that's this script's own selection criterion (see `load_rows`),
+     read from the CSV's own recorded `gen_num_rows`/`returns_results`
+     rather than re-run here.
+  3. Scores the (known-empty) generated query's own value set against
+     ground truth — value-set F1, GT rows covered, excess result rows, the
+     same "flatten every bound value across every row/column into a set,
+     then precision/recall/F1 against ground truth" metric the previous
+     Python implementation's eval used, for comparability — as the
+     `diagnose_*` columns. Since the generated query is guaranteed to
+     return zero rows, this needs no query execution at all: an empty
+     result set trivially covers nothing and produces no excess, and its F1
+     is 0.0 against any non-empty ground truth (1.0 in the one edge case
+     where the ground truth is *also* empty, `calculate_f1`'s convention).
+  4. Runs `diagnose_and_relax` on the generated query (`ablation_depth=3` by
+     default), scores every culprit combination's `relaxed_query` (if one
+     was built) the same way, and records the best-scoring one as the
+     `relax_*` columns.
 
 Every zero-result row is processed; there's no F1-threshold skip, since a
 query with zero original rows can't already be a perfect match (barring an
@@ -33,8 +42,24 @@ special-casing).
 Unlike the old pure-Python ablation (which brute-forced dozens of
 predicate-substitution variants per triple and needed a multiprocess
 worker-recycling supervisor to stay within memory), sparql-relax-rs's
-Rust core does one bounded search per query, so this script is a plain
-sequential loop — no process pool, no memory-based worker recycling.
+Rust core does one bounded search per query, so processing itself is a
+plain sequential loop, one row at a time, with no query-level concurrency.
+
+It does still run inside a single persistent worker subprocess, though —
+see `RowWorker`/`_worker_loop` below — not for throughput, but because
+`diagnose_and_relax`'s Rust-side `timeout` isn't always enough on its own:
+Oxigraph's query engine can go a long time between checking its
+cancellation token (a cartesian-join BGP or a `*`/`+` property path can
+make it materialize a large intermediate result before yielding control
+back at all), and a stuck evaluation like that permanently occupies a
+`rayon` worker thread for the rest of the process — no Python-side
+timeout can force a native thread to stop. The parent enforces a hard
+wall-clock cap per row and kills-and-restarts the worker if it's ever
+exceeded, which is the only thing that can actually reclaim a wedged
+thread. `BuildingCache` still lives inside that one worker for its whole
+lifetime, so this costs nothing extra in the common case; only a row that
+actually trips the watchdog pays for a fresh worker (and everything it
+needs to reload).
 
 `sparql_relax.diagnose`/`diagnose_and_relax` each reparse and reindex
 their RDF graph from scratch on every call if you pass them raw text — on
@@ -66,9 +91,11 @@ from __future__ import annotations
 import argparse
 import csv
 import glob
+import multiprocessing as mp
 import random
 import sys
 import time
+import uuid as uuid_module
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -236,27 +263,46 @@ def load_rows(csv_path: str) -> pd.DataFrame:
 # ==============================================================================
 
 OUTPUT_FIELDS = [
-    "source_csv", "query_id", "question", "building", "approach", "model_name",
-    "skipped", "original_value_set_f1", "best_value_set_f1", "best_stmt_index",
-    "best_stmt_type", "best_stmt_text", "removed_statements", "original_sparql",
-    "best_sparql", "delta_value_set_f1", "result_row_count", "result_col_count",
-    "result_unique_value_count", "gt_row_count", "gt_col_count", "gt_unique_value_count",
-    "syntax_ok", "timed_out", "error", "elapsed_sec", "relax_attempted",
-    "relax_value_set_f1", "relax_result_row_count", "relax_result_col_count",
-    "relax_sparql", "relax_delta_value_set_f1", "relax_elapsed_sec",
-    "gt_rows_covered", "excess_result_rows", "relax_gt_rows_covered", "relax_excess_result_rows"
+    "uuid", "source_csv", "query_id", "question", "building", "approach", "model_name",
+    "gt_rows", "gt_col_count", "gt_unique_value_count",
+    "gen_rows",
+    "diagnose_value_set_f1", "diagnose_rows_covered", "diagnose_excess_rows",
+    "relax_attempted", "relax_stmt_index", "relax_stmt_type", "relax_stmt_text",
+    "relax_removed_statements", "relax_sparql",
+    "relax_value_set_f1", "relax_rows_covered", "relax_excess_rows",
+    "relax_result_row_count", "relax_result_col_count",
+    "timed_out", "error", "elapsed_sec",
 ]
 
 
+def _uuid_for_row(csv_path: str, row: dict) -> str:
+    """A stable per-row id: `uuid5` of (csv_path, query_id, building, generated_sparql), so the
+    same logical row gets the same `uuid` on every run rather than a fresh random one each time —
+    that's what lets `--resume` (and any cross-run comparison) join on `uuid` alone."""
+    key = f"{csv_path}|{row.get('query_id', '')}|{row.get('building', '')}|{row.get('generated_sparql', '')}"
+    return str(uuid_module.uuid5(uuid_module.NAMESPACE_URL, key))
+
+
+def _int_or_zero(value) -> int:
+    """Coerces a CSV-sourced numeric field to `int`, treating `None`/`NaN`/unparseable values as
+    0 rather than propagating them — `gen_num_rows` can be missing or `NaN` for some rows even
+    within a CSV that has the column at all."""
+    try:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return 0
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _blank_relax_fields() -> dict:
-    """Default values for relaxation columns when no relaxation is performed or found."""
+    """Default values for the relax-stage columns when nothing was found (or relaxation wasn't
+    attempted at all — see `--diagnose-only`)."""
     return {
-        "best_value_set_f1": "", "best_stmt_index": -1, "best_stmt_type": "baseline",
-        "best_stmt_text": "", "removed_statements": "[]", "best_sparql": "",
-        "delta_value_set_f1": "", "relax_attempted": False, "relax_value_set_f1": "",
-        "relax_result_row_count": "", "relax_result_col_count": "", "relax_sparql": "",
-        "relax_delta_value_set_f1": "", "relax_elapsed_sec": "",
-        "relax_gt_rows_covered": "", "relax_excess_result_rows": "",
+        "relax_stmt_index": -1, "relax_stmt_type": "baseline",
+        "relax_stmt_text": "", "relax_removed_statements": "[]", "relax_sparql": "",
+        "relax_value_set_f1": "", "relax_rows_covered": "", "relax_excess_rows": "",
+        "relax_result_row_count": "", "relax_result_col_count": "",
     }
 
 
@@ -271,6 +317,25 @@ class EvalConfig:
     diagnose_only: bool
 
 
+def _base_fields(row: dict, csv_path: str) -> dict:
+    return {
+        "source_csv": csv_path,
+        "query_id": str(row.get("query_id", "")),
+        "question": str(row.get("question", "")),
+        "building": str(row.get("building", "")),
+        "approach": str(row.get("approach", Path(csv_path).parent.name)),
+        "model_name": str(row.get("model_name", "")),
+    }
+
+
+def _is_timeout_message(message: str) -> bool:
+    """Whether an exception's text names a timeout — covers both
+    `RelaxError::Timeout`/`RelaxError::QueryTimeout` (see
+    sparql-relax-core/src/error.rs) and this script's own watchdog messages."""
+    lowered = message.lower()
+    return "timeout" in lowered or "timed out" in lowered
+
+
 def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig) -> Optional[dict]:
     building = str(row.get("building", ""))
     store = cache.store(building)
@@ -278,64 +343,59 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     if store is None or relax_store is None:
         return None
 
-    base = {
-        "source_csv": csv_path,
-        "query_id": str(row.get("query_id", "")),
-        "question": str(row.get("question", "")),
-        "building": building,
-        "approach": str(row.get("approach", Path(csv_path).parent.name)),
-        "model_name": str(row.get("model_name", "")),
-    }
-
+    base = _base_fields(row, csv_path)
     gen_query = str(row["generated_sparql"])
     gt_query = str(row["ground_truth_sparql"])
 
-    t_score0 = time.monotonic()
+    t0 = time.monotonic()
     gt_values, gt_rows, gt_cols, gt_sets, gt_error = _get_full_query_stats(gt_query, store, cfg.limit)
     if gt_values is None:
         gt_values, gt_rows, gt_cols, gt_sets = set(), 0, 0, []
+    t_gt = round(time.monotonic() - t0, 3)
 
-    gen_values, gen_rows, gen_cols, gen_sets, gen_error = _get_full_query_stats(gen_query, store, cfg.limit)
-    if gen_values is None:
-        gen_values, gen_rows, gen_cols, gen_sets = set(), 0, 0, []
-
-    original_f1 = calculate_f1(gen_values, gt_values)
-    orig_cov, orig_exc = _row_coverage_stats(gen_sets, gt_sets)
-    t_score = round(time.monotonic() - t_score0, 3)
+    # The generated query is guaranteed to return zero rows — that's this
+    # script's own selection criterion (see `load_rows`) — so its value set
+    # is trivially empty and there's no need to actually re-run it here:
+    # `calculate_f1`/`_row_coverage_stats` already handle an empty result set
+    # correctly (0 rows covered, 0 excess, F1 0.0 unless the ground truth is
+    # *also* empty). `gen_rows` itself comes straight from the CSV's own
+    # recorded `gen_num_rows`, not recomputed.
+    gen_rows = _int_or_zero(row.get("gen_num_rows"))
+    diagnose_f1 = calculate_f1(set(), gt_values)
+    diagnose_cov, diagnose_exc = _row_coverage_stats([], gt_sets)
 
     if cfg.verbose:
-        print(f"    scored original+GT in {t_score}s -> original_f1={original_f1:.3f}, cov={orig_cov}, exc={orig_exc}", flush=True)
+        print(f"    scored GT in {t_gt}s -> diagnose_f1={diagnose_f1:.3f}, cov={diagnose_cov}, exc={diagnose_exc}", flush=True)
 
     common = {
-        **base, "skipped": False,
-        "original_value_set_f1": round(original_f1, 6),
-        "result_row_count": gen_rows, "result_col_count": gen_cols,
-        "result_unique_value_count": len(gen_values),
-        "gt_row_count": gt_rows, "gt_col_count": gt_cols,
-        "gt_unique_value_count": len(gt_values),
-        "syntax_ok": gen_error == "", "timed_out": "timed out" in (gen_error or "").lower(),
-        "error": gen_error or "", "elapsed_sec": t_score,
-        "gt_rows_covered": orig_cov, "excess_result_rows": orig_exc,
-        "original_sparql": gen_query,
-        "relax_attempted": True,
+        **base, "uuid": _uuid_for_row(csv_path, row),
+        "gt_rows": gt_rows, "gt_col_count": gt_cols, "gt_unique_value_count": len(gt_values),
+        "gen_rows": gen_rows,
+        "diagnose_value_set_f1": round(diagnose_f1, 6),
+        "diagnose_rows_covered": diagnose_cov, "diagnose_excess_rows": diagnose_exc,
+        "relax_attempted": not cfg.diagnose_only,
     }
 
     if cfg.diagnose_only:
-        return _diagnose_only_row(relax_store, gen_query, cfg, common, base["query_id"], building)
+        return _diagnose_only_row(relax_store, gen_query, cfg, common, base["query_id"], building, t_gt)
 
     if cfg.verbose:
-        print(f"  [{base['query_id']}] {building}  original_f1={original_f1:.3f} -> relaxing...", flush=True)
+        print(f"  [{base['query_id']}] {building}  diagnose_f1={diagnose_f1:.3f} -> relaxing...", flush=True)
 
     best_f1 = -1.0
     best = None
     best_idx = -1
+    relax_error = ""
 
     # Relaxation phase. diagnose_and_relax runs diagnosis internally (so
     # there's no separate diagnose() call here) and enforces its own
     # timeout/diagnose_timeout deadlines via a real Rust-side cancellation
     # token — see sparql-relax-core/src/diagnose.rs — so it's called
     # directly rather than wrapped in a Python-side watchdog thread/future
-    # that would only add overhead without bounding anything further.
+    # here specifically. That Rust-side deadline is usually sufficient but
+    # not watertight (see the module docstring); the backstop for the rare
+    # case it misses is the hard-timeout process watchdog this function
+    # runs under (see `RowWorker`), not a per-call wrapper here.
     t_relax_start = time.monotonic()
     try:
         report = relax_store.diagnose_and_relax(
@@ -354,27 +414,18 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
                 best_f1 = f1
                 best = culprit
                 best_idx = idx
-    except Exception:
+    except Exception as exc:
         best_f1 = -1.0
+        relax_error = str(exc)
     t_relax_elapsed = round(time.monotonic() - t_relax_start, 3)
+    total_elapsed_sec = round(t_gt + t_relax_elapsed, 3)
 
-    # Total time for baseline scoring + diagnosis + relaxation (diagnose_and_relax
-    # does diagnosis internally, so t_relax_elapsed already covers both).
-    total_elapsed_sec = round(t_score + t_relax_elapsed, 3)
-
-    if best is None or best_f1 <= original_f1:
+    if best is None:
         return {
             **common,
-            "best_value_set_f1": round(original_f1, 6),
-            "best_stmt_index": -1, "best_stmt_type": "baseline",
-            "best_stmt_text": "", "removed_statements": "[]",
-            "best_sparql": gen_query,
-            "delta_value_set_f1": 0.0,
+            **_blank_relax_fields(),
             "relax_value_set_f1": round(best_f1, 6) if best_f1 >= 0 else "",
-            "relax_result_row_count": "", "relax_result_col_count": "",
-            "relax_sparql": "", "relax_delta_value_set_f1": "",
-            "relax_elapsed_sec": t_relax_elapsed,
-            "relax_gt_rows_covered": "", "relax_excess_result_rows": "",
+            "timed_out": _is_timeout_message(relax_error), "error": relax_error,
             "elapsed_sec": total_elapsed_sec,
         }
 
@@ -385,27 +436,23 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
 
     return {
         **common,
-        "best_value_set_f1": round(best_f1, 6),
-        "best_stmt_index": best_idx,
-        "best_stmt_type": "relaxed",
-        "best_stmt_text": " | ".join(t.triple for t in best.triples),
-        "removed_statements": str([t.triple for t in best.triples]),
-        "best_sparql": best.relaxed_query,
-        "delta_value_set_f1": round(best_f1 - original_f1, 6),
+        "relax_stmt_index": best_idx,
+        "relax_stmt_type": "relaxed",
+        "relax_stmt_text": " | ".join(t.triple for t in best.triples),
+        "relax_removed_statements": str([t.triple for t in best.triples]),
+        "relax_sparql": best.relaxed_query,
         "relax_value_set_f1": round(best_f1, 6),
+        "relax_rows_covered": rel_cov,
+        "relax_excess_rows": rel_exc,
         "relax_result_row_count": rel_rows,
         "relax_result_col_count": rel_cols,
-        "relax_sparql": best.relaxed_query,
-        "relax_delta_value_set_f1": round(best_f1 - original_f1, 6),
-        "relax_elapsed_sec": t_relax_elapsed,
-        "relax_gt_rows_covered": rel_cov,
-        "relax_excess_result_rows": rel_exc,
+        "timed_out": _is_timeout_message(relax_error), "error": relax_error,
         "elapsed_sec": total_elapsed_sec,
     }
 
 
 def _diagnose_only_row(
-    relax_store: sparql_relax.Store, gen_query: str, cfg: EvalConfig, common: dict, query_id: str, building: str
+    relax_store: sparql_relax.Store, gen_query: str, cfg: EvalConfig, common: dict, query_id: str, building: str, t_gt: float
 ) -> dict:
     """Runs just `Store.diagnose()` — no endpoint resolution, no path search, no
     candidate scoring — and reports which triples/filters were flagged as
@@ -424,17 +471,155 @@ def _diagnose_only_row(
 
     return {
         **common,
-        "best_value_set_f1": common["original_value_set_f1"],
-        "best_stmt_index": -1, "best_stmt_type": "baseline",
-        "best_stmt_text": "", "removed_statements": "[]",
-        "best_sparql": common["original_sparql"],
-        "delta_value_set_f1": 0.0,
         **_blank_relax_fields(),
-        "relax_attempted": True,
-        "error": diagnose_error or common["error"],
-        "elapsed_sec": round(common["elapsed_sec"] + t_diag_elapsed, 3),
+        "timed_out": _is_timeout_message(diagnose_error), "error": diagnose_error,
+        "elapsed_sec": round(t_gt + t_diag_elapsed, 3),
     }
 
+
+
+# ==============================================================================
+#  PROCESS-LEVEL WATCHDOG
+# ==============================================================================
+#
+# diagnose_and_relax's `timeout`/`diagnose_timeout` are real, Rust-side
+# deadlines (see sparql-relax-core/src/diagnose.rs) — but they only bound the
+# work *if* Oxigraph's query engine actually checks its CancellationToken
+# often enough to notice. In practice it doesn't always: a BGP with
+# disconnected triple patterns (a cartesian join) or a `*`/`+` property path
+# can make the engine materialize a large intermediate result — a hash-join
+# build side, a transitive-closure frontier — without yielding control back
+# in between, so the deadline passes unnoticed until that materialization
+# finishes on its own. Measured live against Experiment_Results/DA-KGQA's
+# llama.csv (bldg11, query MORTAR_002's `isAssociatedWith`/`hasQuantity`
+# join): a `timeout=20.0` run sat on one row for over 200s before being
+# killed by hand, never once returning control to Python.
+#
+# Because that stuck evaluation runs inside `rayon`'s shared global thread
+# pool (every `diagnose_parsed`/`relax_combo` combination is dispatched via
+# `.into_par_iter()`), one such row doesn't just run long — it permanently
+# occupies a worker thread for the rest of the process's life, since nothing
+# on the Python side can force a native thread to stop. Each subsequent row
+# submits more combinations onto that same, increasingly saturated pool, so
+# a single pathological query early in a run degrades every row after it,
+# which is what actually produces the "run_eval hangs" symptom on a long
+# batch even though any individual diagnose_and_relax call is nominally
+# bounded.
+#
+# The raw `pyoxigraph.Store.query()` calls this script makes directly for
+# value-set-F1 scoring (`_get_full_query_stats`, used for the original/GT
+# queries and every relaxed candidate) have no timeout at all — pyoxigraph's
+# Python bindings don't expose a cancellation mechanism — so they're exposed
+# to the exact same failure mode with no protection whatsoever.
+#
+# A Python-side `future.result(timeout=...)` around any of this would not
+# help (see the module docstring on `diagnose_and_relax` above): abandoning a
+# thread-based call doesn't stop the underlying native work, which keeps
+# running and keeps holding its rayon thread hostage. Only killing the whole
+# OS process actually reclaims a wedged native thread. So each row here runs
+# inside a persistent worker *subprocess* (keeping the BuildingCache
+# performance win for the common case — reload only happens after an actual
+# watchdog kill, not on every row); the parent enforces a hard wall-clock cap
+# per row and, if it's ever exceeded, kills the worker outright and starts a
+# fresh one for the rows that follow.
+
+
+def _worker_loop(conn: "mp.connection.Connection", buildings_dir: str) -> None:
+    """Runs in the persistent worker subprocess: owns one `BuildingCache` for
+    its whole lifetime (reused across every row sent to it) and processes
+    rows one at a time, blocking on `conn.recv()` between them. Exits when
+    the parent closes its end of the pipe or sends the `None` shutdown
+    sentinel."""
+    cache = BuildingCache(Path(buildings_dir))
+    while True:
+        try:
+            msg = conn.recv()
+        except (EOFError, OSError):
+            return
+        if msg is None:
+            return
+        row, csv_path, cfg = msg
+        try:
+            result = process_row(row, csv_path, cache, cfg)
+            conn.send(("ok", result))
+        except Exception as exc:
+            conn.send(("error", str(exc)))
+
+
+class RowWorker:
+    """A persistent worker subprocess plus the hard-timeout watchdog around
+    it. `process()` looks like a plain function call from the caller's side,
+    but under the hood: send the row, wait up to `hard_timeout` seconds for a
+    reply, and if that expires — or the worker dies outright, e.g. an OOM
+    kill — SIGKILL whatever's left of it and transparently start a
+    replacement before reporting the row as failed. The replacement pays a
+    fresh `BuildingCache` (i.e. every building gets reloaded on first use
+    again), but only that one time, not on every row."""
+
+    def __init__(self, buildings_dir: Path, hard_timeout: float):
+        self._buildings_dir = buildings_dir
+        self._hard_timeout = hard_timeout
+        self._ctx = mp.get_context("fork")
+        self._conn: Optional["mp.connection.Connection"] = None
+        self._proc: Optional[mp.process.BaseProcess] = None
+        self._spawn()
+
+    def _spawn(self) -> None:
+        parent_conn, child_conn = self._ctx.Pipe()
+        proc = self._ctx.Process(target=_worker_loop, args=(child_conn, str(self._buildings_dir)), daemon=True)
+        proc.start()
+        child_conn.close()
+        self._conn = parent_conn
+        self._proc = proc
+
+    def _kill_and_respawn(self) -> None:
+        assert self._proc is not None and self._conn is not None
+        try:
+            self._proc.kill()
+        except Exception:
+            pass
+        self._proc.join(timeout=5)
+        self._conn.close()
+        self._spawn()
+
+    def process(self, row: dict, csv_path: str, cfg: EvalConfig) -> tuple[Optional[dict], Optional[str]]:
+        """Returns `(result, error)`; exactly one is `None`. `result` may
+        itself be `None` on success (the building graph was missing —
+        mirrors `process_row`'s own `None` return), which is why success/
+        failure is signalled separately rather than by `result is None`."""
+        assert self._conn is not None
+        try:
+            self._conn.send((row, csv_path, cfg))
+        except (BrokenPipeError, OSError):
+            self._kill_and_respawn()
+            return None, "worker died before this row could be sent; killed and restarted"
+
+        if not self._conn.poll(self._hard_timeout):
+            self._kill_and_respawn()
+            return None, f"row exceeded hard watchdog timeout ({self._hard_timeout:.0f}s); worker killed and restarted"
+
+        try:
+            status, payload = self._conn.recv()
+        except (EOFError, OSError):
+            self._kill_and_respawn()
+            return None, "worker died while processing this row; killed and restarted"
+
+        if status == "error":
+            return None, payload
+        return payload, None
+
+    def shutdown(self) -> None:
+        if self._conn is None or self._proc is None:
+            return
+        try:
+            self._conn.send(None)
+        except Exception:
+            pass
+        self._proc.join(timeout=5)
+        if self._proc.is_alive():
+            self._proc.kill()
+            self._proc.join(timeout=5)
+        self._conn.close()
 
 
 # ==============================================================================
@@ -484,6 +669,15 @@ def main() -> None:
              "whole batch (default: 20s)",
     )
     parser.add_argument(
+        "--hard-timeout", type=float, default=None, metavar="SECONDS",
+        help="Wall-clock cap per row enforced by killing and restarting the worker subprocess if "
+             "exceeded — a real backstop for the rare case where --timeout's Rust-side deadline "
+             "doesn't get checked in time (a cartesian-join or transitive-path query can make "
+             "Oxigraph's engine block on an expensive materialization without yielding), and for "
+             "the value-set-F1 scoring queries this script runs directly via pyoxigraph, which "
+             "have no timeout of their own at all. Defaults to max(60, 3 * --timeout + 30).",
+    )
+    parser.add_argument(
         "--resume", action="store_true",
         help="If --output already exists, skip rows already present in it (matched by "
              "source_csv/query_id/building) and append rather than overwrite.",
@@ -509,7 +703,7 @@ def main() -> None:
     skip_buildings = set(args.skip_buildings)
     rng = random.Random(args.seed)
 
-    cache = BuildingCache(buildings_dir)
+    hard_timeout = args.hard_timeout if args.hard_timeout is not None else max(60.0, 3 * args.timeout + 30)
 
     work_items: list[tuple[dict, str]] = []
     for csv_path in csv_paths:
@@ -531,17 +725,11 @@ def main() -> None:
     resuming = args.resume and out_path.exists()
     if resuming:
         with out_path.open("r", newline="", encoding="utf-8") as f:
-            done_keys = {
-                (existing.get("source_csv", ""), existing.get("query_id", ""), existing.get("building", ""))
-                for existing in csv.DictReader(f)
-            }
+            done_uuids = {existing.get("uuid", "") for existing in csv.DictReader(f)}
         before = len(work_items)
-        work_items = [
-            (row, csv_path) for row, csv_path in work_items
-            if (csv_path, str(row.get("query_id", "")), str(row.get("building", ""))) not in done_keys
-        ]
+        work_items = [(row, csv_path) for row, csv_path in work_items if _uuid_for_row(csv_path, row) not in done_uuids]
         print(
-            f"  --resume: {len(done_keys)} rows already in {out_path}, "
+            f"  --resume: {len(done_uuids)} rows already in {out_path}, "
             f"{before - len(work_items)} skipped, {len(work_items)} remaining",
             flush=True,
         )
@@ -549,52 +737,69 @@ def main() -> None:
     print(f"\n{'=' * 70}\n  Total rows to process: {len(work_items)}\n{'=' * 70}\n", flush=True)
 
     total = len(work_items)
+    worker = RowWorker(buildings_dir, hard_timeout)
     file_mode = "a" if resuming else "w"
-    with out_path.open(file_mode, newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
-        if not resuming:
-            writer.writeheader()
+    try:
+        with out_path.open(file_mode, newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=OUTPUT_FIELDS, extrasaction="ignore")
+            if not resuming:
+                writer.writeheader()
 
-        n_processed = n_relaxed_found = n_improved = n_with_culprits = 0
-        deltas: list[float] = []
-        t_start = time.monotonic()
+            n_processed = n_relaxed_found = n_improved = n_with_culprits = n_watchdog_killed = 0
+            relax_f1s: list[float] = []
+            t_start = time.monotonic()
 
-        for i, (row, csv_path) in enumerate(work_items, start=1):
-            out_row = process_row(row, csv_path, cache, cfg)
-            if out_row is None:
-                continue
-            writer.writerow(out_row)
-            f.flush()
-            n_processed += 1
-            if out_row["best_stmt_type"] == "relaxed":
-                n_with_culprits += 1
-            if out_row["relax_value_set_f1"] != "":
-                n_relaxed_found += 1
-                delta = out_row["delta_value_set_f1"]
-                deltas.append(delta)
-                if delta > 0:
-                    n_improved += 1
+            for i, (row, csv_path) in enumerate(work_items, start=1):
+                out_row, watchdog_error = worker.process(row, csv_path, cfg)
+                if watchdog_error is not None:
+                    n_watchdog_killed += 1
+                    print(f"  [{i}/{total}] WATCHDOG: {csv_path} {row.get('query_id', '')} "
+                          f"{row.get('building', '')}: {watchdog_error}", file=sys.stderr, flush=True)
+                    out_row = {
+                        **_base_fields(row, csv_path), "uuid": _uuid_for_row(csv_path, row),
+                        **_blank_relax_fields(),
+                        "gen_rows": _int_or_zero(row.get("gen_num_rows")),
+                        "relax_attempted": not cfg.diagnose_only,
+                        "timed_out": True, "error": watchdog_error,
+                        "elapsed_sec": hard_timeout,
+                    }
+                if out_row is None:
+                    continue
+                writer.writerow(out_row)
+                f.flush()
+                n_processed += 1
+                if out_row["relax_stmt_type"] == "relaxed":
+                    n_with_culprits += 1
+                if out_row["relax_value_set_f1"] != "":
+                    n_relaxed_found += 1
+                    f1 = out_row["relax_value_set_f1"]
+                    relax_f1s.append(f1)
+                    if f1 > 0:
+                        n_improved += 1
 
-            if i % 25 == 0 or i == total:
-                if cfg.diagnose_only:
-                    print(f"  [{i}/{total}] processed={n_processed} "
-                          f"with_culprits={n_with_culprits}", flush=True)
-                else:
-                    print(f"  [{i}/{total}] processed={n_processed} "
-                          f"relaxed={n_relaxed_found} improved={n_improved}", flush=True)
+                if i % 25 == 0 or i == total:
+                    if cfg.diagnose_only:
+                        print(f"  [{i}/{total}] processed={n_processed} "
+                              f"with_culprits={n_with_culprits} watchdog_killed={n_watchdog_killed}", flush=True)
+                    else:
+                        print(f"  [{i}/{total}] processed={n_processed} "
+                              f"relaxed={n_relaxed_found} improved={n_improved} watchdog_killed={n_watchdog_killed}", flush=True)
+    finally:
+        worker.shutdown()
 
     elapsed_total = round(time.monotonic() - t_start, 1)
     print(f"\n{'=' * 70}", flush=True)
     print(f"Done in {elapsed_total}s. Results written to: {out_path}", flush=True)
     print(f"  processed (originally-zero-result rows): {n_processed}", flush=True)
+    print(f"  rows killed by the hard watchdog timeout ({hard_timeout:.0f}s): {n_watchdog_killed}", flush=True)
     if cfg.diagnose_only:
         print(f"  rows with a culprit flagged (triple or filter): {n_with_culprits}", flush=True)
     else:
         print(f"  relaxation found a fix (any culprit with a path): {n_relaxed_found}", flush=True)
-        print(f"  strictly improved F1:  {n_improved}", flush=True)
-        if deltas:
-            avg_delta = sum(deltas) / len(deltas)
-            print(f"  avg delta_f1 among relaxed: {avg_delta:+.4f}", flush=True)
+        print(f"  relax_value_set_f1 > 0 (a real, non-trivial fix): {n_improved}", flush=True)
+        if relax_f1s:
+            avg_relax_f1 = sum(relax_f1s) / len(relax_f1s)
+            print(f"  avg relax_value_set_f1 among relaxed: {avg_relax_f1:.4f}", flush=True)
     print(f"{'=' * 70}", flush=True)
 
 

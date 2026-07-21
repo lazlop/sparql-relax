@@ -63,10 +63,28 @@ pub struct FilterCulprit {
     pub row_count_without_filter: usize,
 }
 
+/// A combination of triples whose reduced pattern (with them removed) was
+/// never evaluated against `store` at all, because doing so would force a
+/// cartesian product — see `algebra::has_cartesian_join`. That's
+/// exactly the shape that can make a query engine materialize a full N×M
+/// cross product before yielding a single row, regardless of how tightly
+/// `timeout` is set (see the module docs). This is *not* a claim about
+/// whether the combination is or isn't a genuine culprit — it's surfaced
+/// separately from [`Culprit`] specifically so it isn't mistaken for one of
+/// the ordinary "checked, found nothing" negatives that `depth`'s search
+/// naturally produces.
+pub struct CartesianRiskCombo {
+    pub triples: Vec<TriplePattern>,
+    /// The combination size at which this was encountered (see
+    /// [`Culprit::depth`]).
+    pub depth: usize,
+}
+
 pub struct Diagnosis {
     pub original_row_count: usize,
     pub culprits: Vec<Culprit>,
     pub filter_culprits: Vec<FilterCulprit>,
+    pub cartesian_risks: Vec<CartesianRiskCombo>,
 }
 
 /// Default for `depth`/`ablation_depth`: single triples are tried first, and
@@ -113,6 +131,13 @@ pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
 /// caller-side timeout (e.g. a Python `future.result(timeout=...)`) doesn't
 /// stop this function from still running to completion in the background,
 /// so a real, enforced `timeout` here is what actually bounds the work.
+///
+/// A combination whose reduced pattern (with it removed) would force a
+/// cartesian product is never evaluated at all, `timeout` notwithstanding —
+/// see `algebra::has_cartesian_join`. That's a distinct outcome
+/// from "checked, and it wasn't a culprit": it's collected separately in
+/// [`Diagnosis::cartesian_risks`] rather than silently folded into a
+/// negative result.
 pub fn diagnose(query_text: &str, store: &Store, depth: usize, timeout: Option<Duration>) -> Result<Diagnosis> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
@@ -168,6 +193,7 @@ pub(crate) fn diagnose_parsed(
     let guard = SharedDeadline::new(deadline);
 
     let mut culprits = Vec::new();
+    let mut cartesian_risks = Vec::new();
     let max_depth = depth.max(1);
     for k in 1..=max_depth {
         if k > triple_candidates.len() {
@@ -178,11 +204,22 @@ pub(crate) fn diagnose_parsed(
         // `store` (Oxigraph stores support concurrent reads), so check them
         // all in parallel rather than one at a time — C(n, k) grows fast
         // once a query has more than a handful of candidate triples.
-        let found: Vec<Culprit> = combinations(&triple_candidates, k)
+        let verdicts: Vec<(Vec<TriplePattern>, ComboVerdict)> = combinations(&triple_candidates, k)
             .into_par_iter()
-            .filter(|combo| is_culprit_combo(query, pattern, combo, store, original_rows.is_empty(), &guard))
-            .map(|triples| Culprit { triples, depth: k })
+            .map(|combo| {
+                let verdict = classify_combo(query, pattern, &combo, store, original_rows.is_empty(), &guard);
+                (combo, verdict)
+            })
             .collect();
+
+        let mut found = Vec::new();
+        for (triples, verdict) in verdicts {
+            match verdict {
+                ComboVerdict::Culprit => found.push(Culprit { triples, depth: k }),
+                ComboVerdict::CartesianRisk => cartesian_risks.push(CartesianRiskCombo { triples, depth: k }),
+                ComboVerdict::NotCulprit => {}
+            }
+        }
 
         if !found.is_empty() {
             culprits.extend(found);
@@ -209,7 +246,19 @@ pub(crate) fn diagnose_parsed(
         })
         .collect();
 
-    Ok(Diagnosis { original_row_count: original_rows.len(), culprits, filter_culprits })
+    Ok(Diagnosis { original_row_count: original_rows.len(), culprits, filter_culprits, cartesian_risks })
+}
+
+/// The three outcomes [`classify_combo`] can reach for one candidate
+/// combination, kept distinct rather than collapsing `CartesianRisk` into
+/// `NotCulprit`: the latter means "checked, and it wasn't"; the former means
+/// "never checked at all" (see [`CartesianRiskCombo`]) — conflating them
+/// would make a query this tool declined to evaluate look identical to one
+/// it actually ruled out.
+enum ComboVerdict {
+    NotCulprit,
+    Culprit,
+    CartesianRisk,
 }
 
 /// Whether removing every triple in `combo` together unblocks the query,
@@ -231,23 +280,42 @@ pub(crate) fn diagnose_parsed(
 /// [`run_select_query_with_deadline`], but is built once per [`diagnose_parsed`]
 /// call and shared (via a cheap token clone) across every combination
 /// checked here, rather than spawning a fresh timer thread per combination —
-/// see [`SharedDeadline`]. Hitting the deadline is treated as "not a
-/// culprit" (`false`) rather than a hang: claiming culprit-hood on
-/// unfinished evaluation would be a false positive (see the per-row loop
-/// below, which only saw *some* of the reduced query's rows before being
-/// cut off — not enough to conclude none of them jointly satisfy `combo`).
-fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern], store: &Store, original_is_empty: bool, guard: &SharedDeadline) -> bool {
+/// see [`SharedDeadline`]. Hitting the deadline reaches [`ComboVerdict::NotCulprit`]
+/// rather than a hang: claiming culprit-hood on unfinished evaluation would
+/// be a false positive (see the per-row loop below, which only saw *some*
+/// of the reduced query's rows before being cut off — not enough to
+/// conclude none of them jointly satisfy `combo`).
+///
+/// Before running anything, checks whether the reduced pattern (`combo`
+/// removed) would force a cartesian product — see
+/// [`crate::algebra::has_cartesian_join`] — and returns
+/// [`ComboVerdict::CartesianRisk`] without evaluating it at all if so. This
+/// applies uniformly to both branches below (the cheap `ASK`-based shortcut
+/// included) rather than only the full per-row scan: whether a physical
+/// query plan needs to fully materialize one side of a disconnected join
+/// before it can answer *at all* — even a plain existence check — depends on
+/// the query engine's own planner, not on which SPARQL query form asked the
+/// question, so there's no branch here that's provably safe to exempt.
+fn classify_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern], store: &Store, original_is_empty: bool, guard: &SharedDeadline) -> ComboVerdict {
     let Some(reduced_pattern) = combo.iter().try_fold(pattern.clone(), |p, t| remove_triple(&p, t)) else {
-        return false;
+        return ComboVerdict::NotCulprit;
     };
 
+    if crate::algebra::has_cartesian_join(&collect_bgp_triples(&reduced_pattern)) {
+        return ComboVerdict::CartesianRisk;
+    }
+
     if original_is_empty {
-        return pattern_has_solution(query, reduced_pattern, store, guard);
+        return if pattern_has_solution(query, reduced_pattern, store, guard) {
+            ComboVerdict::Culprit
+        } else {
+            ComboVerdict::NotCulprit
+        };
     }
 
     let cancellation_token = match guard.token() {
         Some(token) => token,
-        None => return false, // budget already exhausted before this combo could even start
+        None => return ComboVerdict::NotCulprit, // budget already exhausted before this combo could even start
     };
     let mut evaluator = SparqlEvaluator::new();
     if let Some(token) = cancellation_token {
@@ -261,9 +329,9 @@ fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePatter
     // materialize a potentially large result set that removing constraining
     // triples tends to produce.
     let Ok(results) = evaluator.for_query(with_pattern(query, reduced_pattern)).on_store(store).execute() else {
-        return false;
+        return ComboVerdict::NotCulprit;
     };
-    let QueryResults::Solutions(solutions) = results else { return false };
+    let QueryResults::Solutions(solutions) = results else { return ComboVerdict::NotCulprit };
 
     let mut any_row = false;
     for solution in solutions {
@@ -271,14 +339,14 @@ fn is_culprit_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePatter
             Ok(row) => {
                 any_row = true;
                 if combo.iter().all(|t| triple_holds_for_row(store, t, &row)) {
-                    return false; // some binding satisfies every triple in the combo; not a genuine culprit set
+                    return ComboVerdict::NotCulprit; // some binding satisfies every triple in the combo; not a genuine culprit set
                 }
             }
-            Err(QueryEvaluationError::Cancelled) => return false, // saw only some rows; not enough to conclude "not a culprit"
+            Err(QueryEvaluationError::Cancelled) => return ComboVerdict::NotCulprit, // saw only some rows; not enough to conclude "not a culprit"
             Err(_) => break,
         }
     }
-    any_row // non-empty, and no row ever satisfied the whole combo jointly
+    if any_row { ComboVerdict::Culprit } else { ComboVerdict::NotCulprit } // non-empty, and no row ever satisfied the whole combo jointly
 }
 
 /// Whether `pattern` has at least one solution against `store`, evaluated as

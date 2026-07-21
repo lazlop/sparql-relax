@@ -101,11 +101,31 @@ async def test_diagnose_reports_ok_on_a_working_query_then_query_fetches_full_re
 
 
 @pytest.mark.asyncio
-async def test_diagnose_explains_a_broken_query_and_suggests_a_fix():
+async def test_diagnose_reports_a_culprit_but_no_fix_by_default():
+    # `relax` defaults to False: diagnosis is nearly free and always run, but the
+    # (comparatively expensive, experimental) relaxation search only runs when asked
+    # for explicitly -- see the `relax` docs on the `diagnose` tool.
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
 
         diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": BROKEN_QUERY}))
+        assert diagnosis["ok"] is False
+        assert diagnosis["row_count"] == 0
+        assert len(diagnosis["culprits"]) == 1
+
+        culprit = diagnosis["culprits"][0]
+        assert culprit["triples"][0]["triple"] == "<https://brickschema.org/schema/Brick#building223> <https://brickschema.org/schema/Brick#hasSensor> ?sensor"
+        assert culprit["fixed"] is False
+        assert culprit["relaxed_query"] is None
+        assert culprit["row_count_with_fix"] is None
+
+
+@pytest.mark.asyncio
+async def test_diagnose_with_relax_true_suggests_a_fix():
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+
+        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": BROKEN_QUERY, "relax": True}))
         assert diagnosis["ok"] is False
         assert diagnosis["row_count"] == 0
         assert len(diagnosis["culprits"]) == 1
