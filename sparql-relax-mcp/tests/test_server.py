@@ -177,3 +177,25 @@ async def test_diagnose_rejects_non_select_queries():
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
         result = await client.call_tool("diagnose", {"dataset": "b223", "query": "ASK { ?s ?p ?o }"})
         assert result.isError
+
+
+@pytest.mark.asyncio
+async def test_replacing_a_dataset_is_reflected_in_diagnose_not_served_stale():
+    # diagnose routes through a persistent forked worker (see DiagnoseWorker in
+    # server.py) that's only supposed to be replaced -- picking up the new data --
+    # when load_dataset changes something. This is the test for that wiring: if
+    # load_dataset forgot to invalidate the worker, the second diagnose call below
+    # would still see the first fork's copy of "b223" (2 TempSensors) instead of
+    # the replacement (1).
+    replacement_ttl = """
+    @prefix ex: <https://brickschema.org/schema/Brick#> .
+    ex:sensor3 a ex:TempSensor .
+    """
+    async with create_connected_server_and_client_session(mcp) as client:
+        await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
+        first = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY}))
+        assert first["row_count"] == 2  # forces the worker to actually fork with the original data loaded
+
+        await client.call_tool("load_dataset", {"name": "b223", "data": replacement_ttl})
+        second = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": WORKING_QUERY}))
+        assert second["row_count"] == 1
