@@ -11,5 +11,5 @@ readme = "README.md"
 
 [tool.maturin]
 python-source = "python"
-module-name = "sparql_relax_rs._sparql_relax_rs"
+module-name = "sparql_relax._sparql_relax"
 features = ["pyo3/extension-module"]

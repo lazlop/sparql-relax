@@ -15,6 +15,8 @@ pub enum RelaxError {
     CulpritNotFound(String),
     #[error("diagnosis timed out before the original query could even be evaluated")]
     Timeout,
+    #[error("query timed out")]
+    QueryTimeout,
 }
 
 pub type Result<T> = std::result::Result<T, RelaxError>;

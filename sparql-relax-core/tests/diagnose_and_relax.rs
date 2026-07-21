@@ -77,6 +77,29 @@ fn find_path_respects_a_past_deadline_even_when_a_real_path_exists() {
 }
 
 #[test]
+fn find_path_still_works_through_a_high_fan_out_hub_node() {
+    // Regression test for switching `neighbors` from eagerly collecting
+    // every edge into a `Vec` to a lazy iterator (so a deadline can be
+    // checked partway through a huge fan-out node's edges instead of only
+    // after all of them are materialized): the real edge should still be
+    // found among hundreds of unrelated ones, in whatever order the store
+    // happens to yield them.
+    let store = Store::new().unwrap();
+    let mut ttl = String::from("@prefix ex: <urn:example#> .\n");
+    for i in 0..500 {
+        ttl.push_str(&format!("ex:hub ex:hasNoise ex:noise{i} .\n"));
+    }
+    ttl.push_str("ex:hub ex:hasPart ex:target .\n");
+    store.load_from_slice(RdfParser::from_format(RdfFormat::Turtle), &ttl).unwrap();
+
+    let start = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#hub").unwrap());
+    let goal = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#target").unwrap());
+
+    let found = sparql_relax_core::bfs::find_path(&store, &start, &goal, 1, None, None);
+    assert_eq!(found, Some(vec![Hop::Forward(oxigraph::model::NamedNode::new("urn:example#hasPart").unwrap())]));
+}
+
+#[test]
 fn diagnose_and_relax_propagates_a_timeout_error_when_diagnose_timeout_is_exceeded() {
     // diagnose_timeout is independent of the relax-phase `timeout` param —
     // an effectively-zero diagnose_timeout should fail the whole call the
@@ -115,6 +138,50 @@ fn finds_a_real_forward_forward_path_and_fixes_the_query() {
 
     let relaxed = result.relaxed_query.as_ref().unwrap();
     assert!(relaxed.contains("hasPart"));
+}
+
+#[test]
+fn relaxes_a_culprit_triple_whose_variable_is_not_in_the_select_list() {
+    // `?sensor` is a plain WHERE-clause bridge variable — it's never listed
+    // in `SELECT ?reading` — but it's still what the broken `hasSensor`
+    // triple's endpoint search needs to resolve. Regression test for a bug
+    // where the reduced query's rows were built from the *original* query's
+    // `Project`, which strips any variable not in its list (per SPARQL
+    // semantics), silently making endpoint resolution (and the ablation
+    // per-row check) blind to any culprit triple touching a non-selected
+    // variable — always falling back to the pruned/dropped-constraint query
+    // instead of finding the real `hasPart/hasSensor` path.
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:building223 ex:hasPart ex:zone1 .
+                ex:zone1 ex:hasSensor ex:sensor1 .
+                ex:sensor1 ex:reports ex:reading1 .
+            "#,
+        )
+        .unwrap();
+
+    let query = r#"
+        PREFIX ex: <urn:example#>
+        SELECT ?reading WHERE {
+            ex:building223 ex:hasSensor ?sensor .
+            ?sensor ex:reports ?reading .
+        }
+    "#;
+
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    assert_eq!(report.original_row_count, 0);
+    assert_eq!(report.results.len(), 1);
+
+    let result = &report.results[0];
+    let relaxed_triple = &result.triples[0];
+    assert!(!relaxed_triple.hop_alternatives.is_empty(), "the hasPart/hasSensor path should be found even though ?sensor isn't selected");
+    assert_eq!(relaxed_triple.path_text.as_deref(), Some("(<urn:example#hasPart> / <urn:example#hasSensor>)"));
+    assert!(result.relaxed_query.is_some());
+    assert_eq!(result.row_count, 1);
 }
 
 #[test]
@@ -376,6 +443,46 @@ fn combines_distinct_paths_from_different_bound_pairs_as_alternatives() {
         result.row_count, 2,
         "the relaxed query should recover both sensor1 (via hasPart/hasSensor) and sensor2 (via hasDevice)"
     );
+}
+
+#[test]
+fn reuses_one_path_across_endpoints_that_share_its_shape() {
+    // Both sensors hang off buildingA via the same hasPart/hasSensor shape
+    // (through different intermediate zones), so the hop sequence found for
+    // the first sampled endpoint should generalize to the second via
+    // `path_holds` rather than needing its own independent BFS — and either
+    // way, both sensors must still come back in the relaxed query's rows.
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:buildingA ex:hasPart ex:zoneA .
+                ex:zoneA ex:hasSensor ex:sensor1 .
+                ex:sensor1 a ex:TempSensor .
+                ex:buildingA ex:hasPart ex:zoneB .
+                ex:zoneB ex:hasSensor ex:sensor2 .
+                ex:sensor2 a ex:TempSensor .
+            "#,
+        )
+        .unwrap();
+
+    let query = r#"
+        PREFIX ex: <urn:example#>
+        SELECT ?sensor WHERE {
+            ex:buildingA ex:hasSensor ?sensor .
+            ?sensor a ex:TempSensor .
+        }
+    "#;
+
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    assert_eq!(report.results.len(), 1);
+    let result = &report.results[0];
+
+    assert_eq!(result.triples[0].hop_alternatives.len(), 1, "one shared path shape should be deduplicated, not repeated per endpoint");
+    assert_eq!(result.triples[0].path_text.as_deref(), Some("(<urn:example#hasPart> / <urn:example#hasSensor>)"));
+    assert_eq!(result.row_count, 2, "the single generalized path should still recover both sensor1 and sensor2");
 }
 
 #[test]
@@ -657,4 +764,130 @@ fn namespace_scope_restricts_path_search_to_allowed_prefixes() {
         1,
         "a caller-supplied namespace covering ex:altPath should find it"
     );
+}
+
+/// `?sensor` (T1/T2) and `?widget` (T3) never share a variable, so removing
+/// either T1 or T2 alone leaves a disconnected two-component BGP — exactly
+/// the shape that forces a cartesian product. T3's own component (`ex:Widget`)
+/// is non-empty, so if this weren't guarded, checking those combos would ask
+/// the query engine to materialize a real (if here, trivially small) cross
+/// product; at real-world scale this is the class of query that can make an
+/// engine block on a full N×M materialization well past any `timeout` (see
+/// `diagnose.rs`'s module docs).
+fn disconnected_store() -> Store {
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:building223 ex:hasSensor ex:sensor1 .
+                ex:sensor1 a ex:TempSensor .
+                ex:widget1 a ex:Widget .
+            "#,
+        )
+        .unwrap();
+    store
+}
+
+const DISCONNECTED_QUERY: &str = r#"
+    PREFIX ex: <urn:example#>
+    SELECT ?sensor ?widget WHERE {
+        ex:building223 ex:hasBrokenLink ?sensor .
+        ?sensor a ex:TempSensor .
+        ?widget a ex:Widget .
+    }
+"#;
+
+#[test]
+fn a_disconnected_reduced_pattern_is_reported_as_a_cartesian_risk_not_silently_ruled_out() {
+    let store = disconnected_store();
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None).unwrap();
+
+    assert_eq!(diagnosis.original_row_count, 0);
+    // Removing the real culprit (T1, `ex:hasBrokenLink`) leaves {T2, T3}
+    // disconnected, and removing T2 leaves {T1, T3} disconnected too — both
+    // are never evaluated, so the real culprit is never confirmed as one.
+    // That's the conservative trade-off this guard makes deliberately (see
+    // `ComboVerdict`'s docs): a query never evaluated can't be claimed
+    // "not a culprit" any more than it can be claimed a culprit.
+    assert!(diagnosis.culprits.is_empty(), "the true culprit's combo is disconnected once isolated, so it's never confirmed — that's expected, not a bug");
+    assert_eq!(diagnosis.cartesian_risks.len(), 2, "both single-triple combos that disconnect the pattern should be reported as risks");
+
+    // Removing T3 alone leaves {T1, T2} connected (they share ?sensor), so
+    // that combo *is* safely evaluated — and correctly comes back as not a
+    // culprit, since T1 is still broken within it.
+    let risky_triples: Vec<String> = diagnosis.cartesian_risks.iter().flat_map(|r| r.triples.iter().map(ToString::to_string)).collect();
+    assert!(!risky_triples.iter().any(|t| t.contains("Widget")), "the T3-removed combo stays connected and is safely evaluated, not flagged as a risk");
+}
+
+#[test]
+fn diagnose_and_relax_does_not_hang_or_error_on_a_disconnected_query() {
+    let store = disconnected_store();
+    let report = diagnose_and_relax(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None).unwrap();
+    // No culprit was ever confirmed (see the diagnosis-only test above), so
+    // there's nothing for the relax phase to even attempt.
+    assert!(report.results.is_empty());
+}
+
+/// Same shape as `disconnected_store`/`DISCONNECTED_QUERY` (`?sensor` and
+/// `?widget` never share a variable in the required pattern once `T1` is
+/// removed), except an `OPTIONAL` triple also directly mentions both
+/// `?sensor` and `?widget`. An `OPTIONAL` match can be entirely absent
+/// without eliminating the outer row, so that shared pair must not count as
+/// connecting them for cartesian-risk purposes — the *required* pattern is
+/// still disconnected regardless of whether the optional triple happens to
+/// bind for a given solution.
+fn disconnected_with_optional_bridge_store() -> Store {
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:building223 ex:hasSensor ex:sensor1 .
+                ex:sensor1 a ex:TempSensor .
+                ex:widget1 a ex:Widget .
+            "#,
+        )
+        .unwrap();
+    store
+}
+
+const DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY: &str = r#"
+    PREFIX ex: <urn:example#>
+    SELECT ?sensor ?widget WHERE {
+        ex:building223 ex:hasBrokenLink ?sensor .
+        ?sensor a ex:TempSensor .
+        ?widget a ex:Widget .
+        OPTIONAL { ?sensor ex:relatesToWidget ?widget . }
+    }
+"#;
+
+#[test]
+fn an_optional_only_shared_variable_does_not_mask_a_cartesian_risk_in_the_required_pattern() {
+    let store = disconnected_with_optional_bridge_store();
+    let diagnosis = diagnose(DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY, &store, 1, None).unwrap();
+
+    assert_eq!(diagnosis.original_row_count, 0);
+    // Removing the real culprit (`ex:hasBrokenLink`) leaves `?sensor` and
+    // `?widget` disconnected in the required pattern; the `OPTIONAL` triple
+    // mentions both, but must not be treated as bridging them for this
+    // check (see the function docs above). Without the fix, this combo's
+    // reduced pattern (still carrying the OPTIONAL triple) looks connected,
+    // gets evaluated, and — since `?sensor1 a ex:TempSensor` and `?widget1 a
+    // ex:Widget` both hold regardless of the OPTIONAL — is wrongly confirmed
+    // as a culprit.
+    assert!(
+        diagnosis.culprits.is_empty(),
+        "the OPTIONAL-only shared variable must not mask the required pattern's disconnect: this combo should never be evaluated, so it can't be confirmed a culprit"
+    );
+    // Risky combos: removing T1 (`hasBrokenLink`) or T2 (`?sensor a
+    // TempSensor`) each leave the required pattern disconnected across
+    // {?sensor} vs {?widget}; removing the OPTIONAL triple itself leaves the
+    // required pattern (T1, T2, T3) untouched, which is disconnected too
+    // (`?widget` never appears in a required triple). Only removing T3
+    // (`?widget a Widget`) leaves a connected required pattern ({T1, T2}
+    // share `?sensor`), so that's the one combo actually evaluated.
+    assert_eq!(diagnosis.cartesian_risks.len(), 3, "every ablation candidate except removing the ?widget triple should disconnect the required pattern");
 }

@@ -43,8 +43,8 @@
 //! Python `future.result(timeout=...)`, say) doesn't make the call actually
 //! stop running unless *something* inside it is enforcing a real deadline.
 
-use crate::algebra::{pattern_of, replace_triple_with_path, with_limit, with_pattern};
-use crate::bfs::{Hop, find_path, path_to_property_path};
+use crate::algebra::{pattern_of, replace_triple_with_path, variables_of_triples, widen_projection, with_limit, with_pattern};
+use crate::bfs::{Hop, find_path, path_holds, path_to_property_path};
 use crate::diagnose::{
     Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, diagnose_parsed, ensure_select, resolve_term_pattern,
     run_select_query_with_deadline,
@@ -56,6 +56,7 @@ use rayon::prelude::*;
 use spargebra::Query;
 use spargebra::SparqlParser;
 use spargebra::algebra::{GraphPattern, PropertyPathExpression};
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 /// Default for `sample_limit`: a representative handful of bound endpoints
@@ -334,17 +335,41 @@ fn bind_endpoints(
     result_limit: Option<usize>,
     deadline: Option<Instant>,
 ) -> Result<BoundEndpoints> {
-    let reduced_pattern = culprit.triples.iter().try_fold(pattern.clone(), |p, t| crate::algebra::remove_triple(&p, t)).ok_or_else(|| {
-        RelaxError::CulpritNotFound(culprit.triples.first().map(ToString::to_string).unwrap_or_default())
-    })?;
+    // Removed one triple at a time (rather than `try_fold`'s single combined
+    // `Option`) so a removal failure can name the specific triple that
+    // wasn't found, not just whichever happened to be first in the combo.
+    let mut reduced_pattern = pattern.clone();
+    for triple in &culprit.triples {
+        reduced_pattern = crate::algebra::remove_triple(&reduced_pattern, triple)
+            .ok_or_else(|| RelaxError::CulpritNotFound(triple.to_string()))?;
+    }
 
-    let mut pruned_pattern = reduced_pattern.clone();
+    let mut pruned_pattern = reduced_pattern;
     if let Some(limit) = result_limit {
         pruned_pattern = with_limit(pruned_pattern, limit);
     }
-    let pruned_query = with_pattern(query, pruned_pattern).to_string();
+    let pruned_query = with_pattern(query, pruned_pattern.clone()).to_string();
 
-    let reduced_query = with_pattern(query, reduced_pattern);
+    // Note: this doesn't also need a `has_cartesian_join` check of its own.
+    // `culprit` only ever reaches here already having passed exactly that
+    // check on this exact reduced pattern — see `classify_combo` in
+    // `diagnose.rs`, the only place a `Culprit` is ever produced — so
+    // re-checking the identical structural property of the identical
+    // pattern here would be dead code, not defense in depth.
+    //
+    // Executes the *limited* pattern, not the raw `reduced_pattern` — this is
+    // the query most likely to balloon once the culprit triple(s) are gone
+    // (see the module docs), and endpoint sampling below only ever needs
+    // `sample_limit` (a handful) distinct pairs per triple, so there's no
+    // reason to let it materialize more than `result_limit` rows either.
+    //
+    // Widen the (limited) reduced query's projection so each culprit
+    // triple's subject/object is visible in its rows even if it's a plain
+    // WHERE-clause bridge variable never listed in the original SELECT —
+    // see `widen_projection`'s docs for why the original projection alone
+    // isn't enough for the `resolve_term_pattern` calls below.
+    let widened_pattern = widen_projection(&pruned_pattern, &variables_of_triples(&culprit.triples));
+    let reduced_query = with_pattern(query, widened_pattern);
     let Some(reduced_rows) = run_select_query_with_deadline(reduced_query, store, deadline)? else {
         let per_triple = culprit.triples.iter().map(|_| Vec::new()).collect();
         return Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count: 0 });
@@ -355,12 +380,13 @@ fn bind_endpoints(
         .iter()
         .map(|triple| {
             let mut endpoints: Vec<BoundEndpoint> = Vec::new();
+            let mut seen: HashSet<BoundEndpoint> = HashSet::new();
             for row in &reduced_rows {
                 let s = resolve_term_pattern(&triple.subject, row);
                 let o = resolve_term_pattern(&triple.object, row);
                 let (Some(s), Some(o)) = (s, o) else { continue };
                 let endpoint = (s, o);
-                if !endpoints.contains(&endpoint) {
+                if seen.insert(endpoint.clone()) {
                     endpoints.push(endpoint);
                 }
             }
@@ -368,7 +394,7 @@ fn bind_endpoints(
         })
         .collect();
 
-    let pruned_row_count = result_limit.map_or(reduced_rows.len(), |limit| reduced_rows.len().min(limit));
+    let pruned_row_count = reduced_rows.len();
     Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count })
 }
 
@@ -410,9 +436,10 @@ fn relax_combo(
     let pruned_query = bound.pruned_query;
     let pruned_row_count = bound.pruned_row_count;
 
-    // Every triple in the combination is searched independently (and, within
-    // that, every sampled bound endpoint), so both levels run in parallel —
-    // each is just reads against the same `store`.
+    // Every triple in the combination is searched independently, so this
+    // level runs in parallel — each is just reads against the same `store`.
+    // Within a single triple's sampled endpoints, the search is sequential
+    // instead (see the comment below on why).
     let per_triple: Vec<(RelaxedTriple, Option<PropertyPathExpression>)> = culprit
         .triples
         .par_iter()
@@ -423,16 +450,26 @@ fn relax_combo(
                 None => endpoints.iter().collect(),
             };
 
-            let found: Vec<Vec<Hop>> = sampled
-                .par_iter()
-                .flat_map(|endpoint| candidates_for(store, endpoint, max_depth, allowed_namespaces, deadline).into_par_iter())
-                .filter(|hops| !hops.is_empty())
-                .collect();
-
+            // Sequential rather than `par_iter` over `sampled`: a hop
+            // sequence already found for one endpoint often generalizes to
+            // another (e.g. every sensor in the same building reached via
+            // the same 2-hop path), and `path_holds` can confirm that with
+            // a handful of direct store lookups — far cheaper than a fresh
+            // bounded BFS. Trying already-found candidates first lets later
+            // endpoints skip `find_path` (and its store scan) entirely
+            // whenever one generalizes, which matters more than the
+            // parallelism given up here (`sample_limit` keeps this small
+            // regardless).
             let mut candidates: Vec<Vec<Hop>> = Vec::new();
-            for hops in found {
-                if !candidates.contains(&hops) {
-                    candidates.push(hops);
+            for endpoint in sampled.iter().copied() {
+                let (s, o) = endpoint;
+                if candidates.iter().any(|hops| path_holds(store, s, o, hops)) {
+                    continue;
+                }
+                for hops in candidates_for(store, endpoint, max_depth, allowed_namespaces, deadline) {
+                    if !hops.is_empty() && !candidates.contains(&hops) {
+                        candidates.push(hops);
+                    }
                 }
             }
             candidates.sort_by_key(Vec::len);

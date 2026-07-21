@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [lib]
-name = "_sparql_relax_rs"
+name = "_sparql_relax"
 crate-type = ["cdylib"]
 
 [dependencies]

@@ -2,7 +2,7 @@ use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::store::Store;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use sparql_relax_core::{NamespaceScope, diagnose as core_diagnose, diagnose_and_relax as core_relax};
+use sparql_relax_core::{NamespaceScope, QueryOutcome, RdfTerm, diagnose as core_diagnose, diagnose_and_relax as core_relax, query as core_query};
 use std::fmt::Display;
 use std::time::Duration;
 
@@ -40,6 +40,13 @@ fn default_ablation_timeout() -> Option<f64> {
     Some(sparql_relax_core::DEFAULT_ABLATION_TIMEOUT.as_secs_f64())
 }
 
+/// Default value for `timeout` on `query`/`Store.query` when the Python
+/// caller doesn't pass one: `DEFAULT_QUERY_TIMEOUT`, in seconds. Passing
+/// `None` explicitly opts out to unbounded execution instead.
+fn default_query_timeout() -> Option<f64> {
+    Some(sparql_relax_core::DEFAULT_QUERY_TIMEOUT.as_secs_f64())
+}
+
 /// Converts a `timeout` argument (seconds) to a `Duration`, rejecting
 /// negative/non-finite values rather than letting `Duration::from_secs_f64`
 /// panic on them.
@@ -73,8 +80,53 @@ type CulpritTuple = (Vec<String>, usize);
 type FilterCulpritTuple = (String, usize);
 type RelaxedTripleTuple = (String, Option<String>);
 type RelaxResultTuple = (usize, Vec<RelaxedTripleTuple>, Option<String>, usize, String, usize);
-type DiagnoseTuples = (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>);
+// `CartesianRiskCombo` has the exact same (triples, depth) shape as `Culprit`,
+// so it reuses `CulpritTuple` rather than a duplicate type — the two are
+// kept apart at the Python layer by which list they end up in, not by shape.
+type DiagnoseTuples = (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>);
 type RelaxTuples = (usize, Vec<RelaxResultTuple>, Vec<FilterCulpritTuple>);
+
+/// An RDF term as `(kind, value, datatype, language)`, where `kind` is
+/// `"uri"`, `"bnode"`, or `"literal"` — the same three-way split as the
+/// SPARQL 1.1 Query Results JSON Format's `type` field, so callers already
+/// familiar with that shape don't need to learn a new one. `datatype`/
+/// `language` are only ever set when `kind` is `"literal"`.
+type TermTuple = (String, String, Option<String>, Option<String>);
+
+/// The result of `query`/`Store.query`, tagged by SPARQL query form since a
+/// single query can only ever produce one of these three shapes:
+/// `(form, boolean_result, variables, rows, triples)` where `form` is
+/// `"boolean"`, `"solutions"`, or `"graph"` and only the field(s) matching
+/// that form are set (the rest are `None`).
+type QueryTuple = (String, Option<bool>, Option<Vec<String>>, Option<Vec<Vec<Option<TermTuple>>>>, Option<Vec<(TermTuple, TermTuple, TermTuple)>>);
+
+fn term_tuple(term: RdfTerm) -> TermTuple {
+    match term {
+        RdfTerm::Iri(value) => ("uri".to_string(), value, None, None),
+        RdfTerm::BlankNode(value) => ("bnode".to_string(), value, None, None),
+        RdfTerm::Literal { value, datatype, language } => ("literal".to_string(), value, Some(datatype), language),
+    }
+}
+
+/// Runs `query` against an already-loaded `store` and converts the result to
+/// the plain tuple the Python layer returns. Shared by the free `query`
+/// pyfunction (which loads a throwaway `store` first) and `RdfStore::query`
+/// (which reuses one built once, up front) so the two entry points can't
+/// drift apart.
+fn query_tuples(store: &Store, query: &str, row_limit: Option<usize>, timeout: Option<Duration>) -> Result<QueryTuple, sparql_relax_core::RelaxError> {
+    match core_query(query, store, row_limit, timeout)? {
+        QueryOutcome::Boolean(b) => Ok(("boolean".to_string(), Some(b), None, None, None)),
+        QueryOutcome::Solutions { variables, rows } => {
+            let rows = rows.into_iter().map(|row| row.into_iter().map(|t| t.map(term_tuple)).collect()).collect();
+            Ok(("solutions".to_string(), None, Some(variables), Some(rows), None))
+        }
+        QueryOutcome::Graph(triples) => {
+            let triples =
+                triples.into_iter().map(|t| (term_tuple(t.subject), term_tuple(t.predicate), term_tuple(t.object))).collect();
+            Ok(("graph".to_string(), None, None, None, Some(triples)))
+        }
+    }
+}
 
 /// Runs `diagnose` against an already-loaded `store` and converts the result
 /// to the plain tuples the Python layer returns. Shared by the free
@@ -93,7 +145,12 @@ fn diagnose_tuples(store: &Store, query: &str, depth: usize, timeout: Option<Dur
         .into_iter()
         .map(|f| (f.expression.to_string(), f.row_count_without_filter))
         .collect();
-    Ok((diagnosis.original_row_count, culprits, filter_culprits))
+    let cartesian_risks = diagnosis
+        .cartesian_risks
+        .into_iter()
+        .map(|c| (c.triples.iter().map(ToString::to_string).collect(), c.depth))
+        .collect();
+    Ok((diagnosis.original_row_count, culprits, filter_culprits, cartesian_risks))
 }
 
 /// Same as [`diagnose_tuples`], but for `diagnose_and_relax` — shared by the
@@ -128,7 +185,7 @@ fn diagnose_and_relax_tuples(
 }
 
 #[pymodule]
-mod _sparql_relax_rs {
+mod _sparql_relax {
     use super::*;
 
     /// Diagnoses `query` against the RDF graph in `data` (parsed as `format`).
@@ -175,12 +232,74 @@ mod _sparql_relax_rs {
     /// bounds the work and lets a slow row's search release its threads
     /// instead of piling up behind an abandoned future.
     ///
-    /// Returns `(original_row_count, culprits, filter_culprits)`. Each
-    /// culprit is `(triples, depth)`: `triples` is a list of triple texts in
-    /// the combination (just one unless `depth > 1` was needed), and `depth`
-    /// is the combination size at which it was found. Each filter culprit is
-    /// `(expression_text, row_count_without_filter)`.
+    /// Returns `(original_row_count, culprits, filter_culprits,
+    /// cartesian_risks)`. Each culprit is `(triples, depth)`: `triples` is a
+    /// list of triple texts in the combination (just one unless `depth > 1`
+    /// was needed), and `depth` is the combination size at which it was
+    /// found. Each filter culprit is `(expression_text,
+    /// row_count_without_filter)`.
     ///
+    /// `cartesian_risks` is shaped exactly like `culprits` (`(triples,
+    /// depth)`), but means something different: each entry is a combination
+    /// whose reduced pattern (with it removed) was never evaluated against
+    /// `data` at all, because doing so would force a cartesian product —
+    /// some of the remaining triples' variables never overlap, even
+    /// transitively, with the rest, which is exactly the shape that can make
+    /// a query engine materialize a full N×M cross product before yielding a
+    /// single row, `timeout` notwithstanding. This is *not* a claim that the
+    /// combination is or isn't a genuine culprit — it's surfaced separately
+    /// so a query this call declined to check doesn't look identical to one
+    /// it actually ruled out.
+    ///
+    /// Runs `query` (any SPARQL query form — `SELECT`, `ASK`, `CONSTRUCT`,
+    /// `DESCRIBE`) against the RDF graph in `data` (parsed as `format`) and
+    /// returns its actual results — unlike `diagnose`/`diagnose_and_relax`,
+    /// which only explain and fix a query that returns nothing, this is the
+    /// ordinary case of running one that already works.
+    ///
+    /// `row_limit` caps how many rows a `SELECT`/`CONSTRUCT`/`DESCRIBE`
+    /// result may return, applied as a `LIMIT` on the query itself before
+    /// evaluation — only ever tightening a `LIMIT` already present in the
+    /// query, never loosening it — so an oversized result is bounded during
+    /// evaluation rather than computed in full and then truncated. Has no
+    /// effect on `ASK`, which only ever returns one boolean. Defaults to
+    /// `None` (unbounded).
+    ///
+    /// `timeout` (seconds) bounds evaluation; a query that doesn't finish in
+    /// time raises rather than continuing to run unobserved in the
+    /// background (Python threads can't be force-cancelled, so an
+    /// internally-enforced timeout here is what actually stops the work —
+    /// see `diagnose`'s docs for why that matters even when the caller has
+    /// its own external timeout). Defaults to 10.0 seconds; pass `None` to
+    /// leave it unbounded.
+    ///
+    /// Returns `(form, boolean_result, variables, rows, triples)`, tagged by
+    /// `form`:
+    /// - `"boolean"`: `boolean_result` is the `ASK` result.
+    /// - `"solutions"`: `variables` is the `SELECT` column order; each row in
+    ///   `rows` aligns to it position-for-position, with `None` wherever
+    ///   that variable was left unbound in that row.
+    /// - `"graph"`: `triples` is the `CONSTRUCT`/`DESCRIBE` result graph, as
+    ///   `(subject, predicate, object)` tuples.
+    ///
+    /// Every term (in `rows` or `triples`) is `(kind, value, datatype,
+    /// language)`: `kind` is `"uri"`, `"bnode"`, or `"literal"` (the same
+    /// three-way split as the SPARQL 1.1 Query Results JSON Format's `type`
+    /// field); `datatype`/`language` are only set when `kind` is
+    /// `"literal"`.
+    ///
+    /// Builds a throwaway store from `data` on every call — for more than
+    /// one query against the same graph, build a `Store` once instead and
+    /// call its `query` method, which reuses it.
+    #[pyfunction]
+    #[pyo3(signature = (data, query, format="turtle", row_limit=None, timeout=default_query_timeout()))]
+    fn query(py: Python<'_>, data: &str, query: &str, format: &str, row_limit: Option<usize>, timeout: Option<f64>) -> PyResult<QueryTuple> {
+        let store = load_store(data, format)?;
+        let timeout = parse_timeout_seconds(timeout)?;
+        // See the comment on `diagnose` below about releasing the GIL.
+        py.detach(|| query_tuples(&store, query, row_limit, timeout)).map_err(to_py_err)
+    }
+
     /// Builds a throwaway store from `data` on every call — for more than
     /// one query against the same graph, build a `Store` once instead and
     /// call its `diagnose` method, which reuses it.
@@ -383,6 +502,12 @@ mod _sparql_relax_rs {
                 )
             })
             .map_err(to_py_err)
+        }
+
+        #[pyo3(signature = (query, row_limit=None, timeout=default_query_timeout()))]
+        fn query(&self, py: Python<'_>, query: &str, row_limit: Option<usize>, timeout: Option<f64>) -> PyResult<QueryTuple> {
+            let timeout = parse_timeout_seconds(timeout)?;
+            py.detach(|| query_tuples(&self.inner, query, row_limit, timeout)).map_err(to_py_err)
         }
     }
 }

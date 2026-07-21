@@ -8,7 +8,8 @@
 
 use spargebra::Query;
 use spargebra::algebra::{Expression, GraphPattern, PropertyPathExpression};
-use spargebra::term::TriplePattern;
+use spargebra::term::{NamedNodePattern, TermPattern, TriplePattern, Variable};
+use std::collections::HashSet;
 
 /// Every triple pattern appearing in a `Bgp` node anywhere in `pattern`.
 /// Property-path triples (`GraphPattern::Path`) are not included: they are
@@ -42,6 +43,48 @@ fn collect_rec(pattern: &GraphPattern, out: &mut Vec<TriplePattern>) {
         | Slice { inner, .. }
         | Group { inner, .. }
         | Service { inner, .. } => collect_rec(inner, out),
+    }
+}
+
+/// Like [`collect_bgp_triples`], but skips the optional (right) branch of
+/// every `LeftJoin`: only triples that are *required* for a solution to
+/// exist at all. An `OPTIONAL` match can be entirely absent without
+/// eliminating the outer row, so a variable shared only inside one doesn't
+/// actually bridge two otherwise-disconnected clusters of the required
+/// pattern — counting it as a bridge (as [`collect_bgp_triples`] does) masks
+/// a real cartesian-join risk in the required pattern behind a connection
+/// that isn't guaranteed to hold for any given solution. Used by
+/// [`has_cartesian_join`] callers that need the connectivity of the
+/// mandatory pattern specifically, not every candidate triple ablation is
+/// allowed to touch (that's still [`collect_bgp_triples`]'s job).
+pub fn collect_required_bgp_triples(pattern: &GraphPattern) -> Vec<TriplePattern> {
+    let mut out = Vec::new();
+    collect_required_rec(pattern, &mut out);
+    out
+}
+
+fn collect_required_rec(pattern: &GraphPattern, out: &mut Vec<TriplePattern>) {
+    use GraphPattern::*;
+    match pattern {
+        Bgp { patterns } => out.extend(patterns.iter().cloned()),
+        Path { .. } | Values { .. } => {}
+        Join { left, right } | Union { left, right } | Minus { left, right } | Lateral { left, right } => {
+            collect_required_rec(left, out);
+            collect_required_rec(right, out);
+        }
+        LeftJoin { left, .. } => {
+            collect_required_rec(left, out);
+        }
+        Filter { inner, .. }
+        | Graph { inner, .. }
+        | Extend { inner, .. }
+        | OrderBy { inner, .. }
+        | Project { inner, .. }
+        | Distinct { inner }
+        | Reduced { inner }
+        | Slice { inner, .. }
+        | Group { inner, .. }
+        | Service { inner, .. } => collect_required_rec(inner, out),
     }
 }
 
@@ -345,6 +388,70 @@ pub fn with_limit(pattern: GraphPattern, limit: usize) -> GraphPattern {
     GraphPattern::Slice { inner: Box::new(pattern), start: 0, length: Some(limit) }
 }
 
+/// Every distinct variable used as a subject or object across `triples`
+/// (predicates are ignored: every triple this is called with has a concrete
+/// `NamedNode` predicate — see the candidate filter in
+/// [`crate::diagnose::diagnose_parsed`]).
+pub fn variables_of_triples(triples: &[TriplePattern]) -> Vec<Variable> {
+    let mut out = Vec::new();
+    for triple in triples {
+        for term in [&triple.subject, &triple.object] {
+            if let TermPattern::Variable(v) = term
+                && !out.contains(v)
+            {
+                out.push(v.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Widens `pattern`'s `Project` node — found by looking through any
+/// wrapping `Slice`/`Distinct`/`Reduced`/`OrderBy` (the only node kinds
+/// `spargebra` ever nests around `Project` for a plain `SELECT`) — so that,
+/// in addition to whatever it already exposes, every variable in `extra` is
+/// also visible in the resulting solutions.
+///
+/// Needed because [`crate::diagnose`]/[`crate::relax`] re-run a *reduced*
+/// copy of the original query (some BGP triples removed) and then inspect
+/// its rows via [`crate::diagnose::resolve_term_pattern`] to see what a
+/// removed triple's subject/object were bound to. That reduced query is
+/// still built from the *original* query's algebra tree, `Project` node and
+/// all — and per SPARQL semantics, `Project` strips every variable not in
+/// its list from the solutions it yields. A removed triple touching a
+/// variable that never appeared in the original `SELECT` list (a plain
+/// WHERE-clause bridge variable) would otherwise be invisible in every row,
+/// silently defeating both culprit detection and endpoint resolution for
+/// it. Widening only changes what's visible internally to these checks —
+/// the actual `relaxed_query`/`pruned_query` text shown to the caller is
+/// still built with the original, unwidened projection.
+///
+/// Leaves `pattern` unchanged if no `Project` is found (e.g. a `CONSTRUCT`
+/// pattern, which has none).
+pub fn widen_projection(pattern: &GraphPattern, extra: &[Variable]) -> GraphPattern {
+    use GraphPattern::*;
+    match pattern {
+        Project { inner, variables } => {
+            let mut widened = variables.clone();
+            for v in extra {
+                if !widened.contains(v) {
+                    widened.push(v.clone());
+                }
+            }
+            Project { inner: inner.clone(), variables: widened }
+        }
+        Slice { inner, start, length } => {
+            Slice { inner: Box::new(widen_projection(inner, extra)), start: *start, length: *length }
+        }
+        Distinct { inner } => Distinct { inner: Box::new(widen_projection(inner, extra)) },
+        Reduced { inner } => Reduced { inner: Box::new(widen_projection(inner, extra)) },
+        OrderBy { inner, expression } => {
+            OrderBy { inner: Box::new(widen_projection(inner, extra)), expression: expression.clone() }
+        }
+        other => other.clone(),
+    }
+}
+
 /// Builds an `ASK` query with `pattern` as its body, carrying over `query`'s
 /// dataset and base IRI regardless of `query`'s own form. Used where only
 /// existence of a solution matters (not the actual bindings): `ASK`
@@ -369,4 +476,73 @@ pub fn pattern_of(query: &Query) -> &GraphPattern {
         | Query::Describe { pattern, .. }
         | Query::Ask { pattern, .. } => pattern,
     }
+}
+
+/// Every variable/blank-node identifier `triple` mentions, as join keys
+/// (`?name` for a variable, `_:name` for a blank node — prefixed so a
+/// variable and a blank node that happen to share a spelling are never
+/// mistaken for the same join key). A concrete term (IRI/literal) on any
+/// side contributes nothing: it can't be joined *on*, only matched.
+fn triple_join_keys(triple: &TriplePattern) -> impl Iterator<Item = String> {
+    fn term_key(term: &TermPattern) -> Option<String> {
+        match term {
+            TermPattern::Variable(v) => Some(format!("?{}", v.as_str())),
+            TermPattern::BlankNode(b) => Some(format!("_:{}", b.as_str())),
+            _ => None,
+        }
+    }
+    let subject = term_key(&triple.subject);
+    let predicate = match &triple.predicate {
+        NamedNodePattern::Variable(v) => Some(format!("?{}", v.as_str())),
+        NamedNodePattern::NamedNode(_) => None,
+    };
+    let object = term_key(&triple.object);
+    subject.into_iter().chain(predicate).chain(object)
+}
+
+/// Whether `triples`, evaluated together as a single basic graph pattern,
+/// would force a cartesian product — i.e. its variable/blank-node-sharing
+/// graph has more than one connected component, so at least one triple's
+/// join keys never overlap, even transitively through a chain of other
+/// triples, with another's. This is exactly the shape that can make a query
+/// engine materialize a full N×M cross product before yielding a single row
+/// (see the `diagnose`/`relax` module docs on why an internally-enforced
+/// timeout doesn't reliably bound that).
+///
+/// A triple with no variables or blank nodes at all (every side concrete)
+/// never joins with anything and only ever filters existence rather than
+/// multiplying results, so it's ignored entirely rather than counted as a
+/// second, disconnected component on its own. `triples.len() < 2` is always
+/// `false` for the same reason — nothing to be disconnected *from* yet.
+pub(crate) fn has_cartesian_join(triples: &[TriplePattern]) -> bool {
+    let joinable: Vec<&TriplePattern> = triples.iter().filter(|t| triple_join_keys(t).next().is_some()).collect();
+    if joinable.len() < 2 {
+        return false;
+    }
+
+    let mut parent: Vec<usize> = (0..joinable.len()).collect();
+    fn find(parent: &mut [usize], x: usize) -> usize {
+        if parent[x] != x {
+            parent[x] = find(parent, parent[x]);
+        }
+        parent[x]
+    }
+    fn union(parent: &mut [usize], a: usize, b: usize) {
+        let (ra, rb) = (find(parent, a), find(parent, b));
+        if ra != rb {
+            parent[ra] = rb;
+        }
+    }
+
+    let keys: Vec<HashSet<String>> = joinable.iter().map(|t| triple_join_keys(t).collect()).collect();
+    for i in 0..joinable.len() {
+        for j in (i + 1)..joinable.len() {
+            if keys[i].intersection(&keys[j]).next().is_some() {
+                union(&mut parent, i, j);
+            }
+        }
+    }
+
+    let root0 = find(&mut parent, 0);
+    (1..joinable.len()).any(|i| find(&mut parent, i) != root0)
 }
