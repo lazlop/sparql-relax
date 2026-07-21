@@ -84,6 +84,13 @@ Usage:
   # entirely, just report which triples/filters are flagged as culprits.
   # Much cheaper per row than the full pass.
   python3 run_eval.py --diagnose-only
+
+  # Diagnose-only, but also try combinations diagnose() flagged as cartesian
+  # risks and skipped, once the safe search alone found nothing -- trusting
+  # the query engine to come back quickly rather than treating them as
+  # untouchable. Riskier per row (see --try-cartesian-risks' own help text),
+  # so consider a larger --hard-timeout too.
+  python3 run_eval.py --diagnose-only --try-cartesian-risks --hard-timeout 120
 """
 
 from __future__ import annotations
@@ -268,6 +275,7 @@ OUTPUT_FIELDS = [
     "gen_rows",
     "diagnose_culprit_found", "diagnose_value_set_f1", "diagnose_rows_covered", "diagnose_excess_rows",
     "num_bgp_culprits", "num_filter_culprits", "num_cartesian_risks", "cartesian_risk_only",
+    "cartesian_risk_attempted", "num_cartesian_risks_confirmed", "cartesian_risk_culprit_triples",
     "relax_attempted", "relax_stmt_index", "relax_stmt_type", "relax_stmt_text",
     "relax_removed_statements", "relax_sparql",
     "relax_value_set_f1", "relax_rows_covered", "relax_excess_rows",
@@ -316,6 +324,7 @@ class EvalConfig:
     verbose: bool
     timeout: float
     diagnose_only: bool
+    try_cartesian_risks: bool
 
 
 def _base_fields(row: dict, csv_path: str) -> dict:
@@ -489,19 +498,50 @@ def _diagnose_only_row(
     `algebra::has_cartesian_join`) declined to check a combination at all
     rather than confirming or ruling it out (`Diagnosis.cartesian_risks`).
     Used by `--diagnose-only`, where the relax phase's cost isn't wanted at
-    all."""
+    all.
+
+    If `cfg.try_cartesian_risks` is set and the safe search above came up
+    completely empty (no BGP or FILTER culprit at any depth), this also
+    re-evaluates `diagnosis.cartesian_risks` via `Store.check_cartesian_risks`
+    — actually running the combos `diagnose` skipped, on the theory that
+    trusting the engine to come back quickly is a risk worth taking *once
+    the safe search has nothing left to offer*, not routinely. This is opting
+    out of `diagnose`'s own protection for exactly this shape (see that
+    method's docs on the hang risk); it's caught the same way every other
+    row-level hang is here — by `RowWorker`'s hard-timeout watchdog, not by
+    anything in this function itself."""
     if cfg.verbose:
         print(f"  [{query_id}] {building}  -> diagnosing...", flush=True)
 
     t_diag_start = time.monotonic()
     diagnose_error = ""
     num_culprits = num_filter_culprits = num_cartesian_risks = 0
+    num_cartesian_risks_confirmed = 0
+    cartesian_risk_attempted = False
+    cartesian_risk_culprit_triples = ""
     try:
         diagnosis = relax_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
         num_culprits = len(diagnosis.culprits)
         num_filter_culprits = len(diagnosis.filter_culprits)
         num_cartesian_risks = len(diagnosis.cartesian_risks)
-        common["diagnose_culprit_found"] = num_culprits > 0 or num_filter_culprits > 0
+        found_safely = num_culprits > 0 or num_filter_culprits > 0
+        common["diagnose_culprit_found"] = found_safely
+
+        if cfg.try_cartesian_risks and not found_safely and diagnosis.cartesian_risks:
+            cartesian_risk_attempted = True
+            if cfg.verbose:
+                print(f"    -> safe search empty, trying {num_cartesian_risks} cartesian-risk combo(s)...", flush=True)
+            # Every row this function is ever called for is originally
+            # zero-result (see `load_rows`'s filter), so `original_is_empty`
+            # is always true here — `check_cartesian_risks` only needs the
+            # cheap ASK-existence shortcut, never the full per-row check.
+            confirmed = relax_store.check_cartesian_risks(
+                gen_query, diagnosis.cartesian_risks, original_is_empty=True, timeout=cfg.timeout
+            )
+            num_cartesian_risks_confirmed = len(confirmed)
+            if confirmed:
+                common["diagnose_culprit_found"] = True
+                cartesian_risk_culprit_triples = " | ".join(confirmed[0].triples)
     except Exception as exc:
         diagnose_error = str(exc)
     t_diag_elapsed = time.monotonic() - t_diag_start
@@ -512,11 +552,17 @@ def _diagnose_only_row(
         "num_bgp_culprits": num_culprits,
         "num_filter_culprits": num_filter_culprits,
         "num_cartesian_risks": num_cartesian_risks,
-        # A risk was flagged and no culprit was confirmed by any other combo
+        # A risk was flagged and no culprit was confirmed by the safe search
         # at any depth — the guard is the plausible reason diagnosis came
         # back empty on this row, not proof (a combo it declined to check
         # could have been a culprit, or could just as easily not have been).
+        # Unaffected by whether `try_cartesian_risks` then went on to
+        # actually confirm one — see `cartesian_risk_attempted`/
+        # `num_cartesian_risks_confirmed` for that outcome instead.
         "cartesian_risk_only": num_cartesian_risks > 0 and num_culprits == 0,
+        "cartesian_risk_attempted": cartesian_risk_attempted,
+        "num_cartesian_risks_confirmed": num_cartesian_risks_confirmed,
+        "cartesian_risk_culprit_triples": cartesian_risk_culprit_triples,
         "timed_out": _is_timeout_message(diagnose_error), "error": diagnose_error,
         "elapsed_sec": round(t_gt + t_diag_elapsed, 3),
     }
@@ -707,6 +753,20 @@ def main() -> None:
              "ignored in this mode.",
     )
     parser.add_argument(
+        "--try-cartesian-risks", action="store_true",
+        help="Only meaningful with --diagnose-only. When diagnose()'s safe search comes up "
+             "completely empty (no BGP/FILTER culprit at any depth) but it did flag some "
+             "combinations as cartesian risks, actually run those combos anyway via "
+             "Store.check_cartesian_risks — trusting the query engine to come back quickly rather "
+             "than skipping them outright. This opts out of the protection diagnose() applies for "
+             "disconnected BGPs (see its docstring): a bad combo can make Oxigraph materialize a "
+             "full N x M cross product without yielding, for as long as 200+ seconds in cases "
+             "measured against this dataset. The row-level --hard-timeout watchdog is what actually "
+             "catches that if it happens (killing and restarting the worker, at the cost of losing "
+             "that row's results) -- consider raising --hard-timeout when using this flag, since a "
+             "row can now attempt many more, and riskier, queries than the default budget assumes.",
+    )
+    parser.add_argument(
         "--timeout", type=float, default=20.0, metavar="SECONDS",
         help="Per-row cap on diagnose_and_relax (or diagnose, with --diagnose-only); a handful of "
              "queries need a genuinely expensive reduced-query evaluation that no search-ordering "
@@ -739,11 +799,15 @@ def main() -> None:
     if not csv_paths:
         sys.exit(f"No CSV files found under {results_dir}")
 
+    if args.try_cartesian_risks and not args.diagnose_only:
+        sys.exit("--try-cartesian-risks only has an effect together with --diagnose-only")
+
     limit = args.limit if args.limit > 0 else None
     cfg = EvalConfig(
         limit=limit,
         ablation_depth=args.ablation_depth, max_depth=args.max_depth, sample_limit=args.sample_limit,
         verbose=args.verbose, timeout=args.timeout, diagnose_only=args.diagnose_only,
+        try_cartesian_risks=args.try_cartesian_risks,
     )
     skip_buildings = set(args.skip_buildings)
     rng = random.Random(args.seed)
@@ -793,6 +857,7 @@ def main() -> None:
             n_processed = n_improved = n_with_culprits = n_watchdog_killed = 0
             n_diagnose_found = n_diagnose_improved = 0
             n_any_cartesian_risk = n_cartesian_risk_only = 0
+            n_cartesian_risk_attempted = n_cartesian_risk_recovered = 0
             relax_f1s: list[float] = []
             t_start = time.monotonic()
 
@@ -825,6 +890,10 @@ def main() -> None:
                         n_any_cartesian_risk += 1
                     if out_row.get("cartesian_risk_only"):
                         n_cartesian_risk_only += 1
+                    if out_row.get("cartesian_risk_attempted"):
+                        n_cartesian_risk_attempted += 1
+                        if out_row.get("num_cartesian_risks_confirmed"):
+                            n_cartesian_risk_recovered += 1
                 else:
                     if out_row["relax_stmt_type"] == "relaxed":
                         n_with_culprits += 1
@@ -842,7 +911,9 @@ def main() -> None:
                     if cfg.diagnose_only:
                         print(f"  [{i}/{total}] processed={n_processed} "
                               f"with_culprits={n_with_culprits} cartesian_risk={n_any_cartesian_risk} "
-                              f"cartesian_blocked_all={n_cartesian_risk_only} watchdog_killed={n_watchdog_killed}", flush=True)
+                              f"cartesian_blocked_all={n_cartesian_risk_only} "
+                              f"risk_recovered={n_cartesian_risk_recovered}/{n_cartesian_risk_attempted} "
+                              f"watchdog_killed={n_watchdog_killed}", flush=True)
                     else:
                         print(f"  [{i}/{total}] processed={n_processed} "
                               f"diagnose_found={n_diagnose_found} diagnose_improved={n_diagnose_improved} "
@@ -859,6 +930,9 @@ def main() -> None:
         print(f"  rows with a culprit flagged (triple or filter): {n_with_culprits}", flush=True)
         print(f"  rows where the cartesian-join guard declined to check at least one combination: {n_any_cartesian_risk}", flush=True)
         print(f"    of which no culprit was confirmed by any other combo (guard is the plausible reason nothing was found): {n_cartesian_risk_only}", flush=True)
+        if cfg.try_cartesian_risks:
+            print(f"  of those, actually tried via --try-cartesian-risks: {n_cartesian_risk_attempted}", flush=True)
+            print(f"    of which a risky combo was confirmed as a real culprit: {n_cartesian_risk_recovered}", flush=True)
     else:
         print(f"  diagnose found a genuine culprit (pruning it unblocks the query): {n_diagnose_found}", flush=True)
         print(f"    of which diagnose_value_set_f1 > 0 (pruning it also recovers real GT overlap): {n_diagnose_improved}", flush=True)

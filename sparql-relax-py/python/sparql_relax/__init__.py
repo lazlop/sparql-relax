@@ -359,6 +359,43 @@ class Store:
         control."""
         return _query_result_from_tuple(self._store.query(query, row_limit=row_limit, timeout=timeout))
 
+    def check_cartesian_risks(
+        self,
+        query: str,
+        risks: Sequence[CartesianRiskCombo],
+        original_is_empty: bool,
+        timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
+    ) -> List[Culprit]:
+        """Re-evaluates `risks` — combinations a prior `diagnose` call on this same `query`
+        flagged as `CartesianRiskCombo`s and never actually checked — against this store,
+        returning every one confirmed as a genuine `Culprit`.
+
+        `risks` should be that prior call's `Diagnosis.cartesian_risks`, unmodified;
+        `original_is_empty` should be that same call's `original_row_count == 0` — there's no
+        cheaper way for this method to learn it than re-running the whole original query itself,
+        so it isn't done here a second time; pass it through from what you already have.
+
+        Calling this at all means opting out of the protection `diagnose` applies for exactly this
+        shape: a disconnected BGP can make the query engine materialize a full N×M cross product
+        before yielding a single row, and unlike `diagnose`'s own bounded checks, nothing here can
+        force a stuck native evaluation to give up if the engine doesn't check its cancellation
+        token often enough — a measured case elsewhere in this project sat for over 200 seconds and
+        permanently occupied a shared worker thread until the whole process was killed (see
+        `eval/run_eval.py`'s process-level watchdog for why that backstop lives at the process
+        level, not inside this call). Use this only after `diagnose` has already come up empty, and
+        only once you've independently judged the risk worth taking for this specific query/graph —
+        ideally from a process you can afford to kill outright if a check gets stuck.
+
+        `timeout` (seconds) bounds every risk combination checked here with one shared deadline,
+        exactly like `diagnose`'s own `timeout` — not a fresh budget per combination. Defaults to
+        `DEFAULT_ABLATION_TIMEOUT`; pass `None` to leave it unbounded (not recommended given the
+        docs above).
+        """
+        culprits = self._store.check_cartesian_risks(
+            query, [list(risk.triples) for risk in risks], original_is_empty, timeout=timeout
+        )
+        return [Culprit(triples=triples, depth=d) for triples, d in culprits]
+
 
 def diagnose(
     data: str,

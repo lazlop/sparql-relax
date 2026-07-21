@@ -2,7 +2,10 @@ use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::store::Store;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use sparql_relax_core::{NamespaceScope, QueryOutcome, RdfTerm, diagnose as core_diagnose, diagnose_and_relax as core_relax, query as core_query};
+use sparql_relax_core::{
+    NamespaceScope, QueryOutcome, RdfTerm, check_cartesian_risks as core_check_cartesian_risks, diagnose as core_diagnose,
+    diagnose_and_relax as core_relax, query as core_query,
+};
 use std::fmt::Display;
 use std::time::Duration;
 
@@ -151,6 +154,24 @@ fn diagnose_tuples(store: &Store, query: &str, depth: usize, timeout: Option<Dur
         .map(|c| (c.triples.iter().map(ToString::to_string).collect(), c.depth))
         .collect();
     Ok((diagnosis.original_row_count, culprits, filter_culprits, cartesian_risks))
+}
+
+/// Re-evaluates `risks` (each a list of triple texts, in the same shape a
+/// prior `diagnose`/`Store.diagnose` call's `cartesian_risks` returns them)
+/// against `query`, converting the result to the same `(triples, depth)`
+/// tuple shape `culprits`/`cartesian_risks` themselves use. Kept as its own
+/// function for the same reason `diagnose_tuples` is, even though only
+/// `RdfStore::check_cartesian_risks` calls it today: one place for the
+/// Rust<->Python tuple conversion to live.
+fn check_cartesian_risks_tuples(
+    store: &Store,
+    query: &str,
+    risks: Vec<Vec<String>>,
+    original_is_empty: bool,
+    timeout: Option<Duration>,
+) -> Result<Vec<CulpritTuple>, sparql_relax_core::RelaxError> {
+    let culprits = core_check_cartesian_risks(query, store, &risks, original_is_empty, timeout)?;
+    Ok(culprits.into_iter().map(|c| (c.triples.iter().map(ToString::to_string).collect(), c.depth)).collect())
 }
 
 /// Same as [`diagnose_tuples`], but for `diagnose_and_relax` — shared by the
@@ -508,6 +529,50 @@ mod _sparql_relax {
         fn query(&self, py: Python<'_>, query: &str, row_limit: Option<usize>, timeout: Option<f64>) -> PyResult<QueryTuple> {
             let timeout = parse_timeout_seconds(timeout)?;
             py.detach(|| query_tuples(&self.inner, query, row_limit, timeout)).map_err(to_py_err)
+        }
+
+        /// Re-evaluates combinations a prior `diagnose` call on this same
+        /// `query` flagged as cartesian risks — skipped there because their
+        /// reduced pattern was disconnected — actually running them against
+        /// this store. `risks` should be that prior `Diagnosis`'s
+        /// `cartesian_risks[*].triples` lists, unmodified; `original_is_empty`
+        /// should be that same call's `original_row_count == 0` (there's no
+        /// cheaper way for this method to learn it than re-running the whole
+        /// original query itself, so it isn't done here a second time).
+        ///
+        /// Calling this at all means opting out of the protection `diagnose`
+        /// applies for exactly this shape: a disconnected BGP can make the
+        /// query engine materialize a full N×M cross product before yielding
+        /// a single row, and unlike `diagnose`'s own bounded checks, nothing
+        /// here can force a stuck native evaluation to give up if the engine
+        /// doesn't check its cancellation token often enough — see
+        /// `sparql-relax-core`'s `check_cartesian_risks` docs for a measured
+        /// case where that took over 200 seconds and permanently occupied a
+        /// shared worker thread until the whole process was killed. Call this
+        /// only after `diagnose` has already come up empty, and only once
+        /// you've independently judged the risk worth taking for this
+        /// specific query/graph — ideally from a process you can afford to
+        /// kill outright if a check gets stuck, not one you can't restart.
+        ///
+        /// `timeout` (seconds) bounds every risk combination checked here
+        /// with one shared deadline, exactly like `diagnose`'s own `timeout`
+        /// — not a fresh budget per combination. Defaults to 5.0 seconds;
+        /// pass `None` to leave it unbounded (not recommended given the docs
+        /// above).
+        ///
+        /// Returns every combination confirmed as a genuine culprit, in the
+        /// same `(triples, depth)` shape as `diagnose`'s own `culprits`.
+        #[pyo3(signature = (query, risks, original_is_empty, timeout=default_ablation_timeout()))]
+        fn check_cartesian_risks(
+            &self,
+            py: Python<'_>,
+            query: &str,
+            risks: Vec<Vec<String>>,
+            original_is_empty: bool,
+            timeout: Option<f64>,
+        ) -> PyResult<Vec<CulpritTuple>> {
+            let timeout = parse_timeout_seconds(timeout)?;
+            py.detach(|| check_cartesian_risks_tuples(&self.inner, query, risks, original_is_empty, timeout)).map_err(to_py_err)
         }
     }
 }

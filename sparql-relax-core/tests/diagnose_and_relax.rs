@@ -1,7 +1,9 @@
 use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::store::Store;
 use sparql_relax_core::bfs::Hop;
-use sparql_relax_core::{NamespaceScope, RelaxError, diagnose, diagnose_and_relax, diagnose_and_relax_default, diagnose_default};
+use sparql_relax_core::{
+    NamespaceScope, RelaxError, check_cartesian_risks, diagnose, diagnose_and_relax, diagnose_and_relax_default, diagnose_default,
+};
 use std::time::{Duration, Instant};
 
 const TTL: &str = r#"
@@ -828,6 +830,43 @@ fn diagnose_and_relax_does_not_hang_or_error_on_a_disconnected_query() {
     // No culprit was ever confirmed (see the diagnosis-only test above), so
     // there's nothing for the relax phase to even attempt.
     assert!(report.results.is_empty());
+}
+
+/// `diagnose`'s guard skipped both single-triple combos in
+/// `DISCONNECTED_QUERY` without ever running them (see the diagnosis-only
+/// test above), so the real culprit (T1, `hasBrokenLink`) is never
+/// confirmed. `check_cartesian_risks` is the deliberate opt-out of that
+/// guard: actually running the flagged combos recovers T1 as a genuine
+/// culprit — removing it leaves `{T2, T3}` disconnected, but T2/T3 *do* have
+/// a solution together (`ex:sensor1`/`ex:widget1`), which is exactly what
+/// makes T1's absence unblock the query. The other flagged combo (removing
+/// T2) must *not* come back as a culprit: `{T1, T3}` is still disconnected,
+/// and T1 alone never matches anything (`hasBrokenLink` isn't in the data),
+/// so that combo genuinely isn't responsible.
+#[test]
+fn check_cartesian_risks_recovers_the_real_culprit_diagnose_skipped() {
+    let store = disconnected_store();
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None).unwrap();
+    assert!(diagnosis.culprits.is_empty());
+    assert_eq!(diagnosis.cartesian_risks.len(), 2);
+
+    let risks: Vec<Vec<String>> =
+        diagnosis.cartesian_risks.iter().map(|r| r.triples.iter().map(ToString::to_string).collect()).collect();
+    let confirmed = check_cartesian_risks(DISCONNECTED_QUERY, &store, &risks, diagnosis.original_row_count == 0, None).unwrap();
+
+    assert_eq!(confirmed.len(), 1, "only the hasBrokenLink combo should be confirmed a genuine culprit");
+    assert!(confirmed[0].triples[0].to_string().contains("hasBrokenLink"));
+}
+
+/// A combo text that doesn't match any of the query's actual BGP triples
+/// (e.g. a stale/mismatched `risks` list from a different query) should
+/// raise, not silently skip or panic.
+#[test]
+fn check_cartesian_risks_errors_on_an_unmatched_triple_text() {
+    let store = disconnected_store();
+    let bogus = vec![vec!["?nonexistent <urn:example#doesNotAppear> ?anywhere".to_string()]];
+    let result = check_cartesian_risks(DISCONNECTED_QUERY, &store, &bogus, true, None);
+    assert!(result.is_err());
 }
 
 /// Same shape as `disconnected_store`/`DISCONNECTED_QUERY` (`?sensor` and

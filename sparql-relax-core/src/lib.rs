@@ -6,7 +6,8 @@ pub mod query;
 pub mod relax;
 
 pub use diagnose::{
-    CartesianRiskCombo, Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, Diagnosis, FilterCulprit, diagnose, diagnose_default,
+    CartesianRiskCombo, Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, Diagnosis, FilterCulprit, check_cartesian_risks,
+    diagnose, diagnose_default,
 };
 pub use error::{RelaxError, Result};
 pub use query::{DEFAULT_QUERY_TIMEOUT, QueryOutcome, RdfTerm, ResultTriple, query, query_default};
