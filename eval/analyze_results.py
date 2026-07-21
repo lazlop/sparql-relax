@@ -230,54 +230,210 @@ def _print_error_table(df: pd.DataFrame) -> None:
 
 def _plot_approach_f1_combined(df: pd.DataFrame) -> None:
     """
-    One bar per approach: solid = diagnose (search-only) F1, hatched extension
-    on top = the extra F1 gained once relax's fix (where found) is folded in.
+    One bar per approach: solid = diagnose (search-only) F1 / row coverage %,
+    hatched extension on top = the extra F1 / coverage gained once relax's fix
+    (where found) is folded in. Both series use the same denominator (all
+    processed queries), making the comparison fair.
+
+    Each bar also carries a second, lighter hatch capping the portion of its
+    mean attributable to queries that actually returned some rows to score
+    against — rather than an empty result set, which scores 0 by construction.
+    For the combined series that gate is "diagnose OR relax returned rows":
+    gating on relax alone would wrongly discount a query that search already
+    nailed just because relax wasn't attempted or found nothing further to fix.
+
+    Per-approach means are first averaged within each model_name, then
+    averaged across models, so one high-volume model doesn't dominate an
+    approach that spans several models (e.g. ReAct(100), run on both
+    deepseek-r1 and llama).
     """
-    by_a = (
-        df.groupby("approach")
+    processed = df.copy()
+    if "model_name" not in processed.columns:
+        processed["model_name"] = "unknown"
+
+    # Distinguish "relax not attempted" (NaN) from "attempted but found
+    # nothing better" (0) before filling, so combined_f1's fallback stays correct.
+    relax_mask = processed["relax_value_set_f1"].notna()
+
+    for col in ["diagnose_rows_covered", "diagnose_excess_rows", "relax_rows_covered", "relax_result_row_count"]:
+        processed[col] = processed[col].fillna(0)
+
+    processed["diagnose_result_row_count"] = processed["diagnose_rows_covered"] + processed["diagnose_excess_rows"]
+
+    processed["gt_rows_covered_pct"] = processed["diagnose_rows_covered"] / processed["gt_rows"].replace(0, np.nan)
+    combined_covered = processed["relax_rows_covered"].where(relax_mask, processed["diagnose_rows_covered"])
+    processed["combined_row_cov_pct"] = combined_covered / processed["gt_rows"].replace(0, np.nan)
+
+    # ── Global aggregation (all processed queries — same denominator) ──────────
+    by_ma = (
+        processed.groupby(["model_name", "approach"])
         .agg(
             n=("diagnose_value_set_f1", "count"),
-            diagnose_f1=("diagnose_value_set_f1", "mean"),
-            combined_f1=("combined_f1", "mean"),
+            mean_res=("diagnose_value_set_f1", "mean"),
+            mean_combined=("combined_f1", "mean"),
+            mean_row_cov=("gt_rows_covered_pct", "mean"),
+            mean_combined_row_cov=("combined_row_cov_pct", "mean"),
         )
         .reset_index()
-        .sort_values("diagnose_f1", ascending=False)
     )
+
+    by_a = (
+        by_ma.groupby("approach")
+        .agg(
+            n=("n", "sum"),
+            mean_res=("mean_res", "mean"),
+            mean_combined=("mean_combined", "mean"),
+            mean_row_cov=("mean_row_cov", "mean"),
+            mean_combined_row_cov=("mean_combined_row_cov", "mean"),
+        )
+        .reset_index()
+        .sort_values("mean_res", ascending=False)
+    )
+
     if by_a.empty:
         return
 
-    x = np.arange(len(by_a))
-    diag = by_a["diagnose_f1"].to_numpy()
-    comb = by_a["combined_f1"].to_numpy()
-    delta = np.maximum(comb - diag, 0)
+    # ── Filtered aggregation: search — queries where search returned rows ──────
+    search_hit = processed[processed["diagnose_result_row_count"] > 0]
+    by_a_sf = (
+        search_hit.groupby(["model_name", "approach"])
+        .agg(
+            mean_res_filt=("diagnose_value_set_f1", "mean"),
+            mean_row_cov_filt=("gt_rows_covered_pct", "mean"),
+        )
+        .reset_index()
+        .groupby("approach")
+        .agg(mean_res_filt=("mean_res_filt", "mean"), mean_row_cov_filt=("mean_row_cov_filt", "mean"))
+        .reset_index()
+    )
+    by_a = by_a.merge(by_a_sf, on="approach", how="left")
 
-    fig, ax = plt.subplots(figsize=(max(6, len(by_a) * 1.1), 4))
+    # ── Filtered aggregation: combined — queries where *either* phase (search
+    # or relax) returned rows to score against ──────────────────────────────
+    any_hit = processed[
+        (processed["diagnose_result_row_count"] > 0) | (processed["relax_result_row_count"] > 0)
+    ]
+    by_a_cf = (
+        any_hit.groupby(["model_name", "approach"])
+        .agg(
+            mean_combined_filt=("combined_f1", "mean"),
+            mean_combined_row_cov_filt=("combined_row_cov_pct", "mean"),
+        )
+        .reset_index()
+        .groupby("approach")
+        .agg(
+            mean_combined_filt=("mean_combined_filt", "mean"),
+            mean_combined_row_cov_filt=("mean_combined_row_cov_filt", "mean"),
+        )
+        .reset_index()
+    )
+    by_a = by_a.merge(by_a_cf, on="approach", how="left")
 
-    bars = ax.bar(x, diag, 0.6, label="Diagnose F1 (search only)", color="#4a90d9", zorder=3)
-    ax.bar(x, delta, 0.6, bottom=diag, label="+ Relax fix", color="#e07b54",
-           alpha=0.7, edgecolor="#e07b54", hatch="///", zorder=3)
+    # ── Rename approaches ──────────────────────────────────────────────────────
+    rename_map = {
+        "ReAct(w5000triples)_google/gemini-flash": "R5000, G",
+        "ReAct(5000)": "R5000, L",
+        "ReAct(w5000triples)": "R5000, O3",
+        "ReAct(100)": "R100, D",
+        "ReAct(w100triples)_google/gemini-flash": "R100, G",
+        "ReAct(w100triples)_4o-mini": "R100, O4",
+        "ReAct(w100triples)": "R100, O3",
+        "ReACT(noKG)": "R, O3",
+        "ReACT(noKG)_test_google/gemini-flash": "R, G",
+        "ReAct(noKG)": "R, O3b",
+        "dakgqa": "DA, O3",
+        "DA-KGQA": "DA, L",
+        "dakgqa_google/gemini-flash": "DA, G",
+    }
+    by_a = by_a[by_a["approach"].isin(rename_map.keys())]
+    by_a["approach"] = by_a["approach"].map(lambda a: rename_map.get(a, a))
 
-    for xi, g, c in zip(x, diag, comb):
-        ax.text(xi, g + 0.005, f"{g:.3f}", ha="center", va="bottom", fontsize=7, rotation=90)
-        if c > g:
-            ax.text(xi, c + 0.005, f"{c:.3f}", ha="center", va="bottom", fontsize=7,
-                     rotation=90, color="#e07b54", fontstyle="italic")
+    if by_a.empty:
+        return
 
-    xtick_labels = [f"{a}\n(n={n})" for a, n in zip(by_a["approach"], by_a["n"])]
+    approach_order = by_a["approach"].tolist()
+    x = np.arange(len(approach_order))
+
+    COLORS = {
+        "result":       "#4a90d9",
+        "combined":     "#e07b54",
+        "row_cov":      "#5bbf9e",
+        "comb_row_cov": "#d94f4f",
+    }
+
+    bar_series = [
+        ("Search Value Set", by_a["mean_res"].tolist(), by_a["mean_res_filt"].tolist(), COLORS["result"]),
+        ("Search+Relax Value Set", by_a["mean_combined"].tolist(), by_a["mean_combined_filt"].tolist(), COLORS["combined"]),
+        ("Search Row Coverage %", by_a["mean_row_cov"].tolist(), by_a["mean_row_cov_filt"].tolist(), COLORS["row_cov"]),
+        ("Search+Relax Row Coverage %", by_a["mean_combined_row_cov"].tolist(), by_a["mean_combined_row_cov_filt"].tolist(), COLORS["comb_row_cov"]),
+    ]
+
+    n_series = len(bar_series)
+    total_bar_width = 0.75
+    w = total_bar_width / n_series
+    offsets = np.linspace(-(total_bar_width - w) / 2, (total_bar_width - w) / 2, n_series)
+
+    fig, ax = plt.subplots(figsize=(max(6, len(approach_order) * 1.1), 3.5))
+
+    all_bars = []
+    for offset, (label, global_vals, filt_vals, color) in zip(offsets, bar_series):
+        bars = ax.bar(x + offset, global_vals, w, label=label, color=color, zorder=3)
+        all_bars.extend(bars)
+
+        filt_arr = np.array(filt_vals, dtype=float)
+        glob_arr = np.array(global_vals, dtype=float)
+        delta = np.where(np.isnan(filt_arr), 0, filt_arr - glob_arr)
+        delta = np.maximum(delta, 0)
+
+        hatched_bars = ax.bar(
+            x + offset, delta, w,
+            bottom=glob_arr,
+            color=color, alpha=0.5,
+            edgecolor=color, linewidth=1.0,
+            hatch="///",
+            zorder=3,
+            label=f"{label} (rows>0)",
+        )
+        for bar_h, g, f_val in zip(hatched_bars, glob_arr, filt_arr):
+            if not np.isnan(f_val) and f_val > g:
+                ax.text(bar_h.get_x() + bar_h.get_width() / 2, f_val + 0.005,
+                        f"{f_val:.3f}", ha="center", va="bottom",
+                        fontsize=7, rotation=90, color=color, fontstyle="italic")
+
+    for bar in all_bars:
+        h = bar.get_height()
+        if not np.isnan(h) and h > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, h + 0.005,
+                    f"{h:.3f}", ha="center", va="bottom", fontsize=6, rotation=90)
+
+    ax.legend(fontsize=6, loc="upper right", ncol=2)
+
+    for i, row in by_a.reset_index(drop=True).iterrows():
+        ax.text(i - 0.1, -0.1, f"n={int(row['n'])}", ha="center", va="top",
+                fontsize=6.5, color="gray",
+                transform=ax.get_xaxis_transform())
 
     ax.set_xticks(x)
-    ax.set_xticklabels(xtick_labels, rotation=30, ha="right", fontsize=7.5)
-    ax.set_ylim(0, min(1.0, max(comb.max(), diag.max()) + 0.15) if len(comb) else 1.0)
-    ax.set_ylabel("Mean value-set F1")
-    ax.set_title("Diagnose vs. Combined (search+relax) F1 by Approach", fontsize=10)
+    ax.set_xticklabels(approach_order, rotation=0, ha="right", fontsize=8)
+
+    active_cols = [
+        "mean_res", "mean_combined", "mean_row_cov", "mean_combined_row_cov",
+        "mean_res_filt", "mean_combined_filt", "mean_row_cov_filt", "mean_combined_row_cov_filt",
+    ]
+    max_val = by_a[active_cols].max().max()
+    ax.set_ylim(0, min(1.0, max_val + 0.15))
     ax.yaxis.grid(True, linestyle="--", alpha=0.5)
     ax.set_axisbelow(True)
-    ax.legend(fontsize=7, loc="upper right")
+    ax.set_ylabel("Mean Score")
+    ax.set_title(
+        "Value-Set F1 & Row Coverage — Search vs Search+Relax  (same denominator: all processed queries)",
+        fontsize=9,
+    )
 
     fig.tight_layout()
     out = "approach_f1_combined.png"
     fig.savefig(out, dpi=150, bbox_inches="tight")
-    print(f"Chart saved to {out}")
+    print(f"\nChart saved to {out}")
     plt.show()
 
 
