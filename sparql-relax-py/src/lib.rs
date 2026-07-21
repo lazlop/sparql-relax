@@ -388,8 +388,10 @@ mod _sparql_relax {
     /// pruned_row_count)`: `triples` is a list of `(triple_text, path_text)`
     /// for every triple in the combination (`path_text` is `None` when no
     /// connecting path was found within `max_depth` hops); `relaxed_query`
-    /// is the combined fix, or `None` if any triple in the combination had
-    /// no path (including one abandoned because `timeout` was exceeded).
+    /// is the combined fix — every triple that found a path spliced in,
+    /// every triple that didn't simply dropped — or `None` only if *no*
+    /// triple in the combination had a path (including one abandoned
+    /// because `timeout` was exceeded).
     /// `pruned_query` is the original query with every triple in the
     /// combination simply removed (no path substitution) — not a real fix,
     /// but always present and (outside the rare case where `timeout` cuts

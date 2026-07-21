@@ -564,7 +564,10 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
 
     // Relaxation: the hasSensor triple has a real path (hasZone/hasSensor),
     // but the hasUnit triple genuinely has none (nothing connects sensor1
-    // to Fahrenheit), so the combination as a whole should not be relaxed.
+    // to Fahrenheit). Since at least one triple in the pair found a path,
+    // the combination should still be relaxed as a whole: hasSensor spliced
+    // in with its discovered path, hasUnit simply dropped — recovering
+    // sensor1 rather than giving up on the pair entirely.
     let report = diagnose_and_relax(query, &store, 3, Some(4), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
@@ -574,8 +577,12 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
     let has_unit_result = result.triples.iter().find(|t| t.triple_text.contains("hasUnit")).unwrap();
     assert!(!has_sensor_result.hop_alternatives.is_empty(), "hasSensor has a real 2-hop path");
     assert!(has_unit_result.hop_alternatives.is_empty(), "nothing connects sensor1 to Fahrenheit");
-    assert!(result.relaxed_query.is_none(), "one broken triple in the pair has no path, so no combined fix");
-    assert_eq!(result.row_count, 0);
+    assert!(
+        result.relaxed_query.is_some(),
+        "hasSensor's path was found, so the pair is still relaxed with hasUnit simply dropped"
+    );
+    assert!(!result.relaxed_query.as_ref().unwrap().contains("hasUnit"), "hasUnit should be dropped, not just left broken");
+    assert_eq!(result.row_count, 1, "sensor1 matches once hasSensor is path-substituted and hasUnit is dropped");
 }
 
 #[test]

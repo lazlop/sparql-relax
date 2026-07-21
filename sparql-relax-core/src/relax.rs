@@ -4,12 +4,16 @@
 //! a higher depth), resolves what its variables are actually bound to —
 //! diagnosis itself does none of this binding work, so a plain diagnosis
 //! call never pays for it — then searches each triple's bound endpoints for
-//! a real forward/inverse path (via [`crate::bfs`]), splices *all* of the
-//! combination's triples in place at once, and confirms the result by
-//! actually re-running the modified query. A combination is only relaxed as
-//! a whole: if any one of its triples has no discoverable path, the others
-//! being fixable wouldn't produce a working query on its own (they're only
-//! broken *together*), so no relaxed query is built for it.
+//! a real forward/inverse path (via [`crate::bfs`]), splices every triple
+//! that found one into the pattern in its place and simply drops whichever
+//! didn't, and confirms the result by actually re-running the modified
+//! query. A combination only goes unrelaxed (falling back to
+//! [`RelaxedCulprit::pruned_query`]) when *none* of its triples found a
+//! path — as soon as at least one does, the rest are dropped rather than
+//! left broken, since a partially-relaxed query is still a strictly better
+//! candidate than dropping the whole combination, and it's re-verified
+//! against the graph exactly like a fully-relaxed one, so a bad partial fix
+//! still scores as empty instead of being trusted blindly.
 //!
 //! A broken triple's other side is sometimes not bound anywhere else in the
 //! query (e.g. `?sensor` in `building hasSensor ?sensor` if nothing else
@@ -43,7 +47,9 @@
 //! Python `future.result(timeout=...)`, say) doesn't make the call actually
 //! stop running unless *something* inside it is enforcing a real deadline.
 
-use crate::algebra::{pattern_of, replace_triple_with_path, variables_of_triples, widen_projection, with_limit, with_pattern};
+use crate::algebra::{
+    pattern_of, remove_triple, replace_triple_with_path, variables_of_triples, widen_projection, with_limit, with_pattern,
+};
 use crate::bfs::{Hop, find_path, path_holds, path_to_property_path};
 use crate::diagnose::{
     Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, diagnose_parsed, ensure_select, resolve_term_pattern,
@@ -159,13 +165,14 @@ pub struct RelaxedCulprit {
     /// Every triple in the culprit combination, each with its own path
     /// search result, in the same order they appear in the query.
     pub triples: Vec<RelaxedTriple>,
-    /// The full query with every triple above replaced by its discovered
-    /// path, only present if *all* of them had one — relaxing just some of
-    /// a jointly-broken combination wouldn't produce a working query, since
-    /// the others are still broken on their own.
+    /// The full query with every triple above that found a path replaced by
+    /// it, and every triple that didn't simply dropped. `None` only when
+    /// *none* of the combination's triples found a path — as soon as one
+    /// does, the rest are dropped rather than leaving the whole combination
+    /// unrelaxed.
     pub relaxed_query: Option<String>,
-    /// Row count of `relaxed_query` when re-executed. Zero if no combined
-    /// relaxation was built, or it still returns nothing.
+    /// Row count of `relaxed_query` when re-executed. Zero if no
+    /// relaxation was built at all, or it still returns nothing.
     pub row_count: usize,
     /// The original query with every triple in this combination simply
     /// removed — no path substitution, so it isn't a real fix (it silently
@@ -486,11 +493,19 @@ fn relax_combo(
 
     let (relaxed_triples, paths): (Vec<_>, Vec<_>) = per_triple.into_iter().unzip();
 
-    // Only build a combined relaxed query if every triple in the
-    // combination had a discoverable path — otherwise the ones without one
-    // are still broken and the query would still fail regardless.
-    let all_found = paths.iter().all(Option::is_some);
-    if !all_found {
+    // Splice in a path for every triple that found one, and simply drop
+    // (prune) whichever ones didn't — rather than requiring the whole
+    // combination to have a path for every triple before building anything.
+    // A pair where one triple gets a real path substitution and the other
+    // just gets dropped is still a strictly better candidate than dropping
+    // both, and it's re-verified against the graph below exactly like a
+    // fully-relaxed query is, so a bad partial fix still scores as empty
+    // rather than being trusted blindly. Only when *none* of the
+    // combination's triples found a path is there nothing to splice in, so
+    // that case alone falls back to `pruned_query` (identical to it, so
+    // building a redundant `relaxed_query` would add nothing).
+    let any_found = paths.iter().any(Option::is_some);
+    if !any_found {
         return Ok(RelaxedCulprit {
             found_at_depth: culprit.depth,
             triples: relaxed_triples,
@@ -502,8 +517,12 @@ fn relax_combo(
     }
 
     let mut relaxed_pattern = pattern.clone();
-    for (triple, path_expr) in culprit.triples.iter().zip(paths.into_iter().flatten()) {
-        let Some(next) = replace_triple_with_path(&relaxed_pattern, triple, path_expr) else {
+    for (triple, path_expr) in culprit.triples.iter().zip(paths.into_iter()) {
+        let next = match path_expr {
+            Some(path_expr) => replace_triple_with_path(&relaxed_pattern, triple, path_expr),
+            None => remove_triple(&relaxed_pattern, triple),
+        };
+        let Some(next) = next else {
             return Ok(RelaxedCulprit {
                 found_at_depth: culprit.depth,
                 triples: relaxed_triples,

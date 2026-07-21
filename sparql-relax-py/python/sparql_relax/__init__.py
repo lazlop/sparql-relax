@@ -149,9 +149,10 @@ class RelaxedCulprit:
     """Every triple in the culprit combination, each with its own path search result."""
 
     relaxed_query: Optional[str]
-    """The full query with every triple above replaced by its discovered path. Only present if
-    *all* of them had one — relaxing just some of a jointly-broken combination wouldn't produce a
-    working query, since the others are still broken on their own."""
+    """The full query with every triple above that found a path replaced by it, and every triple
+    that didn't simply dropped. `None` only when *none* of the combination's triples found a path
+    — as soon as one does, the rest are dropped rather than leaving the whole combination
+    unrelaxed."""
 
     row_count: int
     """Row count of `relaxed_query` when re-executed. Zero if no combined relaxation was built, or
