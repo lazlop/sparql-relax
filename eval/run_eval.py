@@ -267,6 +267,7 @@ OUTPUT_FIELDS = [
     "gt_rows", "gt_col_count", "gt_unique_value_count",
     "gen_rows",
     "diagnose_culprit_found", "diagnose_value_set_f1", "diagnose_rows_covered", "diagnose_excess_rows",
+    "num_bgp_culprits", "num_filter_culprits", "num_cartesian_risks", "cartesian_risk_only",
     "relax_attempted", "relax_stmt_index", "relax_stmt_type", "relax_stmt_text",
     "relax_removed_statements", "relax_sparql",
     "relax_value_set_f1", "relax_rows_covered", "relax_excess_rows",
@@ -484,15 +485,23 @@ def _diagnose_only_row(
 ) -> dict:
     """Runs just `Store.diagnose()` — no endpoint resolution, no path search, no
     candidate scoring — and reports which triples/filters were flagged as
-    culprits. Used by `--diagnose-only`, where the relax phase's cost isn't
-    wanted at all."""
+    culprits, plus how often the cartesian-join guard (see
+    `algebra::has_cartesian_join`) declined to check a combination at all
+    rather than confirming or ruling it out (`Diagnosis.cartesian_risks`).
+    Used by `--diagnose-only`, where the relax phase's cost isn't wanted at
+    all."""
     if cfg.verbose:
         print(f"  [{query_id}] {building}  -> diagnosing...", flush=True)
 
     t_diag_start = time.monotonic()
     diagnose_error = ""
+    num_culprits = num_filter_culprits = num_cartesian_risks = 0
     try:
-        relax_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
+        diagnosis = relax_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
+        num_culprits = len(diagnosis.culprits)
+        num_filter_culprits = len(diagnosis.filter_culprits)
+        num_cartesian_risks = len(diagnosis.cartesian_risks)
+        common["diagnose_culprit_found"] = num_culprits > 0 or num_filter_culprits > 0
     except Exception as exc:
         diagnose_error = str(exc)
     t_diag_elapsed = time.monotonic() - t_diag_start
@@ -500,6 +509,14 @@ def _diagnose_only_row(
     return {
         **common,
         **_blank_relax_fields(),
+        "num_bgp_culprits": num_culprits,
+        "num_filter_culprits": num_filter_culprits,
+        "num_cartesian_risks": num_cartesian_risks,
+        # A risk was flagged and no culprit was confirmed by any other combo
+        # at any depth — the guard is the plausible reason diagnosis came
+        # back empty on this row, not proof (a combo it declined to check
+        # could have been a culprit, or could just as easily not have been).
+        "cartesian_risk_only": num_cartesian_risks > 0 and num_culprits == 0,
         "timed_out": _is_timeout_message(diagnose_error), "error": diagnose_error,
         "elapsed_sec": round(t_gt + t_diag_elapsed, 3),
     }
@@ -775,6 +792,7 @@ def main() -> None:
 
             n_processed = n_improved = n_with_culprits = n_watchdog_killed = 0
             n_diagnose_found = n_diagnose_improved = 0
+            n_any_cartesian_risk = n_cartesian_risk_only = 0
             relax_f1s: list[float] = []
             t_start = time.monotonic()
 
@@ -797,22 +815,34 @@ def main() -> None:
                 writer.writerow(out_row)
                 f.flush()
                 n_processed += 1
-                if out_row["relax_stmt_type"] == "relaxed":
-                    n_with_culprits += 1
-                if out_row.get("diagnose_culprit_found") is True:
-                    n_diagnose_found += 1
-                    if out_row["diagnose_value_set_f1"] > 0:
-                        n_diagnose_improved += 1
-                if out_row["relax_value_set_f1"] != "":
-                    f1 = out_row["relax_value_set_f1"]
-                    relax_f1s.append(f1)
-                    if f1 > 0:
-                        n_improved += 1
+                if cfg.diagnose_only:
+                    # `relax_stmt_type` never becomes "relaxed" in this mode (no relax phase
+                    # ever runs — see `_blank_relax_fields`), so `diagnose_culprit_found` is
+                    # the real signal here, not the relax-path field below.
+                    if out_row.get("diagnose_culprit_found"):
+                        n_with_culprits += 1
+                    if out_row.get("num_cartesian_risks"):
+                        n_any_cartesian_risk += 1
+                    if out_row.get("cartesian_risk_only"):
+                        n_cartesian_risk_only += 1
+                else:
+                    if out_row["relax_stmt_type"] == "relaxed":
+                        n_with_culprits += 1
+                    if out_row.get("diagnose_culprit_found") is True:
+                        n_diagnose_found += 1
+                        if out_row["diagnose_value_set_f1"] > 0:
+                            n_diagnose_improved += 1
+                    if out_row["relax_value_set_f1"] != "":
+                        f1 = out_row["relax_value_set_f1"]
+                        relax_f1s.append(f1)
+                        if f1 > 0:
+                            n_improved += 1
 
                 if i % 25 == 0 or i == total:
                     if cfg.diagnose_only:
                         print(f"  [{i}/{total}] processed={n_processed} "
-                              f"with_culprits={n_with_culprits} watchdog_killed={n_watchdog_killed}", flush=True)
+                              f"with_culprits={n_with_culprits} cartesian_risk={n_any_cartesian_risk} "
+                              f"cartesian_blocked_all={n_cartesian_risk_only} watchdog_killed={n_watchdog_killed}", flush=True)
                     else:
                         print(f"  [{i}/{total}] processed={n_processed} "
                               f"diagnose_found={n_diagnose_found} diagnose_improved={n_diagnose_improved} "
@@ -827,6 +857,8 @@ def main() -> None:
     print(f"  rows killed by the hard watchdog timeout ({hard_timeout:.0f}s): {n_watchdog_killed}", flush=True)
     if cfg.diagnose_only:
         print(f"  rows with a culprit flagged (triple or filter): {n_with_culprits}", flush=True)
+        print(f"  rows where the cartesian-join guard declined to check at least one combination: {n_any_cartesian_risk}", flush=True)
+        print(f"    of which no culprit was confirmed by any other combo (guard is the plausible reason nothing was found): {n_cartesian_risk_only}", flush=True)
     else:
         print(f"  diagnose found a genuine culprit (pruning it unblocks the query): {n_diagnose_found}", flush=True)
         print(f"    of which diagnose_value_set_f1 > 0 (pruning it also recovers real GT overlap): {n_diagnose_improved}", flush=True)
