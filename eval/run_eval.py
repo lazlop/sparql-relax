@@ -82,8 +82,17 @@ Usage:
 
   # Diagnose-only: skip relaxation (path search + candidate scoring)
   # entirely, just report which triples/filters are flagged as culprits.
-  # Much cheaper per row than the full pass.
+  # Much cheaper per row than the full pass. By default, once the safe
+  # search alone finds nothing, this also tries any combinations diagnose()
+  # flagged as cartesian risks and skipped -- trusting the query engine to
+  # come back quickly rather than treating them as untouchable (see
+  # --no-try-cartesian-risks' help text for the measured tradeoff, and
+  # --hard-timeout's for why its own default is larger in this mode).
   python3 run_eval.py --diagnose-only
+
+  # Same, but opt back out to the always-guarded behavior (cheaper per row,
+  # slightly fewer culprits found).
+  python3 run_eval.py --diagnose-only --no-try-cartesian-risks
 """
 
 from __future__ import annotations
@@ -267,6 +276,8 @@ OUTPUT_FIELDS = [
     "gt_rows", "gt_col_count", "gt_unique_value_count",
     "gen_rows",
     "diagnose_culprit_found", "diagnose_value_set_f1", "diagnose_rows_covered", "diagnose_excess_rows",
+    "num_bgp_culprits", "num_filter_culprits", "num_cartesian_risks", "cartesian_risk_only",
+    "cartesian_risk_attempted", "num_cartesian_risks_confirmed", "cartesian_risk_culprit_triples",
     "relax_attempted", "relax_stmt_index", "relax_stmt_type", "relax_stmt_text",
     "relax_removed_statements", "relax_sparql",
     "relax_value_set_f1", "relax_rows_covered", "relax_excess_rows",
@@ -315,6 +326,7 @@ class EvalConfig:
     verbose: bool
     timeout: float
     diagnose_only: bool
+    try_cartesian_risks: bool
 
 
 def _base_fields(row: dict, csv_path: str) -> dict:
@@ -378,7 +390,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     }
 
     if cfg.diagnose_only:
-        return _diagnose_only_row(relax_store, gen_query, cfg, common, base["query_id"], building, t_gt)
+        return _diagnose_only_row(relax_store, gen_query, cfg, common, base["query_id"], building, t_gt, store, gt_values, gt_sets)
 
     if cfg.verbose:
         print(f"  [{base['query_id']}] {building}  diagnose_f1={diagnose_f1:.3f} -> relaxing...", flush=True)
@@ -480,26 +492,120 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
 
 
 def _diagnose_only_row(
-    relax_store: sparql_relax.Store, gen_query: str, cfg: EvalConfig, common: dict, query_id: str, building: str, t_gt: float
+    relax_store: sparql_relax.Store,
+    gen_query: str,
+    cfg: EvalConfig,
+    common: dict,
+    query_id: str,
+    building: str,
+    t_gt: float,
+    store: pyoxigraph.Store,
+    gt_values: set,
+    gt_sets: list[frozenset],
 ) -> dict:
-    """Runs just `Store.diagnose()` — no endpoint resolution, no path search, no
-    candidate scoring — and reports which triples/filters were flagged as
-    culprits. Used by `--diagnose-only`, where the relax phase's cost isn't
-    wanted at all."""
+    """Runs just `Store.diagnose()` — no endpoint resolution, no path search — and
+    reports which triples/filters were flagged as culprits, plus how often the
+    cartesian-join guard (see `algebra::has_cartesian_join`) declined to check a
+    combination at all rather than confirming or ruling it out
+    (`Diagnosis.cartesian_risks`). Used by `--diagnose-only`, where the relax
+    phase's endpoint resolution/path search isn't wanted at all.
+
+    Still scores every confirmed culprit combination's *pruned* query (the
+    triples simply removed, no path substitution — via `sparql_relax.pruned_query`)
+    against ground truth, same "diagnose's own signal" metric the full
+    (non-diagnose-only) path already reports as `diagnose_value_set_f1` — this
+    is what makes it possible to tell whether a confirmed culprit (safe or, see
+    below, cartesian-risk-recovered) is a real fix or a technicality.
+
+    If `cfg.try_cartesian_risks` is set and the safe search above came up
+    completely empty (no BGP or FILTER culprit at any depth), this also
+    re-evaluates `diagnosis.cartesian_risks` via `Store.check_cartesian_risks`
+    — actually running the combos `diagnose` skipped, on the theory that
+    trusting the engine to come back quickly is a risk worth taking *once
+    the safe search has nothing left to offer*, not routinely. This is opting
+    out of `diagnose`'s own protection for exactly this shape (see that
+    method's docs on the hang risk); it's caught the same way every other
+    row-level hang is here — by `RowWorker`'s hard-timeout watchdog, not by
+    anything in this function itself."""
     if cfg.verbose:
         print(f"  [{query_id}] {building}  -> diagnosing...", flush=True)
 
     t_diag_start = time.monotonic()
     diagnose_error = ""
+    num_culprits = num_filter_culprits = num_cartesian_risks = 0
+    num_cartesian_risks_confirmed = 0
+    cartesian_risk_attempted = False
+    cartesian_risk_culprit_triples = ""
+    candidates: list = []
     try:
-        relax_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
+        diagnosis = relax_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
+        num_culprits = len(diagnosis.culprits)
+        num_filter_culprits = len(diagnosis.filter_culprits)
+        num_cartesian_risks = len(diagnosis.cartesian_risks)
+        found_safely = num_culprits > 0 or num_filter_culprits > 0
+        common["diagnose_culprit_found"] = found_safely
+        candidates.extend(diagnosis.culprits)
+
+        if cfg.try_cartesian_risks and not found_safely and diagnosis.cartesian_risks:
+            cartesian_risk_attempted = True
+            if cfg.verbose:
+                print(f"    -> safe search empty, trying {num_cartesian_risks} cartesian-risk combo(s)...", flush=True)
+            # Every row this function is ever called for is originally
+            # zero-result (see `load_rows`'s filter), so `original_is_empty`
+            # is always true here — `check_cartesian_risks` only needs the
+            # cheap ASK-existence shortcut, never the full per-row check.
+            confirmed = relax_store.check_cartesian_risks(
+                gen_query, diagnosis.cartesian_risks, original_is_empty=True, timeout=cfg.timeout
+            )
+            num_cartesian_risks_confirmed = len(confirmed)
+            if confirmed:
+                common["diagnose_culprit_found"] = True
+                cartesian_risk_culprit_triples = " | ".join(confirmed[0].triples)
+                candidates.extend(confirmed)
     except Exception as exc:
         diagnose_error = str(exc)
     t_diag_elapsed = time.monotonic() - t_diag_start
 
+    # Score every candidate's pruned query (no path substitution) and keep the
+    # best value-set F1 found -- mirrors exactly what the full (non-diagnose-
+    # only) path already does for its own `diagnose_value_set_f1` (see
+    # `process_row`'s `best_diagnose_culprit` loop), just without the relax
+    # phase's endpoint/path-search cost.
+    best_f1, best_cov, best_exc = -1.0, 0, 0
+    for culprit in candidates:
+        try:
+            pruned = sparql_relax.pruned_query(gen_query, culprit.triples)
+        except Exception:
+            continue
+        values, _, _, sets, _ = _get_full_query_stats(pruned, store, cfg.limit)
+        if values is None:
+            continue
+        f1 = calculate_f1(values, gt_values)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_cov, best_exc = _row_coverage_stats(sets, gt_sets)
+    if best_f1 >= 0:
+        common["diagnose_value_set_f1"] = round(best_f1, 6)
+        common["diagnose_rows_covered"] = best_cov
+        common["diagnose_excess_rows"] = best_exc
+
     return {
         **common,
         **_blank_relax_fields(),
+        "num_bgp_culprits": num_culprits,
+        "num_filter_culprits": num_filter_culprits,
+        "num_cartesian_risks": num_cartesian_risks,
+        # A risk was flagged and no culprit was confirmed by the safe search
+        # at any depth — the guard is the plausible reason diagnosis came
+        # back empty on this row, not proof (a combo it declined to check
+        # could have been a culprit, or could just as easily not have been).
+        # Unaffected by whether `try_cartesian_risks` then went on to
+        # actually confirm one — see `cartesian_risk_attempted`/
+        # `num_cartesian_risks_confirmed` for that outcome instead.
+        "cartesian_risk_only": num_cartesian_risks > 0 and num_culprits == 0,
+        "cartesian_risk_attempted": cartesian_risk_attempted,
+        "num_cartesian_risks_confirmed": num_cartesian_risks_confirmed,
+        "cartesian_risk_culprit_triples": cartesian_risk_culprit_triples,
         "timed_out": _is_timeout_message(diagnose_error), "error": diagnose_error,
         "elapsed_sec": round(t_gt + t_diag_elapsed, 3),
     }
@@ -690,6 +796,25 @@ def main() -> None:
              "ignored in this mode.",
     )
     parser.add_argument(
+        "--no-try-cartesian-risks", action="store_false", dest="try_cartesian_risks", default=True,
+        help="Only relevant with --diagnose-only (a no-op otherwise). By default, when "
+             "diagnose()'s safe search comes up completely empty (no BGP/FILTER culprit at any "
+             "depth) but it did flag some combinations as cartesian risks, --diagnose-only runs "
+             "those combos anyway via Store.check_cartesian_risks — trusting the query engine "
+             "to come back quickly rather than skipping them outright. Measured on this dataset: "
+             "recovers a genuine culprit on ~12%% of the rows the safe search alone couldn't "
+             "explain, for a ~14%% relative increase in average diagnose_value_set_f1 dataset-wide, "
+             "at the cost of a handful of extra --hard-timeout watchdog kills (up to ~1%% of rows). "
+             "Pass this flag to opt back out to the always-guarded, cheaper, slightly-safer "
+             "behavior. This opts (by default) out of the protection diagnose() applies for "
+             "disconnected BGPs (see its docstring): a bad combo can make Oxigraph materialize a "
+             "full N x M cross product without yielding, for as long as 200+ seconds in cases "
+             "measured against this dataset -- the row-level --hard-timeout watchdog is what "
+             "actually catches that if it happens (killing and restarting the worker, at the cost "
+             "of losing that row's results), which is why --hard-timeout's own default is larger "
+             "whenever this is left on (see its help text).",
+    )
+    parser.add_argument(
         "--timeout", type=float, default=20.0, metavar="SECONDS",
         help="Per-row cap on diagnose_and_relax (or diagnose, with --diagnose-only); a handful of "
              "queries need a genuinely expensive reduced-query evaluation that no search-ordering "
@@ -703,7 +828,10 @@ def main() -> None:
              "doesn't get checked in time (a cartesian-join or transitive-path query can make "
              "Oxigraph's engine block on an expensive materialization without yielding), and for "
              "the value-set-F1 scoring queries this script runs directly via pyoxigraph, which "
-             "have no timeout of their own at all. Defaults to max(60, 3 * --timeout + 30).",
+             "have no timeout of their own at all. Defaults to max(60, 3 * --timeout + 30) normally, "
+             "or max(180, 6 * --timeout + 60) when --diagnose-only and --try-cartesian-risks (the "
+             "default) are both active, since a row can then attempt many more, and riskier, "
+             "queries -- both budgets measured empirically against this dataset.",
     )
     parser.add_argument(
         "--resume", action="store_true",
@@ -722,16 +850,25 @@ def main() -> None:
     if not csv_paths:
         sys.exit(f"No CSV files found under {results_dir}")
 
+    # `try_cartesian_risks` is only ever read inside `_diagnose_only_row`, so
+    # it's simply inert (never consulted) when `--diagnose-only` isn't also
+    # set -- nothing to validate or warn about.
     limit = args.limit if args.limit > 0 else None
     cfg = EvalConfig(
         limit=limit,
         ablation_depth=args.ablation_depth, max_depth=args.max_depth, sample_limit=args.sample_limit,
         verbose=args.verbose, timeout=args.timeout, diagnose_only=args.diagnose_only,
+        try_cartesian_risks=args.try_cartesian_risks,
     )
     skip_buildings = set(args.skip_buildings)
     rng = random.Random(args.seed)
 
-    hard_timeout = args.hard_timeout if args.hard_timeout is not None else max(60.0, 3 * args.timeout + 30)
+    if args.hard_timeout is not None:
+        hard_timeout = args.hard_timeout
+    elif args.diagnose_only and args.try_cartesian_risks:
+        hard_timeout = max(180.0, 6 * args.timeout + 60)
+    else:
+        hard_timeout = max(60.0, 3 * args.timeout + 30)
 
     work_items: list[tuple[dict, str]] = []
     for csv_path in csv_paths:
@@ -775,7 +912,11 @@ def main() -> None:
 
             n_processed = n_improved = n_with_culprits = n_watchdog_killed = 0
             n_diagnose_found = n_diagnose_improved = 0
+            n_any_cartesian_risk = n_cartesian_risk_only = 0
+            n_cartesian_risk_attempted = n_cartesian_risk_recovered = 0
             relax_f1s: list[float] = []
+            diagnose_f1s: list[float] = []
+            cartesian_risk_f1s: list[float] = []
             t_start = time.monotonic()
 
             for i, (row, csv_path) in enumerate(work_items, start=1):
@@ -797,22 +938,47 @@ def main() -> None:
                 writer.writerow(out_row)
                 f.flush()
                 n_processed += 1
-                if out_row["relax_stmt_type"] == "relaxed":
-                    n_with_culprits += 1
-                if out_row.get("diagnose_culprit_found") is True:
-                    n_diagnose_found += 1
-                    if out_row["diagnose_value_set_f1"] > 0:
-                        n_diagnose_improved += 1
-                if out_row["relax_value_set_f1"] != "":
-                    f1 = out_row["relax_value_set_f1"]
-                    relax_f1s.append(f1)
-                    if f1 > 0:
-                        n_improved += 1
+                if cfg.diagnose_only:
+                    # `relax_stmt_type` never becomes "relaxed" in this mode (no relax phase
+                    # ever runs — see `_blank_relax_fields`), so `diagnose_culprit_found` is
+                    # the real signal here, not the relax-path field below.
+                    if out_row.get("diagnose_culprit_found"):
+                        n_with_culprits += 1
+                    f1 = out_row.get("diagnose_value_set_f1")
+                    if isinstance(f1, (int, float)):
+                        diagnose_f1s.append(f1)
+                        if f1 > 0:
+                            n_diagnose_improved += 1
+                    if out_row.get("num_cartesian_risks"):
+                        n_any_cartesian_risk += 1
+                    if out_row.get("cartesian_risk_only"):
+                        n_cartesian_risk_only += 1
+                    if out_row.get("cartesian_risk_attempted"):
+                        n_cartesian_risk_attempted += 1
+                        if out_row.get("num_cartesian_risks_confirmed"):
+                            n_cartesian_risk_recovered += 1
+                            if isinstance(f1, (int, float)):
+                                cartesian_risk_f1s.append(f1)
+                else:
+                    if out_row["relax_stmt_type"] == "relaxed":
+                        n_with_culprits += 1
+                    if out_row.get("diagnose_culprit_found") is True:
+                        n_diagnose_found += 1
+                        if out_row["diagnose_value_set_f1"] > 0:
+                            n_diagnose_improved += 1
+                    if out_row["relax_value_set_f1"] != "":
+                        f1 = out_row["relax_value_set_f1"]
+                        relax_f1s.append(f1)
+                        if f1 > 0:
+                            n_improved += 1
 
                 if i % 25 == 0 or i == total:
                     if cfg.diagnose_only:
                         print(f"  [{i}/{total}] processed={n_processed} "
-                              f"with_culprits={n_with_culprits} watchdog_killed={n_watchdog_killed}", flush=True)
+                              f"with_culprits={n_with_culprits} cartesian_risk={n_any_cartesian_risk} "
+                              f"cartesian_blocked_all={n_cartesian_risk_only} "
+                              f"risk_recovered={n_cartesian_risk_recovered}/{n_cartesian_risk_attempted} "
+                              f"watchdog_killed={n_watchdog_killed}", flush=True)
                     else:
                         print(f"  [{i}/{total}] processed={n_processed} "
                               f"diagnose_found={n_diagnose_found} diagnose_improved={n_diagnose_improved} "
@@ -827,6 +993,19 @@ def main() -> None:
     print(f"  rows killed by the hard watchdog timeout ({hard_timeout:.0f}s): {n_watchdog_killed}", flush=True)
     if cfg.diagnose_only:
         print(f"  rows with a culprit flagged (triple or filter): {n_with_culprits}", flush=True)
+        print(f"    of which diagnose_value_set_f1 > 0 (pruning it also recovers real GT overlap): {n_diagnose_improved}", flush=True)
+        if diagnose_f1s:
+            print(f"  avg diagnose_value_set_f1 across all processed rows: {sum(diagnose_f1s) / len(diagnose_f1s):.4f}", flush=True)
+        print(f"  rows where the cartesian-join guard declined to check at least one combination: {n_any_cartesian_risk}", flush=True)
+        print(f"    of which no culprit was confirmed by any other combo (guard is the plausible reason nothing was found): {n_cartesian_risk_only}", flush=True)
+        if cfg.try_cartesian_risks:
+            print(f"  of those, actually tried via --try-cartesian-risks: {n_cartesian_risk_attempted}", flush=True)
+            print(f"    of which a risky combo was confirmed as a real culprit: {n_cartesian_risk_recovered}", flush=True)
+            if cartesian_risk_f1s:
+                n_risk_f1_positive = sum(1 for f1 in cartesian_risk_f1s if f1 > 0)
+                avg_risk_f1 = sum(cartesian_risk_f1s) / len(cartesian_risk_f1s)
+                print(f"    of which diagnose_value_set_f1 > 0 (not just unblocking, real GT overlap): {n_risk_f1_positive}", flush=True)
+                print(f"    avg diagnose_value_set_f1 among cartesian-risk-recovered rows: {avg_risk_f1:.4f}", flush=True)
     else:
         print(f"  diagnose found a genuine culprit (pruning it unblocks the query): {n_diagnose_found}", flush=True)
         print(f"    of which diagnose_value_set_f1 > 0 (pruning it also recovers real GT overlap): {n_diagnose_improved}", flush=True)

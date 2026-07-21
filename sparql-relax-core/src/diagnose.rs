@@ -210,7 +210,7 @@ pub(crate) fn diagnose_parsed(
         let verdicts: Vec<(Vec<TriplePattern>, ComboVerdict)> = combinations(&triple_candidates, k)
             .into_par_iter()
             .map(|combo| {
-                let verdict = classify_combo(query, pattern, &combo, store, original_rows.is_empty(), &guard);
+                let verdict = classify_combo(query, pattern, &combo, store, original_rows.is_empty(), &guard, false);
                 (combo, verdict)
             })
             .collect();
@@ -307,12 +307,20 @@ enum ComboVerdict {
 /// can be entirely absent), so counting it would hide a real disconnect —
 /// and cartesian risk — in the pattern every solution actually has to
 /// satisfy.
-fn classify_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern], store: &Store, original_is_empty: bool, guard: &SharedDeadline) -> ComboVerdict {
+fn classify_combo(
+    query: &Query,
+    pattern: &GraphPattern,
+    combo: &[TriplePattern],
+    store: &Store,
+    original_is_empty: bool,
+    guard: &SharedDeadline,
+    ignore_cartesian_risk: bool,
+) -> ComboVerdict {
     let Some(reduced_pattern) = combo.iter().try_fold(pattern.clone(), |p, t| remove_triple(&p, t)) else {
         return ComboVerdict::NotCulprit;
     };
 
-    if crate::algebra::has_cartesian_join(&collect_required_bgp_triples(&reduced_pattern)) {
+    if !ignore_cartesian_risk && crate::algebra::has_cartesian_join(&collect_required_bgp_triples(&reduced_pattern)) {
         return ComboVerdict::CartesianRisk;
     }
 
@@ -370,6 +378,118 @@ fn classify_combo(query: &Query, pattern: &GraphPattern, combo: &[TriplePattern]
         }
     }
     if any_row { ComboVerdict::Culprit } else { ComboVerdict::NotCulprit } // non-empty, and no row ever satisfied the whole combo jointly
+}
+
+/// Re-evaluates combinations a prior [`diagnose`] call flagged as
+/// [`CartesianRiskCombo`]s — skipped entirely there because their reduced
+/// pattern was disconnected — actually running them against `store` this
+/// time. `risks` is each combo's triples as SPARQL text (the same text
+/// [`CartesianRiskCombo::triples`] already carries), matched back to
+/// `query_text`'s actual BGP triples by an exact `Display`-string match.
+/// `original_is_empty` should be the same `Diagnosis::original_row_count ==
+/// 0` the caller already has from that prior [`diagnose`] call — this
+/// function has no cheaper way to learn it than re-running the whole
+/// original query itself, so it isn't done here a second time.
+///
+/// Callers choosing to use this at all are opting out of the protection
+/// `diagnose` applies for exactly this shape: a disconnected BGP can make
+/// the query engine materialize a full N×M cross product before yielding a
+/// single row, and unlike `diagnose`'s own bounded checks, nothing here can
+/// force a stuck native evaluation to give up if the engine doesn't check
+/// its cancellation token often enough — see `eval/run_eval.py`'s
+/// process-level watchdog (in the Python eval harness) for a measured case
+/// where that took over 200 seconds and permanently occupied a shared
+/// `rayon` worker thread until the whole process was killed. This is meant
+/// to be called deliberately, after `diagnose` has already come up empty,
+/// by a caller that has independently judged the risk worth taking for this
+/// specific query/graph — not as a routine part of every diagnosis, and not
+/// from inside a process whose native threads can't be reclaimed if one
+/// gets stuck.
+///
+/// Every combo given is checked in parallel (like `diagnose`'s own
+/// combinations) against one shared `timeout` deadline, not a fresh budget
+/// each. Returns every combo confirmed as a genuine culprit — same
+/// semantics as [`Culprit`] elsewhere: removing it unblocks the query, and
+/// no single row satisfies every triple in it jointly.
+pub fn check_cartesian_risks(
+    query_text: &str,
+    store: &Store,
+    risks: &[Vec<String>],
+    original_is_empty: bool,
+    timeout: Option<Duration>,
+) -> Result<Vec<Culprit>> {
+    let query = SparqlParser::new().parse_query(query_text)?;
+    ensure_select(&query)?;
+    let pattern = pattern_of(&query).clone();
+    let available = collect_bgp_triples(&pattern);
+
+    let combos: Vec<Vec<TriplePattern>> =
+        risks.iter().map(|texts| match_triples_by_text(&available, texts)).collect::<Result<_>>()?;
+
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let guard = SharedDeadline::new(deadline);
+    Ok(combos
+        .into_par_iter()
+        .filter_map(|combo| match classify_combo(&query, &pattern, &combo, store, original_is_empty, &guard, true) {
+            ComboVerdict::Culprit => {
+                let depth = combo.len();
+                Some(Culprit { triples: combo, depth })
+            }
+            _ => None,
+        })
+        .collect())
+}
+
+/// Matches each text in `texts` back to one of `available`'s actual
+/// `TriplePattern`s by exact `Display`-string equality, one not-yet-claimed
+/// occurrence per text: two distinct triples in a pattern can share
+/// identical SPARQL text (e.g. a repeated triple pattern), so matching
+/// greedily against the first unclaimed occurrence disambiguates without
+/// assuming the whole pattern has no duplicates. Shared by
+/// [`check_cartesian_risks`] (one call per combo, fresh `used` mask each
+/// time) and [`pruned_query_text`].
+fn match_triples_by_text(available: &[TriplePattern], texts: &[String]) -> Result<Vec<TriplePattern>> {
+    let mut used = vec![false; available.len()];
+    let mut matched = Vec::with_capacity(texts.len());
+    for text in texts {
+        let idx = available
+            .iter()
+            .enumerate()
+            .find(|(i, t)| !used[*i] && t.to_string() == *text)
+            .map(|(i, _)| i)
+            .ok_or_else(|| RelaxError::CulpritNotFound(text.clone()))?;
+        used[idx] = true;
+        matched.push(available[idx].clone());
+    }
+    Ok(matched)
+}
+
+/// The SPARQL text of `query_text` with every triple in `triples` (matched
+/// by exact text, the same form [`Culprit::triples`]/
+/// [`CartesianRiskCombo::triples`] already carry as strings once converted
+/// at the Python boundary) removed from its basic graph pattern — no path
+/// substitution, just ablation. A pure syntactic transform: no `Store`
+/// involved, and nothing here is executed.
+///
+/// Used to score what a confirmed culprit combination's removal alone gets
+/// you (e.g. via value-set F1 against ground truth), independent of whether
+/// a real path fix was also found for it — the same "diagnose's own signal"
+/// [`crate::relax::RelaxedCulprit::pruned_query`] already provides for
+/// combinations `diagnose_and_relax` confirms, but usable here for a
+/// combination [`check_cartesian_risks`] confirmed, which never had a
+/// `RelaxedCulprit` (or any query text) built for it at all.
+pub fn pruned_query_text(query_text: &str, triples: &[String]) -> Result<String> {
+    let query = SparqlParser::new().parse_query(query_text)?;
+    ensure_select(&query)?;
+    let pattern = pattern_of(&query).clone();
+    let available = collect_bgp_triples(&pattern);
+
+    let matched = match_triples_by_text(&available, triples)?;
+    let reduced_pattern = matched
+        .iter()
+        .try_fold(pattern, |p, t| remove_triple(&p, t))
+        .ok_or_else(|| RelaxError::CulpritNotFound(triples.join(", ")))?;
+    Ok(with_pattern(&query, reduced_pattern).to_string())
 }
 
 /// Whether `pattern` has at least one solution against `store`, evaluated as
