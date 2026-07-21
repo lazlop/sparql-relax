@@ -388,7 +388,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     }
 
     if cfg.diagnose_only:
-        return _diagnose_only_row(relax_store, gen_query, cfg, common, base["query_id"], building, t_gt)
+        return _diagnose_only_row(relax_store, gen_query, cfg, common, base["query_id"], building, t_gt, store, gt_values, gt_sets)
 
     if cfg.verbose:
         print(f"  [{base['query_id']}] {building}  diagnose_f1={diagnose_f1:.3f} -> relaxing...", flush=True)
@@ -490,15 +490,30 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
 
 
 def _diagnose_only_row(
-    relax_store: sparql_relax.Store, gen_query: str, cfg: EvalConfig, common: dict, query_id: str, building: str, t_gt: float
+    relax_store: sparql_relax.Store,
+    gen_query: str,
+    cfg: EvalConfig,
+    common: dict,
+    query_id: str,
+    building: str,
+    t_gt: float,
+    store: pyoxigraph.Store,
+    gt_values: set,
+    gt_sets: list[frozenset],
 ) -> dict:
-    """Runs just `Store.diagnose()` — no endpoint resolution, no path search, no
-    candidate scoring — and reports which triples/filters were flagged as
-    culprits, plus how often the cartesian-join guard (see
-    `algebra::has_cartesian_join`) declined to check a combination at all
-    rather than confirming or ruling it out (`Diagnosis.cartesian_risks`).
-    Used by `--diagnose-only`, where the relax phase's cost isn't wanted at
-    all.
+    """Runs just `Store.diagnose()` — no endpoint resolution, no path search — and
+    reports which triples/filters were flagged as culprits, plus how often the
+    cartesian-join guard (see `algebra::has_cartesian_join`) declined to check a
+    combination at all rather than confirming or ruling it out
+    (`Diagnosis.cartesian_risks`). Used by `--diagnose-only`, where the relax
+    phase's endpoint resolution/path search isn't wanted at all.
+
+    Still scores every confirmed culprit combination's *pruned* query (the
+    triples simply removed, no path substitution — via `sparql_relax.pruned_query`)
+    against ground truth, same "diagnose's own signal" metric the full
+    (non-diagnose-only) path already reports as `diagnose_value_set_f1` — this
+    is what makes it possible to tell whether a confirmed culprit (safe or, see
+    below, cartesian-risk-recovered) is a real fix or a technicality.
 
     If `cfg.try_cartesian_risks` is set and the safe search above came up
     completely empty (no BGP or FILTER culprit at any depth), this also
@@ -519,6 +534,7 @@ def _diagnose_only_row(
     num_cartesian_risks_confirmed = 0
     cartesian_risk_attempted = False
     cartesian_risk_culprit_triples = ""
+    candidates: list = []
     try:
         diagnosis = relax_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
         num_culprits = len(diagnosis.culprits)
@@ -526,6 +542,7 @@ def _diagnose_only_row(
         num_cartesian_risks = len(diagnosis.cartesian_risks)
         found_safely = num_culprits > 0 or num_filter_culprits > 0
         common["diagnose_culprit_found"] = found_safely
+        candidates.extend(diagnosis.culprits)
 
         if cfg.try_cartesian_risks and not found_safely and diagnosis.cartesian_risks:
             cartesian_risk_attempted = True
@@ -542,9 +559,33 @@ def _diagnose_only_row(
             if confirmed:
                 common["diagnose_culprit_found"] = True
                 cartesian_risk_culprit_triples = " | ".join(confirmed[0].triples)
+                candidates.extend(confirmed)
     except Exception as exc:
         diagnose_error = str(exc)
     t_diag_elapsed = time.monotonic() - t_diag_start
+
+    # Score every candidate's pruned query (no path substitution) and keep the
+    # best value-set F1 found -- mirrors exactly what the full (non-diagnose-
+    # only) path already does for its own `diagnose_value_set_f1` (see
+    # `process_row`'s `best_diagnose_culprit` loop), just without the relax
+    # phase's endpoint/path-search cost.
+    best_f1, best_cov, best_exc = -1.0, 0, 0
+    for culprit in candidates:
+        try:
+            pruned = sparql_relax.pruned_query(gen_query, culprit.triples)
+        except Exception:
+            continue
+        values, _, _, sets, _ = _get_full_query_stats(pruned, store, cfg.limit)
+        if values is None:
+            continue
+        f1 = calculate_f1(values, gt_values)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_cov, best_exc = _row_coverage_stats(sets, gt_sets)
+    if best_f1 >= 0:
+        common["diagnose_value_set_f1"] = round(best_f1, 6)
+        common["diagnose_rows_covered"] = best_cov
+        common["diagnose_excess_rows"] = best_exc
 
     return {
         **common,
@@ -859,6 +900,8 @@ def main() -> None:
             n_any_cartesian_risk = n_cartesian_risk_only = 0
             n_cartesian_risk_attempted = n_cartesian_risk_recovered = 0
             relax_f1s: list[float] = []
+            diagnose_f1s: list[float] = []
+            cartesian_risk_f1s: list[float] = []
             t_start = time.monotonic()
 
             for i, (row, csv_path) in enumerate(work_items, start=1):
@@ -886,6 +929,11 @@ def main() -> None:
                     # the real signal here, not the relax-path field below.
                     if out_row.get("diagnose_culprit_found"):
                         n_with_culprits += 1
+                    f1 = out_row.get("diagnose_value_set_f1")
+                    if isinstance(f1, (int, float)):
+                        diagnose_f1s.append(f1)
+                        if f1 > 0:
+                            n_diagnose_improved += 1
                     if out_row.get("num_cartesian_risks"):
                         n_any_cartesian_risk += 1
                     if out_row.get("cartesian_risk_only"):
@@ -894,6 +942,8 @@ def main() -> None:
                         n_cartesian_risk_attempted += 1
                         if out_row.get("num_cartesian_risks_confirmed"):
                             n_cartesian_risk_recovered += 1
+                            if isinstance(f1, (int, float)):
+                                cartesian_risk_f1s.append(f1)
                 else:
                     if out_row["relax_stmt_type"] == "relaxed":
                         n_with_culprits += 1
@@ -928,11 +978,19 @@ def main() -> None:
     print(f"  rows killed by the hard watchdog timeout ({hard_timeout:.0f}s): {n_watchdog_killed}", flush=True)
     if cfg.diagnose_only:
         print(f"  rows with a culprit flagged (triple or filter): {n_with_culprits}", flush=True)
+        print(f"    of which diagnose_value_set_f1 > 0 (pruning it also recovers real GT overlap): {n_diagnose_improved}", flush=True)
+        if diagnose_f1s:
+            print(f"  avg diagnose_value_set_f1 across all processed rows: {sum(diagnose_f1s) / len(diagnose_f1s):.4f}", flush=True)
         print(f"  rows where the cartesian-join guard declined to check at least one combination: {n_any_cartesian_risk}", flush=True)
         print(f"    of which no culprit was confirmed by any other combo (guard is the plausible reason nothing was found): {n_cartesian_risk_only}", flush=True)
         if cfg.try_cartesian_risks:
             print(f"  of those, actually tried via --try-cartesian-risks: {n_cartesian_risk_attempted}", flush=True)
             print(f"    of which a risky combo was confirmed as a real culprit: {n_cartesian_risk_recovered}", flush=True)
+            if cartesian_risk_f1s:
+                n_risk_f1_positive = sum(1 for f1 in cartesian_risk_f1s if f1 > 0)
+                avg_risk_f1 = sum(cartesian_risk_f1s) / len(cartesian_risk_f1s)
+                print(f"    of which diagnose_value_set_f1 > 0 (not just unblocking, real GT overlap): {n_risk_f1_positive}", flush=True)
+                print(f"    avg diagnose_value_set_f1 among cartesian-risk-recovered rows: {avg_risk_f1:.4f}", flush=True)
     else:
         print(f"  diagnose found a genuine culprit (pruning it unblocks the query): {n_diagnose_found}", flush=True)
         print(f"    of which diagnose_value_set_f1 > 0 (pruning it also recovers real GT overlap): {n_diagnose_improved}", flush=True)

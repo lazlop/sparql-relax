@@ -4,7 +4,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use sparql_relax_core::{
     NamespaceScope, QueryOutcome, RdfTerm, check_cartesian_risks as core_check_cartesian_risks, diagnose as core_diagnose,
-    diagnose_and_relax as core_relax, query as core_query,
+    diagnose_and_relax as core_relax, pruned_query_text as core_pruned_query_text, query as core_query,
 };
 use std::fmt::Display;
 use std::time::Duration;
@@ -319,6 +319,24 @@ mod _sparql_relax {
         let timeout = parse_timeout_seconds(timeout)?;
         // See the comment on `diagnose` below about releasing the GIL.
         py.detach(|| query_tuples(&store, query, row_limit, timeout)).map_err(to_py_err)
+    }
+
+    /// The SPARQL text of `query` with every triple in `triples` removed
+    /// from its basic graph pattern — no path substitution, just ablation.
+    /// `triples` should be triple texts from a `Culprit`/`CartesianRiskCombo`
+    /// (e.g. `diagnosis.culprits[i].triples` or a `check_cartesian_risks`
+    /// result's `triples`) already obtained for this same `query`; each is
+    /// matched back to the query's actual BGP triples by an exact text
+    /// match, and this raises if any isn't found there.
+    ///
+    /// Unlike every other function here, this takes no RDF graph at all and
+    /// runs nothing against one — it's a pure syntactic transform, useful
+    /// for scoring what a confirmed culprit combination's removal alone gets
+    /// you (e.g. value-set F1 against ground truth) without needing a real
+    /// path-substituted fix built for it too.
+    #[pyfunction]
+    fn pruned_query(query: &str, triples: Vec<String>) -> PyResult<String> {
+        core_pruned_query_text(query, &triples).map_err(to_py_err)
     }
 
     /// Builds a throwaway store from `data` on every call — for more than

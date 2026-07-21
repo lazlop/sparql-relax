@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ._sparql_relax import Store as _Store
+from ._sparql_relax import pruned_query as _pruned_query
 
 __all__ = [
     "Culprit",
@@ -39,6 +40,7 @@ __all__ = [
     "diagnose",
     "diagnose_and_relax",
     "query",
+    "pruned_query",
     "DEFAULT_RELAX_NAMESPACES",
     "DEFAULT_RELAX_TIMEOUT",
     "DEFAULT_ABLATION_TIMEOUT",
@@ -574,3 +576,20 @@ def query(
     same graph, build a `Store` once instead and call its `query` method.
     """
     return Store(data, format).query(query, row_limit=row_limit, timeout=timeout)
+
+
+def pruned_query(query: str, triples: Sequence[str]) -> str:
+    """The SPARQL text of `query` with every triple in `triples` removed from its basic graph
+    pattern — no path substitution, just ablation.
+
+    `triples` should be triple texts from a `Culprit`/`CartesianRiskCombo` already obtained for
+    this same `query` (e.g. `diagnosis.culprits[i].triples`, or a `Store.check_cartesian_risks`
+    result's `triples`); each is matched back to the query's actual BGP triples by an exact text
+    match, and this raises if any isn't found there.
+
+    Unlike every other function in this module, this takes no RDF graph at all and runs nothing
+    against one — it's a pure syntactic transform, useful for scoring what a confirmed culprit
+    combination's removal alone gets you (e.g. value-set F1 against ground truth) without needing
+    a real path-substituted fix built for it too.
+    """
+    return _pruned_query(query, list(triples))

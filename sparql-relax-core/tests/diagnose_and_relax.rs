@@ -3,6 +3,7 @@ use oxigraph::store::Store;
 use sparql_relax_core::bfs::Hop;
 use sparql_relax_core::{
     NamespaceScope, RelaxError, check_cartesian_risks, diagnose, diagnose_and_relax, diagnose_and_relax_default, diagnose_default,
+    pruned_query_text,
 };
 use std::time::{Duration, Instant};
 
@@ -866,6 +867,36 @@ fn check_cartesian_risks_errors_on_an_unmatched_triple_text() {
     let store = disconnected_store();
     let bogus = vec![vec!["?nonexistent <urn:example#doesNotAppear> ?anywhere".to_string()]];
     let result = check_cartesian_risks(DISCONNECTED_QUERY, &store, &bogus, true, None);
+    assert!(result.is_err());
+}
+
+/// `pruned_query_text` is a pure syntactic transform (no `Store`, nothing
+/// executed) — removing the confirmed culprit's triple should yield a query
+/// that, run against the graph, actually returns the rows that made it a
+/// genuine culprit in the first place.
+#[test]
+fn pruned_query_text_removes_the_given_triple_and_the_result_runs() {
+    let store = disconnected_store();
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None).unwrap();
+    let risks: Vec<Vec<String>> =
+        diagnosis.cartesian_risks.iter().map(|r| r.triples.iter().map(ToString::to_string).collect()).collect();
+    let confirmed = check_cartesian_risks(DISCONNECTED_QUERY, &store, &risks, true, None).unwrap();
+    assert_eq!(confirmed.len(), 1);
+
+    let triples: Vec<String> = confirmed[0].triples.iter().map(ToString::to_string).collect();
+    let pruned = pruned_query_text(DISCONNECTED_QUERY, &triples).unwrap();
+    assert!(!pruned.contains("hasBrokenLink"), "the culprit triple should be gone from the pruned query text");
+
+    let rows = diagnose(&pruned, &store, 1, None).unwrap();
+    assert_eq!(rows.original_row_count, 1, "removing the real culprit should unblock the query");
+}
+
+/// Same unmatched-text case as `check_cartesian_risks` above: raise rather
+/// than silently producing a query with nothing removed.
+#[test]
+fn pruned_query_text_errors_on_an_unmatched_triple_text() {
+    let bogus = vec!["?nonexistent <urn:example#doesNotAppear> ?anywhere".to_string()];
+    let result = pruned_query_text(DISCONNECTED_QUERY, &bogus);
     assert!(result.is_err());
 }
 

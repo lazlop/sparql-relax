@@ -423,28 +423,8 @@ pub fn check_cartesian_risks(
     let pattern = pattern_of(&query).clone();
     let available = collect_bgp_triples(&pattern);
 
-    // Re-derives each combo's actual `TriplePattern`s from `risks`' text one
-    // combo at a time (a fresh `used` mask per combo, not shared across
-    // combos): two distinct triples in the pattern can share identical
-    // SPARQL text (e.g. a repeated triple pattern), so matching greedily
-    // against the first not-yet-claimed occurrence — within this combo only
-    // — disambiguates without assuming the whole pattern has no duplicates.
-    let mut combos: Vec<Vec<TriplePattern>> = Vec::with_capacity(risks.len());
-    for texts in risks {
-        let mut used = vec![false; available.len()];
-        let mut combo = Vec::with_capacity(texts.len());
-        for text in texts {
-            let idx = available
-                .iter()
-                .enumerate()
-                .find(|(i, t)| !used[*i] && t.to_string() == *text)
-                .map(|(i, _)| i)
-                .ok_or_else(|| RelaxError::CulpritNotFound(text.clone()))?;
-            used[idx] = true;
-            combo.push(available[idx].clone());
-        }
-        combos.push(combo);
-    }
+    let combos: Vec<Vec<TriplePattern>> =
+        risks.iter().map(|texts| match_triples_by_text(&available, texts)).collect::<Result<_>>()?;
 
     let deadline = timeout.map(|t| Instant::now() + t);
     let guard = SharedDeadline::new(deadline);
@@ -458,6 +438,58 @@ pub fn check_cartesian_risks(
             _ => None,
         })
         .collect())
+}
+
+/// Matches each text in `texts` back to one of `available`'s actual
+/// `TriplePattern`s by exact `Display`-string equality, one not-yet-claimed
+/// occurrence per text: two distinct triples in a pattern can share
+/// identical SPARQL text (e.g. a repeated triple pattern), so matching
+/// greedily against the first unclaimed occurrence disambiguates without
+/// assuming the whole pattern has no duplicates. Shared by
+/// [`check_cartesian_risks`] (one call per combo, fresh `used` mask each
+/// time) and [`pruned_query_text`].
+fn match_triples_by_text(available: &[TriplePattern], texts: &[String]) -> Result<Vec<TriplePattern>> {
+    let mut used = vec![false; available.len()];
+    let mut matched = Vec::with_capacity(texts.len());
+    for text in texts {
+        let idx = available
+            .iter()
+            .enumerate()
+            .find(|(i, t)| !used[*i] && t.to_string() == *text)
+            .map(|(i, _)| i)
+            .ok_or_else(|| RelaxError::CulpritNotFound(text.clone()))?;
+        used[idx] = true;
+        matched.push(available[idx].clone());
+    }
+    Ok(matched)
+}
+
+/// The SPARQL text of `query_text` with every triple in `triples` (matched
+/// by exact text, the same form [`Culprit::triples`]/
+/// [`CartesianRiskCombo::triples`] already carry as strings once converted
+/// at the Python boundary) removed from its basic graph pattern — no path
+/// substitution, just ablation. A pure syntactic transform: no `Store`
+/// involved, and nothing here is executed.
+///
+/// Used to score what a confirmed culprit combination's removal alone gets
+/// you (e.g. via value-set F1 against ground truth), independent of whether
+/// a real path fix was also found for it — the same "diagnose's own signal"
+/// [`crate::relax::RelaxedCulprit::pruned_query`] already provides for
+/// combinations `diagnose_and_relax` confirms, but usable here for a
+/// combination [`check_cartesian_risks`] confirmed, which never had a
+/// `RelaxedCulprit` (or any query text) built for it at all.
+pub fn pruned_query_text(query_text: &str, triples: &[String]) -> Result<String> {
+    let query = SparqlParser::new().parse_query(query_text)?;
+    ensure_select(&query)?;
+    let pattern = pattern_of(&query).clone();
+    let available = collect_bgp_triples(&pattern);
+
+    let matched = match_triples_by_text(&available, triples)?;
+    let reduced_pattern = matched
+        .iter()
+        .try_fold(pattern, |p, t| remove_triple(&p, t))
+        .ok_or_else(|| RelaxError::CulpritNotFound(triples.join(", ")))?;
+    Ok(with_pattern(&query, reduced_pattern).to_string())
 }
 
 /// Whether `pattern` has at least one solution against `store`, evaluated as
