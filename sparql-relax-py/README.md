@@ -6,11 +6,13 @@ store. Based on the ideas in `sparql_prune.py`/`sparql_relax.py`, but:
 - **Diagnosis** is ablation-style (like `sparql_prune`): for each BGP triple with a concrete
   predicate, remove it, re-run the rest of the query, and check whether the triple's predicate
   actually holds for any of the resulting bindings. If not, that triple is flagged as the culprit.
-- **Relaxation** searches the graph's *actual* edges: a bounded breadth-first search from the
-  culprit's bound endpoints, trying both a forward (`<p>`) and inverse (`^<p>`) step at each hop,
-  to find a real connecting path — rather than substituting predicates from a fixed/frequent
-  candidate list. The discovered path is spliced into the query as a SPARQL property path and the
-  fix is verified by re-running the modified query.
+- **Relaxation** (experimental) searches the graph's *actual* edges: a bounded breadth-first
+  search from the culprit's bound endpoints, trying both a forward (`<p>`) and inverse (`^<p>`)
+  step at each hop, to find a real connecting path — rather than substituting predicates from a
+  fixed/frequent candidate list. The discovered path is spliced into the query as a SPARQL
+  property path and the fix is verified by re-running the modified query. Treat a `relaxed_query`
+  as a candidate to review, not a guaranteed correct fix — `diagnose` alone (no relaxation) is the
+  more reliable, battle-tested part of this library.
 
 The query is rewritten as a typed algebra tree (via `spargebra`, the same parser Oxigraph itself
 uses) and re-serialized to text, rather than via regex text substitution.
