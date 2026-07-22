@@ -26,6 +26,15 @@
 //! shared across every predicate — catches the hub case while leaving
 //! structural, near-uniform relations untouched.
 //!
+//! The percentile alone breaks down for a low-cardinality predicate — a
+//! boolean like `writable` has exactly two possible values, so with only
+//! two (predicate, direction) groups to rank, the 75th percentile always
+//! lands on whichever of the two has the larger count, and `>` never fires
+//! against its own value. A majority-share backstop catches this: a value
+//! that alone accounts for more than half of a predicate's total usage in
+//! that direction is a hub regardless of how many other values exist to
+//! rank it against (see [`collect_thresholds`]).
+//!
 //! Built once per [`Store`] (like the store itself) rather than recomputed
 //! per search: it's a single pass over every triple, and the resulting
 //! index is read-only for the lifetime of the store, so every
@@ -99,13 +108,37 @@ impl FanoutIndex {
 
 type HashSetTerm = std::collections::HashSet<Term>;
 
+/// For each predicate, folds its per-endpoint fan-out counts down to one
+/// threshold: the smaller of the 75th-percentile count (the normal case,
+/// see the module docs) and half the predicate's total usage in this
+/// direction — a single endpoint value accounting for a majority of every
+/// occurrence of the predicate is a hub on its own terms, independent of
+/// how many *other* distinct values exist to rank it against. Without this
+/// second term, a low-cardinality predicate (a boolean, an enum with a
+/// handful of values) can't produce a useful percentile at all: with only
+/// two values to rank, the larger one *is* the 75th percentile, so it can
+/// never exceed its own threshold.
+///
+/// The majority-share term only applies with at least two distinct endpoint
+/// values for the predicate: with only one, that lone value *is* the
+/// predicate's entire usage in this direction, and "it accounts for a
+/// majority of the total" is trivially true of any single-use predicate
+/// (the common case in a small or sparsely-connected graph) rather than a
+/// sign of anything hub-like — there's nothing else to have been
+/// disproportionate relative to.
 fn collect_thresholds(groups: HashMap<(NamedNode, Term), HashSetTerm>, direction: Direction, out: &mut HashMap<(NamedNode, Direction), usize>) {
     let mut counts_by_predicate: HashMap<NamedNode, Vec<usize>> = HashMap::new();
     for ((predicate, _endpoint), neighbors) in groups {
         counts_by_predicate.entry(predicate).or_default().push(neighbors.len());
     }
     for (predicate, counts) in counts_by_predicate {
-        out.insert((predicate, direction), percentile_75(counts));
+        let threshold = if counts.len() >= 2 {
+            let total: usize = counts.iter().sum();
+            percentile_75(counts).min(total / 2)
+        } else {
+            percentile_75(counts)
+        };
+        out.insert((predicate, direction), threshold);
     }
 }
 
