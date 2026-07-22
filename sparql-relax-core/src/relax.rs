@@ -52,7 +52,7 @@ use crate::algebra::{
 };
 use crate::bfs::{Hop, find_path, path_holds, path_to_property_path};
 use crate::diagnose::{
-    Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, diagnose_parsed, ensure_select, resolve_term_pattern,
+    CartesianRiskCombo, Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, diagnose_parsed, ensure_select, resolve_term_pattern,
     run_select_query_with_deadline,
 };
 use crate::error::{RelaxError, Result};
@@ -206,6 +206,14 @@ pub struct RelaxReport {
     pub original_row_count: usize,
     pub results: Vec<RelaxedCulprit>,
     pub filter_results: Vec<FilterReport>,
+    /// Combinations diagnosis flagged as cartesian risks — skipped entirely
+    /// (never evaluated, and so never attempted here) because their reduced
+    /// pattern was disconnected. Always empty when `ignore_cartesian_risk`
+    /// was set on this call, since every combination was actually evaluated
+    /// instead of being skipped. Mirrors [`crate::diagnose::Diagnosis::cartesian_risks`]
+    /// exactly, for the same reason: a combination this call declined to
+    /// check shouldn't look identical to one it actually ruled out.
+    pub cartesian_risks: Vec<CartesianRiskCombo>,
 }
 
 /// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`],
@@ -283,11 +291,12 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
 /// Passing `true` means opting out of the protection that guard applies: a
 /// disconnected BGP can make the query engine materialize a full N×M cross
 /// product before yielding a single row, regardless of how tightly `timeout`
-/// is set — see [`crate::diagnose::check_cartesian_risks`]'s docs for a
-/// measured case where an unbounded evaluation of exactly this shape ran for
-/// over 200 seconds and permanently occupied a shared worker thread. Only
-/// set this once you've independently judged the risk worth taking for this
-/// specific query/graph, ideally from a process you can afford to kill
+/// is set — a measured case elsewhere in this project sat for over 200
+/// seconds and permanently occupied a shared worker thread until the whole
+/// process was killed (see `eval/run_eval.py`'s process-level watchdog for
+/// why that backstop lives at the process level, not inside this call).
+/// Only set this once you've independently judged the risk worth taking for
+/// this specific query/graph, ideally from a process you can afford to kill
 /// outright if a check gets stuck.
 ///
 /// Builds a fresh [`FanoutIndex`] from `store` on every call — see
@@ -376,7 +385,12 @@ pub fn diagnose_and_relax_with_fanout_index(
         })
         .collect();
 
-    Ok(RelaxReport { original_row_count: diagnosis.original_row_count, results, filter_results })
+    Ok(RelaxReport {
+        original_row_count: diagnosis.original_row_count,
+        results,
+        filter_results,
+        cartesian_risks: diagnosis.cartesian_risks,
+    })
 }
 
 /// Every triple in a culprit combination removed together, the endpoints

@@ -192,6 +192,13 @@ class RelaxReport:
     original_row_count: int
     results: List[RelaxedCulprit]
     filter_results: List[FilterReport]
+    cartesian_risks: List[CartesianRiskCombo]
+    """Combinations diagnosis flagged as cartesian risks — skipped entirely (never evaluated, and
+    so never attempted here) because their reduced pattern was disconnected. Always empty when
+    `ignore_cartesian_risk` was set on this call, since every combination was actually evaluated
+    instead of being skipped. Mirrors `Diagnosis.cartesian_risks` exactly, for the same reason: a
+    combination this call declined to check shouldn't look identical to one it actually ruled
+    out."""
 
 
 @dataclass
@@ -281,7 +288,7 @@ def _diagnosis_from_tuples(original_row_count: int, culprits, filter_culprits, c
     )
 
 
-def _relax_report_from_tuples(original_row_count: int, results, filter_results) -> RelaxReport:
+def _relax_report_from_tuples(original_row_count: int, results, filter_results, cartesian_risks) -> RelaxReport:
     return RelaxReport(
         original_row_count=original_row_count,
         results=[
@@ -298,6 +305,7 @@ def _relax_report_from_tuples(original_row_count: int, results, filter_results) 
         filter_results=[
             FilterReport(expression=e, row_count_without_filter=n) for e, n in filter_results
         ],
+        cartesian_risks=[CartesianRiskCombo(triples=triples, depth=d) for triples, d in cartesian_risks],
     )
 
 
@@ -325,9 +333,17 @@ class Store:
     def __init__(self, data: str, format: str = "turtle") -> None:
         self._store = _Store(data, format)
 
-    def diagnose(self, query: str, depth: int = 3, timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT) -> Diagnosis:
-        """See the module-level `diagnose` for what this does and what `depth`/`timeout` control."""
-        original_row_count, culprits, filter_culprits, cartesian_risks = self._store.diagnose(query, depth=depth, timeout=timeout)
+    def diagnose(
+        self,
+        query: str,
+        depth: int = 3,
+        timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
+        ignore_cartesian_risk: bool = False,
+    ) -> Diagnosis:
+        """See the module-level `diagnose` for what this does and what its parameters control."""
+        original_row_count, culprits, filter_culprits, cartesian_risks = self._store.diagnose(
+            query, depth=depth, timeout=timeout, ignore_cartesian_risk=ignore_cartesian_risk
+        )
         return _diagnosis_from_tuples(original_row_count, culprits, filter_culprits, cartesian_risks)
 
     def diagnose_and_relax(
@@ -344,7 +360,7 @@ class Store:
     ) -> RelaxReport:
         """See the module-level `diagnose_and_relax` for what this does and what its parameters
         control."""
-        original_row_count, results, filter_results = self._store.diagnose_and_relax(
+        original_row_count, results, filter_results, cartesian_risks = self._store.diagnose_and_relax(
             query,
             ablation_depth=ablation_depth,
             max_depth=max_depth,
@@ -355,7 +371,7 @@ class Store:
             diagnose_timeout=diagnose_timeout,
             ignore_cartesian_risk=ignore_cartesian_risk,
         )
-        return _relax_report_from_tuples(original_row_count, results, filter_results)
+        return _relax_report_from_tuples(original_row_count, results, filter_results, cartesian_risks)
 
     def query(
         self, query: str, row_limit: Optional[int] = None, timeout: Optional[float] = DEFAULT_QUERY_TIMEOUT
@@ -364,43 +380,6 @@ class Store:
         control."""
         return _query_result_from_tuple(self._store.query(query, row_limit=row_limit, timeout=timeout))
 
-    def check_cartesian_risks(
-        self,
-        query: str,
-        risks: Sequence[CartesianRiskCombo],
-        original_is_empty: bool,
-        timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
-    ) -> List[Culprit]:
-        """Re-evaluates `risks` — combinations a prior `diagnose` call on this same `query`
-        flagged as `CartesianRiskCombo`s and never actually checked — against this store,
-        returning every one confirmed as a genuine `Culprit`.
-
-        `risks` should be that prior call's `Diagnosis.cartesian_risks`, unmodified;
-        `original_is_empty` should be that same call's `original_row_count == 0` — there's no
-        cheaper way for this method to learn it than re-running the whole original query itself,
-        so it isn't done here a second time; pass it through from what you already have.
-
-        Calling this at all means opting out of the protection `diagnose` applies for exactly this
-        shape: a disconnected BGP can make the query engine materialize a full N×M cross product
-        before yielding a single row, and unlike `diagnose`'s own bounded checks, nothing here can
-        force a stuck native evaluation to give up if the engine doesn't check its cancellation
-        token often enough — a measured case elsewhere in this project sat for over 200 seconds and
-        permanently occupied a shared worker thread until the whole process was killed (see
-        `eval/run_eval.py`'s process-level watchdog for why that backstop lives at the process
-        level, not inside this call). Use this only after `diagnose` has already come up empty, and
-        only once you've independently judged the risk worth taking for this specific query/graph —
-        ideally from a process you can afford to kill outright if a check gets stuck.
-
-        `timeout` (seconds) bounds every risk combination checked here with one shared deadline,
-        exactly like `diagnose`'s own `timeout` — not a fresh budget per combination. Defaults to
-        `DEFAULT_ABLATION_TIMEOUT`; pass `None` to leave it unbounded (not recommended given the
-        docs above).
-        """
-        culprits = self._store.check_cartesian_risks(
-            query, [list(risk.triples) for risk in risks], original_is_empty, timeout=timeout
-        )
-        return [Culprit(triples=triples, depth=d) for triples, d in culprits]
-
 
 def diagnose(
     data: str,
@@ -408,6 +387,7 @@ def diagnose(
     format: str = "turtle",
     depth: int = 3,
     timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
+    ignore_cartesian_risk: bool = False,
 ) -> Diagnosis:
     """Diagnoses which BGP triple(s)/FILTER(s) in `query` are likely broken against `data`.
 
@@ -446,10 +426,28 @@ def diagnose(
     accumulate orphaned background searches that keep consuming CPU and threads indefinitely,
     starving every subsequent row rather than just the one that was slow.
 
+    A culprit combination whose reduced pattern (with it removed) is disconnected is never
+    evaluated at all, `timeout` notwithstanding — that's exactly the shape that can make a query
+    engine materialize a full N×M cross product before yielding a single row. It's reported
+    separately, in `Diagnosis.cartesian_risks`, rather than silently folded into "checked, and it
+    wasn't a culprit" — unless `ignore_cartesian_risk` is set (see below).
+
+    `ignore_cartesian_risk` disables that guard entirely: every combination is actually evaluated
+    against `data`, so `Diagnosis.cartesian_risks` always comes back empty, and a combination that
+    would otherwise have been skipped can be confirmed a genuine `Culprit` instead. Defaults to
+    `False`, preserving the guard. Passing `True` means opting out of the protection it applies — a
+    disconnected BGP can make the query engine materialize a full N×M cross product before
+    yielding a single row, regardless of `timeout` — a measured case elsewhere in this project sat
+    for over 200 seconds and permanently occupied a shared worker thread until the whole process
+    was killed (see `eval/run_eval.py`'s process-level watchdog for why that backstop lives at the
+    process level, not inside this call). Only set this once you've independently judged the risk
+    worth taking for this specific query/graph, ideally from a process you can afford to kill
+    outright if a check gets stuck.
+
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
     same graph, build a `Store` once instead and call its `diagnose` method.
     """
-    return Store(data, format).diagnose(query, depth=depth, timeout=timeout)
+    return Store(data, format).diagnose(query, depth=depth, timeout=timeout, ignore_cartesian_risk=ignore_cartesian_risk)
 
 
 def diagnose_and_relax(
@@ -532,17 +530,15 @@ def diagnose_and_relax(
 
     `ignore_cartesian_risk` disables diagnosis's disconnected-pattern guard for this call: a
     culprit combination whose reduced pattern (with it removed) is disconnected is normally never
-    evaluated at all — it's reported as a `CartesianRiskCombo` and silently dropped, so
-    `diagnose_and_relax` never even attempts to relax it (see `diagnose`'s and
-    `Store.check_cartesian_risks`'s docs for why: a disconnected BGP can make the query engine
-    materialize a full N×M cross product before yielding a single row, regardless of `timeout`).
-    Passing `True` folds the separate diagnose-then-`check_cartesian_risks` dance into this one
-    call instead: every combination is actually evaluated, and one confirmed a genuine culprit gets
-    a real relaxation attempt like any other. Defaults to `False`, preserving the guard. Only set
-    this once you've independently judged the risk worth taking for this specific query/graph,
-    ideally from a process you can afford to kill outright if a check gets stuck — see
-    `Store.check_cartesian_risks`'s docs for a measured case where an unguarded evaluation of
-    exactly this shape ran for over 200 seconds and permanently occupied a worker thread.
+    evaluated at all — it's reported in `cartesian_risks` and never relaxed (see `diagnose`'s docs
+    on why: a disconnected BGP can make the query engine materialize a full N×M cross product
+    before yielding a single row, regardless of `timeout`). Passing `True` means every combination
+    is actually evaluated instead, and one confirmed a genuine culprit gets a real relaxation
+    attempt like any other, so `cartesian_risks` always comes back empty. Defaults to `False`,
+    preserving the guard. Only set this once you've independently judged the risk worth taking for
+    this specific query/graph, ideally from a process you can afford to kill outright if a check
+    gets stuck — see `diagnose`'s docs for a measured case where an unguarded evaluation of exactly
+    this shape ran for over 200 seconds and permanently occupied a worker thread.
 
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
     same graph, build a `Store` once instead and call its `diagnose_and_relax` method.
@@ -602,9 +598,9 @@ def pruned_query(query: str, triples: Sequence[str]) -> str:
     pattern — no path substitution, just ablation.
 
     `triples` should be triple texts from a `Culprit`/`CartesianRiskCombo` already obtained for
-    this same `query` (e.g. `diagnosis.culprits[i].triples`, or a `Store.check_cartesian_risks`
-    result's `triples`); each is matched back to the query's actual BGP triples by an exact text
-    match, and this raises if any isn't found there.
+    this same `query` (e.g. `diagnosis.culprits[i].triples` or `diagnosis.cartesian_risks[i].triples`);
+    each is matched back to the query's actual BGP triples by an exact text match, and this raises
+    if any isn't found there.
 
     Unlike every other function in this module, this takes no RDF graph at all and runs nothing
     against one — it's a pure syntactic transform, useful for scoring what a confirmed culprit

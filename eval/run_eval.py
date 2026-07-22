@@ -518,15 +518,19 @@ def _diagnose_only_row(
     below, cartesian-risk-recovered) is a real fix or a technicality.
 
     If `cfg.try_cartesian_risks` is set and the safe search above came up
-    completely empty (no BGP or FILTER culprit at any depth), this also
-    re-evaluates `diagnosis.cartesian_risks` via `Store.check_cartesian_risks`
-    — actually running the combos `diagnose` skipped, on the theory that
-    trusting the engine to come back quickly is a risk worth taking *once
-    the safe search has nothing left to offer*, not routinely. This is opting
-    out of `diagnose`'s own protection for exactly this shape (see that
-    method's docs on the hang risk); it's caught the same way every other
-    row-level hang is here — by `RowWorker`'s hard-timeout watchdog, not by
-    anything in this function itself."""
+    completely empty (no BGP or FILTER culprit at any depth), this re-runs
+    `Store.diagnose()` a second time with `ignore_cartesian_risk=True` —
+    actually running every combination the safe search skipped, on the theory
+    that trusting the engine to come back quickly is a risk worth taking *once
+    the safe search has nothing left to offer*, not routinely. This repeats
+    the safe search's own already-checked combinations too (there's no
+    cheaper way to recheck only the flagged ones without also re-deriving
+    which culprit(s), if any, they resolve to), so it's only ever paid on
+    rows where the safe search found nothing at all. This is opting out of
+    `diagnose`'s own protection for exactly this shape (see that method's
+    docs on the hang risk); it's caught the same way every other row-level
+    hang is here — by `RowWorker`'s hard-timeout watchdog, not by anything in
+    this function itself."""
     if cfg.verbose:
         print(f"  [{query_id}] {building}  -> diagnosing...", flush=True)
 
@@ -549,14 +553,11 @@ def _diagnose_only_row(
         if cfg.try_cartesian_risks and not found_safely and diagnosis.cartesian_risks:
             cartesian_risk_attempted = True
             if cfg.verbose:
-                print(f"    -> safe search empty, trying {num_cartesian_risks} cartesian-risk combo(s)...", flush=True)
-            # Every row this function is ever called for is originally
-            # zero-result (see `load_rows`'s filter), so `original_is_empty`
-            # is always true here — `check_cartesian_risks` only needs the
-            # cheap ASK-existence shortcut, never the full per-row check.
-            confirmed = relax_store.check_cartesian_risks(
-                gen_query, diagnosis.cartesian_risks, original_is_empty=True, timeout=cfg.timeout
+                print(f"    -> safe search empty, retrying with ignore_cartesian_risk ({num_cartesian_risks} combo(s) skipped)...", flush=True)
+            unguarded = relax_store.diagnose(
+                gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout, ignore_cartesian_risk=True
             )
+            confirmed = unguarded.culprits
             num_cartesian_risks_confirmed = len(confirmed)
             if confirmed:
                 common["diagnose_culprit_found"] = True
@@ -799,8 +800,8 @@ def main() -> None:
         "--no-try-cartesian-risks", action="store_false", dest="try_cartesian_risks", default=True,
         help="Only relevant with --diagnose-only (a no-op otherwise). By default, when "
              "diagnose()'s safe search comes up completely empty (no BGP/FILTER culprit at any "
-             "depth) but it did flag some combinations as cartesian risks, --diagnose-only runs "
-             "those combos anyway via Store.check_cartesian_risks — trusting the query engine "
+             "depth) but it did flag some combinations as cartesian risks, --diagnose-only retries "
+             "with Store.diagnose(ignore_cartesian_risk=True) — trusting the query engine "
              "to come back quickly rather than skipping them outright. Measured on this dataset: "
              "recovers a genuine culprit on ~12%% of the rows the safe search alone couldn't "
              "explain, for a ~14%% relative increase in average diagnose_value_set_f1 dataset-wide, "

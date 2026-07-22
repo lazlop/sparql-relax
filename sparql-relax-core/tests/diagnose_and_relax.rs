@@ -2,8 +2,7 @@ use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::store::Store;
 use sparql_relax_core::bfs::Hop;
 use sparql_relax_core::{
-    NamespaceScope, RelaxError, check_cartesian_risks, diagnose, diagnose_and_relax, diagnose_and_relax_default, diagnose_default,
-    pruned_query_text,
+    NamespaceScope, RelaxError, diagnose, diagnose_and_relax, diagnose_and_relax_default, diagnose_default, pruned_query_text,
 };
 use std::time::{Duration, Instant};
 
@@ -31,7 +30,7 @@ const BROKEN_QUERY: &str = r#"
 #[test]
 fn diagnoses_the_wrong_predicate_as_a_culprit() {
     let store = test_store();
-    let diagnosis = diagnose(BROKEN_QUERY, &store, 1, None).unwrap();
+    let diagnosis = diagnose(BROKEN_QUERY, &store, 1, None, false).unwrap();
 
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1);
@@ -56,7 +55,7 @@ fn diagnose_errors_with_timeout_when_even_the_original_query_cant_run_in_time() 
     // knowing its row count, so this is a hard error, not a graceful
     // "no culprits found".
     let store = test_store();
-    let result = diagnose(BROKEN_QUERY, &store, 1, Some(Duration::from_nanos(1)));
+    let result = diagnose(BROKEN_QUERY, &store, 1, Some(Duration::from_nanos(1)), false);
     assert!(matches!(result, Err(RelaxError::Timeout)), "expected a Timeout error");
 }
 
@@ -244,7 +243,7 @@ fn query_with_no_broken_triples_reports_no_culprits() {
             ?sensor a ex:TempSensor .
         }
     "#;
-    let diagnosis = diagnose(query, &store, 1, None).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 1);
     assert!(diagnosis.culprits.is_empty());
 }
@@ -405,7 +404,7 @@ fn diagnoses_an_overly_restrictive_filter_as_a_culprit() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1, None).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 0);
     assert!(diagnosis.culprits.is_empty(), "no BGP triple is broken here, only the filter");
     assert_eq!(diagnosis.filter_culprits.len(), 1);
@@ -424,7 +423,7 @@ fn does_not_flag_a_filter_that_is_not_excluding_anything() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1, None).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 1);
     assert!(diagnosis.filter_culprits.is_empty());
 }
@@ -477,7 +476,7 @@ fn combines_distinct_paths_from_different_bound_pairs_as_alternatives() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1, None).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1);
 
@@ -601,10 +600,10 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
         }
     "#;
 
-    let depth_1 = diagnose(query, &store, 1, None).unwrap();
+    let depth_1 = diagnose(query, &store, 1, None, false).unwrap();
     assert!(depth_1.culprits.is_empty(), "no single triple's removal alone unblocks the query");
 
-    let depth_3 = diagnose(query, &store, 3, None).unwrap();
+    let depth_3 = diagnose(query, &store, 3, None, false).unwrap();
     assert_eq!(depth_3.culprits.len(), 1, "exactly one joint 2-triple culprit should be found");
     let culprit = &depth_3.culprits[0];
     assert_eq!(culprit.depth, 2, "found at depth 2, so depth 3 never had to run");
@@ -663,7 +662,7 @@ fn does_not_relax_when_the_object_is_unconstrained_elsewhere() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1, None).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false).unwrap();
     assert_eq!(diagnosis.culprits.len(), 1, "building has no direct hasSensor edge");
 
     let report = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
@@ -861,7 +860,7 @@ const DISCONNECTED_QUERY: &str = r#"
 #[test]
 fn a_disconnected_reduced_pattern_is_reported_as_a_cartesian_risk_not_silently_ruled_out() {
     let store = disconnected_store();
-    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None).unwrap();
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None, false).unwrap();
 
     assert_eq!(diagnosis.original_row_count, 0);
     // Removing the real culprit (T1, `ex:hasBrokenLink`) leaves {T2, T3}
@@ -889,10 +888,10 @@ fn diagnose_and_relax_does_not_hang_or_error_on_a_disconnected_query() {
     assert!(report.results.is_empty());
 }
 
-/// `ignore_cartesian_risk: true` folds the two-step
-/// diagnose-then-`check_cartesian_risks` dance (see
-/// `check_cartesian_risks_recovers_the_real_culprit_diagnose_skipped` above)
-/// straight into `diagnose_and_relax`: the disconnected `{T2, T3}` combo left
+/// `ignore_cartesian_risk: true` (see
+/// `ignore_cartesian_risk_recovers_the_real_culprit_diagnose_skipped` below,
+/// which exercises the same flag on plain `diagnose`) works the same way on
+/// `diagnose_and_relax`: the disconnected `{T2, T3}` combo left
 /// by removing the real culprit (T1, `hasBrokenLink`) is actually evaluated
 /// instead of skipped, confirms T1 as a genuine culprit, and relaxation then
 /// gets a real shot at fixing it — here, no path connects
@@ -918,8 +917,8 @@ fn ignore_cartesian_risk_lets_relax_attempt_a_combo_diagnose_would_otherwise_ski
 /// `diagnose`'s guard skipped both single-triple combos in
 /// `DISCONNECTED_QUERY` without ever running them (see the diagnosis-only
 /// test above), so the real culprit (T1, `hasBrokenLink`) is never
-/// confirmed. `check_cartesian_risks` is the deliberate opt-out of that
-/// guard: actually running the flagged combos recovers T1 as a genuine
+/// confirmed. `ignore_cartesian_risk: true` is the deliberate opt-out of
+/// that guard: actually running the flagged combos recovers T1 as a genuine
 /// culprit — removing it leaves `{T2, T3}` disconnected, but T2/T3 *do* have
 /// a solution together (`ex:sensor1`/`ex:widget1`), which is exactly what
 /// makes T1's absence unblock the query. The other flagged combo (removing
@@ -927,29 +926,13 @@ fn ignore_cartesian_risk_lets_relax_attempt_a_combo_diagnose_would_otherwise_ski
 /// and T1 alone never matches anything (`hasBrokenLink` isn't in the data),
 /// so that combo genuinely isn't responsible.
 #[test]
-fn check_cartesian_risks_recovers_the_real_culprit_diagnose_skipped() {
+fn ignore_cartesian_risk_recovers_the_real_culprit_diagnose_skipped() {
     let store = disconnected_store();
-    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None).unwrap();
-    assert!(diagnosis.culprits.is_empty());
-    assert_eq!(diagnosis.cartesian_risks.len(), 2);
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None, true).unwrap();
 
-    let risks: Vec<Vec<String>> =
-        diagnosis.cartesian_risks.iter().map(|r| r.triples.iter().map(ToString::to_string).collect()).collect();
-    let confirmed = check_cartesian_risks(DISCONNECTED_QUERY, &store, &risks, diagnosis.original_row_count == 0, None).unwrap();
-
-    assert_eq!(confirmed.len(), 1, "only the hasBrokenLink combo should be confirmed a genuine culprit");
-    assert!(confirmed[0].triples[0].to_string().contains("hasBrokenLink"));
-}
-
-/// A combo text that doesn't match any of the query's actual BGP triples
-/// (e.g. a stale/mismatched `risks` list from a different query) should
-/// raise, not silently skip or panic.
-#[test]
-fn check_cartesian_risks_errors_on_an_unmatched_triple_text() {
-    let store = disconnected_store();
-    let bogus = vec![vec!["?nonexistent <urn:example#doesNotAppear> ?anywhere".to_string()]];
-    let result = check_cartesian_risks(DISCONNECTED_QUERY, &store, &bogus, true, None);
-    assert!(result.is_err());
+    assert!(diagnosis.cartesian_risks.is_empty(), "every combo was actually evaluated, so none should be reported as skipped");
+    assert_eq!(diagnosis.culprits.len(), 1, "only the hasBrokenLink combo should be confirmed a genuine culprit");
+    assert!(diagnosis.culprits[0].triples[0].to_string().contains("hasBrokenLink"));
 }
 
 /// `pruned_query_text` is a pure syntactic transform (no `Store`, nothing
@@ -959,22 +942,20 @@ fn check_cartesian_risks_errors_on_an_unmatched_triple_text() {
 #[test]
 fn pruned_query_text_removes_the_given_triple_and_the_result_runs() {
     let store = disconnected_store();
-    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None).unwrap();
-    let risks: Vec<Vec<String>> =
-        diagnosis.cartesian_risks.iter().map(|r| r.triples.iter().map(ToString::to_string).collect()).collect();
-    let confirmed = check_cartesian_risks(DISCONNECTED_QUERY, &store, &risks, true, None).unwrap();
-    assert_eq!(confirmed.len(), 1);
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None, true).unwrap();
+    assert_eq!(diagnosis.culprits.len(), 1);
 
-    let triples: Vec<String> = confirmed[0].triples.iter().map(ToString::to_string).collect();
+    let triples: Vec<String> = diagnosis.culprits[0].triples.iter().map(ToString::to_string).collect();
     let pruned = pruned_query_text(DISCONNECTED_QUERY, &triples).unwrap();
     assert!(!pruned.contains("hasBrokenLink"), "the culprit triple should be gone from the pruned query text");
 
-    let rows = diagnose(&pruned, &store, 1, None).unwrap();
+    let rows = diagnose(&pruned, &store, 1, None, false).unwrap();
     assert_eq!(rows.original_row_count, 1, "removing the real culprit should unblock the query");
 }
 
-/// Same unmatched-text case as `check_cartesian_risks` above: raise rather
-/// than silently producing a query with nothing removed.
+/// A triple text that doesn't match any of the query's actual BGP triples
+/// (e.g. a stale/mismatched `triples` list from a different query) should
+/// raise, not silently produce a query with nothing removed.
 #[test]
 fn pruned_query_text_errors_on_an_unmatched_triple_text() {
     let bogus = vec!["?nonexistent <urn:example#doesNotAppear> ?anywhere".to_string()];
@@ -1019,7 +1000,7 @@ const DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY: &str = r#"
 #[test]
 fn an_optional_only_shared_variable_does_not_mask_a_cartesian_risk_in_the_required_pattern() {
     let store = disconnected_with_optional_bridge_store();
-    let diagnosis = diagnose(DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY, &store, 1, None).unwrap();
+    let diagnosis = diagnose(DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY, &store, 1, None, false).unwrap();
 
     assert_eq!(diagnosis.original_row_count, 0);
     // Removing the real culprit (`ex:hasBrokenLink`) leaves `?sensor` and
@@ -1079,7 +1060,7 @@ fn an_rdf_type_culprit_short_circuits_before_the_rest_of_its_depth_is_ever_check
             ?zone ex:hasWidget ex:widget1 .
         }
     "#;
-    let diagnosis = diagnose(query, &store, 1, None).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false).unwrap();
 
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1, "the rdf:type triple alone should be confirmed as the culprit");

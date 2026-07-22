@@ -300,7 +300,7 @@ def list_datasets() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def diagnose(dataset: str, query: str, relax: bool = False) -> dict[str, Any]:
+def diagnose(dataset: str, query: str, relax: bool = False, ignore_cartesian_risk: bool = False) -> dict[str, Any]:
     """Run a SPARQL SELECT query against `dataset` and diagnose it. ALWAYS call this before
     `query` -- even when you expect the query to succeed.
 
@@ -322,11 +322,18 @@ def diagnose(dataset: str, query: str, relax: bool = False) -> dict[str, Any]:
     and QUDT namespaces (this tool's usual building-automation domain) -- a real fix outside
     those namespaces won't be found, though the diagnosis of *which* triple is broken
     is unaffected.
+
+    Some triple combinations are skipped rather than checked at all, because checking them would
+    force the query engine to materialize a full N x M cross product before yielding a single row
+    -- see `cartesian_risks_skipped` in the result. These are the plausible reason no culprit was
+    isolated, not proof one way or the other. Pass `ignore_cartesian_risk=True` to force those
+    combinations to actually be checked instead; only do this if the query is small enough that a
+    stuck evaluation is an acceptable risk, since nothing can force a stuck check to give up early.
     """
     _require_dataset(dataset)  # fail fast with a clear error before involving the watchdog worker at all
     worker = _get_diagnose_worker()
     if relax:
-        report = worker.call(dataset, "diagnose_and_relax", query)
+        report = worker.call(dataset, "diagnose_and_relax", query, ignore_cartesian_risk=ignore_cartesian_risk)
         culprits = [
             {
                 "depth": result.found_at_depth,
@@ -342,8 +349,9 @@ def diagnose(dataset: str, query: str, relax: bool = False) -> dict[str, Any]:
         filter_issues = [
             {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in report.filter_results
         ]
+        cartesian_risks = report.cartesian_risks
     else:
-        report = worker.call(dataset, "diagnose", query)
+        report = worker.call(dataset, "diagnose", query, ignore_cartesian_risk=ignore_cartesian_risk)
         culprits = [
             {
                 "depth": c.depth,
@@ -359,6 +367,9 @@ def diagnose(dataset: str, query: str, relax: bool = False) -> dict[str, Any]:
         filter_issues = [
             {"expression": f.expression, "row_count_without_filter": f.row_count_without_filter} for f in report.filter_culprits
         ]
+        cartesian_risks = report.cartesian_risks
+
+    cartesian_risks_skipped = [{"triples": list(r.triples), "depth": r.depth} for r in cartesian_risks]
 
     ok = report.original_row_count > 0 and not culprits and not filter_issues
     if ok:
@@ -374,6 +385,13 @@ def diagnose(dataset: str, query: str, relax: bool = False) -> dict[str, Any]:
                 "Query is broken. See `culprits`/`filter_issues` for what's wrong. Call again with "
                 "`relax=true` to search for a corrected query."
             )
+    elif cartesian_risks_skipped:
+        message = (
+            "Query returned 0 rows and no broken triple/filter could be isolated, but "
+            f"{len(cartesian_risks_skipped)} combination(s) were skipped rather than checked (see "
+            "`cartesian_risks_skipped`) -- the real culprit may be among them. Call again with "
+            "`ignore_cartesian_risk=true` to force those combinations to actually be checked."
+        )
     else:
         message = (
             "Query returned 0 rows and no single broken triple/filter could be isolated -- the "
@@ -386,6 +404,7 @@ def diagnose(dataset: str, query: str, relax: bool = False) -> dict[str, Any]:
         "row_count": report.original_row_count,
         "culprits": culprits,
         "filter_issues": filter_issues,
+        "cartesian_risks_skipped": cartesian_risks_skipped,
         "message": message,
     }
 

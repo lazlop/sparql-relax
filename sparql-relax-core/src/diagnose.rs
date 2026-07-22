@@ -114,10 +114,11 @@ fn is_rdf_type_triple(triple: &TriplePattern) -> bool {
 }
 
 /// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`]
-/// and [`DEFAULT_ABLATION_TIMEOUT`]. A convenient default for callers who
-/// don't need to tune the search.
+/// and [`DEFAULT_ABLATION_TIMEOUT`], with the cartesian-risk guard left on
+/// (see `ignore_cartesian_risk` on [`diagnose`]). A convenient default for
+/// callers who don't need to tune the search.
 pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
-    diagnose(query_text, store, DEFAULT_ABLATION_DEPTH, Some(DEFAULT_ABLATION_TIMEOUT))
+    diagnose(query_text, store, DEFAULT_ABLATION_DEPTH, Some(DEFAULT_ABLATION_TIMEOUT), false)
 }
 
 /// Diagnoses `query_text` against `store`. Only `SELECT` queries are
@@ -162,12 +163,28 @@ pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
 /// see `algebra::has_cartesian_join`. That's a distinct outcome
 /// from "checked, and it wasn't a culprit": it's collected separately in
 /// [`Diagnosis::cartesian_risks`] rather than silently folded into a
-/// negative result.
-pub fn diagnose(query_text: &str, store: &Store, depth: usize, timeout: Option<Duration>) -> Result<Diagnosis> {
+/// negative result, unless `ignore_cartesian_risk` is set (see below).
+///
+/// `ignore_cartesian_risk` disables that guard entirely: every combination
+/// is actually evaluated against `store`, so [`Diagnosis::cartesian_risks`]
+/// always comes back empty, and a combination that would otherwise have
+/// been skipped can be confirmed a genuine [`Culprit`] instead. `false` (the
+/// default via [`diagnose_default`]) preserves the guard. Passing `true`
+/// means opting out of the protection it applies: a disconnected BGP can
+/// make the query engine materialize a full N×M cross product before
+/// yielding a single row, regardless of how tightly `timeout` is set — a
+/// measured case elsewhere in this project sat for over 200 seconds and
+/// permanently occupied a shared worker thread until the whole process was
+/// killed (see `eval/run_eval.py`'s process-level watchdog for why that
+/// backstop lives at the process level, not inside this call). Only set
+/// this once you've independently judged the risk worth taking for this
+/// specific query/graph, ideally from a process you can afford to kill
+/// outright if a check gets stuck.
+pub fn diagnose(query_text: &str, store: &Store, depth: usize, timeout: Option<Duration>, ignore_cartesian_risk: bool) -> Result<Diagnosis> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
-    diagnose_parsed(&query, &pattern, store, depth, timeout, false)
+    diagnose_parsed(&query, &pattern, store, depth, timeout, ignore_cartesian_risk)
 }
 
 pub(crate) fn ensure_select(query: &Query) -> Result<()> {
@@ -188,19 +205,9 @@ pub(crate) fn ensure_select(query: &Query) -> Result<()> {
 /// which would otherwise make a culprit "disappear" when relaxation tries
 /// to remove it.
 ///
-/// `ignore_cartesian_risk` disables the [`crate::algebra::has_cartesian_join`]
-/// guard entirely: every combination is evaluated against `store` regardless
-/// of whether its reduced pattern is disconnected, so [`Diagnosis::cartesian_risks`]
-/// always comes back empty and a combination that would otherwise have been
-/// skipped can be confirmed a genuine [`Culprit`] instead. [`diagnose`]/
-/// [`diagnose_default`] always pass `false` here, preserving the guard for
-/// plain diagnosis; [`crate::relax::diagnose_and_relax`] passes its own
-/// caller-supplied flag through, so a caller opting in gets both the
-/// confirmation *and* a relaxation attempt in one call, rather than needing
-/// the separate [`check_cartesian_risks`] dance. See that function's docs for
-/// why this is a deliberate, caller-judged opt-in rather than a default: a
-/// disconnected BGP can make the query engine materialize a full N×M cross
-/// product before yielding a single row.
+/// `ignore_cartesian_risk` is passed straight through from whichever public
+/// entry point called this — see its docs on [`diagnose`] (and on
+/// [`crate::relax::diagnose_and_relax`], which shares this same guard).
 pub(crate) fn diagnose_parsed(
     query: &Query,
     pattern: &GraphPattern,
@@ -434,74 +441,12 @@ fn classify_combo(
     if any_row { ComboVerdict::Culprit } else { ComboVerdict::NotCulprit } // non-empty, and no row ever satisfied the whole combo jointly
 }
 
-/// Re-evaluates combinations a prior [`diagnose`] call flagged as
-/// [`CartesianRiskCombo`]s — skipped entirely there because their reduced
-/// pattern was disconnected — actually running them against `store` this
-/// time. `risks` is each combo's triples as SPARQL text (the same text
-/// [`CartesianRiskCombo::triples`] already carries), matched back to
-/// `query_text`'s actual BGP triples by an exact `Display`-string match.
-/// `original_is_empty` should be the same `Diagnosis::original_row_count ==
-/// 0` the caller already has from that prior [`diagnose`] call — this
-/// function has no cheaper way to learn it than re-running the whole
-/// original query itself, so it isn't done here a second time.
-///
-/// Callers choosing to use this at all are opting out of the protection
-/// `diagnose` applies for exactly this shape: a disconnected BGP can make
-/// the query engine materialize a full N×M cross product before yielding a
-/// single row, and unlike `diagnose`'s own bounded checks, nothing here can
-/// force a stuck native evaluation to give up if the engine doesn't check
-/// its cancellation token often enough — see `eval/run_eval.py`'s
-/// process-level watchdog (in the Python eval harness) for a measured case
-/// where that took over 200 seconds and permanently occupied a shared
-/// `rayon` worker thread until the whole process was killed. This is meant
-/// to be called deliberately, after `diagnose` has already come up empty,
-/// by a caller that has independently judged the risk worth taking for this
-/// specific query/graph — not as a routine part of every diagnosis, and not
-/// from inside a process whose native threads can't be reclaimed if one
-/// gets stuck.
-///
-/// Every combo given is checked in parallel (like `diagnose`'s own
-/// combinations) against one shared `timeout` deadline, not a fresh budget
-/// each. Returns every combo confirmed as a genuine culprit — same
-/// semantics as [`Culprit`] elsewhere: removing it unblocks the query, and
-/// no single row satisfies every triple in it jointly.
-pub fn check_cartesian_risks(
-    query_text: &str,
-    store: &Store,
-    risks: &[Vec<String>],
-    original_is_empty: bool,
-    timeout: Option<Duration>,
-) -> Result<Vec<Culprit>> {
-    let query = SparqlParser::new().parse_query(query_text)?;
-    ensure_select(&query)?;
-    let pattern = pattern_of(&query).clone();
-    let available = collect_bgp_triples(&pattern);
-
-    let combos: Vec<Vec<TriplePattern>> =
-        risks.iter().map(|texts| match_triples_by_text(&available, texts)).collect::<Result<_>>()?;
-
-    let deadline = timeout.map(|t| Instant::now() + t);
-    let guard = SharedDeadline::new(deadline);
-    Ok(combos
-        .into_par_iter()
-        .filter_map(|combo| match classify_combo(&query, &pattern, &combo, store, original_is_empty, &guard, true) {
-            ComboVerdict::Culprit => {
-                let depth = combo.len();
-                Some(Culprit { triples: combo, depth })
-            }
-            _ => None,
-        })
-        .collect())
-}
-
 /// Matches each text in `texts` back to one of `available`'s actual
 /// `TriplePattern`s by exact `Display`-string equality, one not-yet-claimed
 /// occurrence per text: two distinct triples in a pattern can share
 /// identical SPARQL text (e.g. a repeated triple pattern), so matching
 /// greedily against the first unclaimed occurrence disambiguates without
-/// assuming the whole pattern has no duplicates. Shared by
-/// [`check_cartesian_risks`] (one call per combo, fresh `used` mask each
-/// time) and [`pruned_query_text`].
+/// assuming the whole pattern has no duplicates. Used by [`pruned_query_text`].
 fn match_triples_by_text(available: &[TriplePattern], texts: &[String]) -> Result<Vec<TriplePattern>> {
     let mut used = vec![false; available.len()];
     let mut matched = Vec::with_capacity(texts.len());
@@ -529,8 +474,8 @@ fn match_triples_by_text(available: &[TriplePattern], texts: &[String]) -> Resul
 /// you (e.g. via value-set F1 against ground truth), independent of whether
 /// a real path fix was also found for it — the same "diagnose's own signal"
 /// [`crate::relax::RelaxedCulprit::pruned_query`] already provides for
-/// combinations `diagnose_and_relax` confirms, but usable here for a
-/// combination [`check_cartesian_risks`] confirmed, which never had a
+/// combinations `diagnose_and_relax` confirms, but usable here for any
+/// [`Culprit`] a plain [`diagnose`] call confirmed, which never had a
 /// `RelaxedCulprit` (or any query text) built for it at all.
 pub fn pruned_query_text(query_text: &str, triples: &[String]) -> Result<String> {
     let query = SparqlParser::new().parse_query(query_text)?;
