@@ -4,10 +4,14 @@ in-memory RDF graphs, for AI agents.
 Intended agent workflow: `load_dataset` once, then for every query, call `diagnose`
 before trusting its result. Diagnosis is nearly free when the query already works (it
 just confirms the row count) and, when the query returns nothing or looks wrong, it
-explains *why* -- which triple or FILTER is broken, and often a corrected query found
-by searching the graph's real edges -- instead of leaving the agent with just an empty
-result to guess at. Only call `query`, which fetches the full result set, once
-`diagnose` has confirmed the query returns rows.
+explains *why* -- which triple or FILTER is broken -- instead of leaving the agent with
+just an empty result to guess at. This is the reliable, repeatable core of the tool, and
+the one most agents should reach for. `diagnose`'s `relax=True` option additionally
+searches the graph's real edges for a corrected query, but that search is experimental
+(slower, namespace-restricted, and not guaranteed to find or verify a real fix) -- most
+agents are better served by the default diagnosis and fixing the query themselves from
+its explanation. Only call `query`, which fetches the full result set, once `diagnose`
+has confirmed the query returns rows.
 """
 
 from __future__ import annotations
@@ -26,7 +30,10 @@ mcp = FastMCP(
         "Tools for running and debugging SPARQL queries against RDF graphs. Load a graph with "
         "load_dataset, then ALWAYS call diagnose on a query before trusting its result -- it's "
         "cheap even when the query already works, and when it doesn't it explains exactly which "
-        "triple or FILTER is broken and, where possible, suggests a corrected query. Only call "
+        "triple or FILTER is broken. This default diagnosis is the reliable part of this tool; "
+        "diagnose's relax=True option additionally tries to search the graph for a corrected "
+        "query, but that search is experimental and its suggestions should be verified, not "
+        "trusted outright -- leave relax off unless you specifically want to try it. Only call "
         "query, which returns the full result set, once diagnose has confirmed rows come back."
     ),
 )

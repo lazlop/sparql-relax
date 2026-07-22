@@ -1,13 +1,13 @@
 # SPARQL-Relax
 
-SPARQL-Relax is a toolkit for diagnosing and repairing broken SPARQL queries over RDF graphs. When a query returns no results but is expected to, SPARQL-Relax helps identify the "culprit" triple pattern or filter and suggests a "relaxed" version of the query by searching for actual paths in the knowledge graph.
+SPARQL-Relax is a toolkit for diagnosing broken SPARQL queries over RDF graphs. When a query returns no results but is expected to, SPARQL-Relax identifies the "culprit" triple pattern or filter — the core feature, and the one that's reliable enough to run on every query, including ones that already work. It also has an experimental relaxation mode that searches the graph for actual paths and proposes a "relaxed" fix; treat any suggested fix as a starting point to verify, not a guaranteed repair.
 
 ## Repository Structure
 
-- `sparql-relax-core/`: The Rust implementation of the diagnosis and relaxation logic.
+- `sparql-relax-core/`: The Rust implementation of the diagnosis logic, plus an experimental relaxation/repair search.
 - `sparql-relax-py/`: Python bindings for the Rust core, providing a high-level API for developers.
-- `sparql-relax-mcp/`: An MCP (Model Context Protocol) server that enables AI agents to use the diagnosis and relaxation tools.
-- `eval/`: Evaluation framework containing benchmarks and scripts (`run_eval.py`) to measure the effectiveness of the repair process on real-world datasets.
+- `sparql-relax-mcp/`: An MCP (Model Context Protocol) server that enables AI agents to use the diagnosis tool (and, experimentally, relaxation).
+- `eval/`: Evaluation framework containing benchmarks and scripts (`run_eval.py`) to measure the effectiveness of diagnosis and relaxation on real-world datasets.
 
 ## Getting Started
 

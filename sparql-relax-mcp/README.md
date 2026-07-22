@@ -9,16 +9,21 @@ top of [`sparql_relax`](../sparql-relax-py).
 - **`load_dataset(name, data=None, path=None, format="turtle")`** — load RDF text (or a local
   file) into memory under `name`. Replaces any dataset already loaded under that name.
 - **`list_datasets()`** — list loaded datasets with their format and triple count.
-- **`diagnose(dataset, query)`** — run a SPARQL `SELECT` query and diagnose it. Cheap even when
-  the query already works (`ok: true`); when it doesn't, explains which triple pattern or
-  `FILTER` is broken and, when a real fix exists in the graph, suggests a corrected query.
+- **`diagnose(dataset, query, relax=False)`** — the main tool, and the one that does the most
+  reliable, repeatable work. Run a SPARQL `SELECT` query and diagnose it. Cheap even when the
+  query already works (`ok: true`); when it doesn't, explains which triple pattern or `FILTER`
+  is broken. Pass `relax=True` to also search the graph for a real connecting path and propose a
+  corrected query — this part is **experimental**: it's slower, only looks within a fixed set of
+  namespaces, and a suggested fix should be verified, not trusted outright. Most agents get what
+  they need from the default (`relax=False`) diagnosis and fix the query themselves from there.
 - **`query(dataset, query, row_limit=1000)`** — run any SPARQL query form (`SELECT`, `ASK`,
   `CONSTRUCT`, `DESCRIBE`) and return the actual results.
 
 **Intended workflow:** call `diagnose` on every new query before trusting its result — it's
 nearly free when the query works and tells you exactly what's wrong when it doesn't. Only call
 `query` once `diagnose` confirms rows come back (or directly, for `ASK`/`CONSTRUCT`/`DESCRIBE`,
-which `diagnose` doesn't support).
+which `diagnose` doesn't support). Leave `relax` off by default; it's there for cases where an
+automatic suggested fix is worth the extra cost, not as the first thing to reach for.
 
 ## Setup
 
