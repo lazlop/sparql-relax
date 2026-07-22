@@ -196,8 +196,10 @@ fn diagnose_and_relax_tuples(
     scope: NamespaceScope,
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
+    ignore_cartesian_risk: bool,
 ) -> Result<RelaxTuples, sparql_relax_core::RelaxError> {
-    let report = core_relax(query, store, fanout_index, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout)?;
+    let report =
+        core_relax(query, store, fanout_index, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout, ignore_cartesian_risk)?;
     let results = report
         .results
         .into_iter()
@@ -431,6 +433,19 @@ mod _sparql_relax {
     /// once, before any relaxation work starts, so the two budgets don't
     /// interact. Also defaults to 5.0 seconds.
     ///
+    /// `ignore_cartesian_risk` disables diagnosis's disconnected-pattern
+    /// guard for this call: a combination that would otherwise be reported
+    /// as a `cartesian_risks` entry and never relaxed is instead actually
+    /// evaluated against `data`, and relaxed like any other culprit if
+    /// confirmed. Defaults to `False`, preserving the guard. Passing `True`
+    /// means opting out of the protection that guard applies — a
+    /// disconnected BGP can make the query engine materialize a full N×M
+    /// cross product before yielding a single row, regardless of `timeout` —
+    /// so only set this once you've independently judged the risk worth
+    /// taking for this specific query/graph (see `Store.check_cartesian_risks`'s
+    /// docs for a measured case where that took over 200 seconds and
+    /// permanently occupied a worker thread).
+    ///
     /// Returns `(original_row_count, results, filter_results)`. Each result
     /// is `(found_at_depth, triples, relaxed_query, row_count, pruned_query,
     /// pruned_row_count)`: `triples` is a list of `(triple_text, path_text)`
@@ -455,7 +470,7 @@ mod _sparql_relax {
     #[pyo3(signature = (
         data, query, format="turtle", ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
         allowed_namespaces=default_relax_namespaces(), timeout=default_relax_timeout(),
-        diagnose_timeout=default_ablation_timeout()
+        diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
     ))]
     #[allow(clippy::too_many_arguments)]
     fn diagnose_and_relax(
@@ -470,6 +485,7 @@ mod _sparql_relax {
         allowed_namespaces: Option<Vec<String>>,
         timeout: Option<f64>,
         diagnose_timeout: Option<f64>,
+        ignore_cartesian_risk: bool,
     ) -> PyResult<RelaxTuples> {
         let store = load_store(data, format)?;
         let scope = namespace_scope(allowed_namespaces);
@@ -493,6 +509,7 @@ mod _sparql_relax {
                 scope,
                 timeout,
                 diagnose_timeout,
+                ignore_cartesian_risk,
             )
         })
         .map_err(to_py_err)
@@ -540,7 +557,7 @@ mod _sparql_relax {
         #[pyo3(signature = (
             query, ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
             allowed_namespaces=default_relax_namespaces(), timeout=default_relax_timeout(),
-            diagnose_timeout=default_ablation_timeout()
+            diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
         ))]
         #[allow(clippy::too_many_arguments)]
         fn diagnose_and_relax(
@@ -554,6 +571,7 @@ mod _sparql_relax {
             allowed_namespaces: Option<Vec<String>>,
             timeout: Option<f64>,
             diagnose_timeout: Option<f64>,
+            ignore_cartesian_risk: bool,
         ) -> PyResult<RelaxTuples> {
             let scope = namespace_scope(allowed_namespaces);
             let timeout = parse_timeout_seconds(timeout)?;
@@ -570,6 +588,7 @@ mod _sparql_relax {
                     scope,
                     timeout,
                     diagnose_timeout,
+                    ignore_cartesian_risk,
                 )
             })
             .map_err(to_py_err)

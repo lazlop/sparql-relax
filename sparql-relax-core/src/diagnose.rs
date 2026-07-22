@@ -167,7 +167,7 @@ pub fn diagnose(query_text: &str, store: &Store, depth: usize, timeout: Option<D
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
-    diagnose_parsed(&query, &pattern, store, depth, timeout)
+    diagnose_parsed(&query, &pattern, store, depth, timeout, false)
 }
 
 pub(crate) fn ensure_select(query: &Query) -> Result<()> {
@@ -187,12 +187,27 @@ pub(crate) fn ensure_select(query: &Query) -> Result<()> {
 /// guaranteed to produce identical `TriplePattern` values in every case,
 /// which would otherwise make a culprit "disappear" when relaxation tries
 /// to remove it.
+///
+/// `ignore_cartesian_risk` disables the [`crate::algebra::has_cartesian_join`]
+/// guard entirely: every combination is evaluated against `store` regardless
+/// of whether its reduced pattern is disconnected, so [`Diagnosis::cartesian_risks`]
+/// always comes back empty and a combination that would otherwise have been
+/// skipped can be confirmed a genuine [`Culprit`] instead. [`diagnose`]/
+/// [`diagnose_default`] always pass `false` here, preserving the guard for
+/// plain diagnosis; [`crate::relax::diagnose_and_relax`] passes its own
+/// caller-supplied flag through, so a caller opting in gets both the
+/// confirmation *and* a relaxation attempt in one call, rather than needing
+/// the separate [`check_cartesian_risks`] dance. See that function's docs for
+/// why this is a deliberate, caller-judged opt-in rather than a default: a
+/// disconnected BGP can make the query engine materialize a full N×M cross
+/// product before yielding a single row.
 pub(crate) fn diagnose_parsed(
     query: &Query,
     pattern: &GraphPattern,
     store: &Store,
     depth: usize,
     timeout: Option<Duration>,
+    ignore_cartesian_risk: bool,
 ) -> Result<Diagnosis> {
     // One shared deadline for every query this call runs, rather than a
     // fresh budget per check — see the `timeout` docs on [`diagnose`].
@@ -248,7 +263,8 @@ pub(crate) fn diagnose_parsed(
             let verdicts: Vec<(Vec<TriplePattern>, ComboVerdict)> = wave
                 .into_par_iter()
                 .map(|combo| {
-                    let verdict = classify_combo(query, pattern, &combo, store, original_rows.is_empty(), &guard, false);
+                    let verdict =
+                        classify_combo(query, pattern, &combo, store, original_rows.is_empty(), &guard, ignore_cartesian_risk);
                     (combo, verdict)
                 })
                 .collect();

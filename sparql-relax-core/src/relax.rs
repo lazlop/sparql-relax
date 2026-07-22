@@ -226,6 +226,7 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
         NamespaceScope::default(),
         Some(DEFAULT_RELAX_TIMEOUT),
         Some(DEFAULT_ABLATION_TIMEOUT),
+        false,
     )
 }
 
@@ -272,6 +273,23 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
 /// runs once, before any relaxation work starts, so the two phases'
 /// budgets don't interact.
 ///
+/// `ignore_cartesian_risk` disables diagnosis's [`crate::algebra::has_cartesian_join`]
+/// guard for this call: a culprit combination whose reduced pattern is
+/// disconnected is actually evaluated against `store` instead of being
+/// skipped and reported as a [`crate::diagnose::CartesianRiskCombo`], and if
+/// confirmed genuine, relaxation attempts to fix it exactly like any other
+/// culprit. `false` (the default via [`diagnose_and_relax_default`])
+/// preserves the guard, same as a plain [`crate::diagnose::diagnose`] call.
+/// Passing `true` means opting out of the protection that guard applies: a
+/// disconnected BGP can make the query engine materialize a full N×M cross
+/// product before yielding a single row, regardless of how tightly `timeout`
+/// is set — see [`crate::diagnose::check_cartesian_risks`]'s docs for a
+/// measured case where an unbounded evaluation of exactly this shape ran for
+/// over 200 seconds and permanently occupied a shared worker thread. Only
+/// set this once you've independently judged the risk worth taking for this
+/// specific query/graph, ideally from a process you can afford to kill
+/// outright if a check gets stuck.
+///
 /// Builds a fresh [`FanoutIndex`] from `store` on every call — see
 /// [`diagnose_and_relax_with_fanout_index`], which this delegates to, for
 /// what that's for. Fine for a one-off query; a caller relaxing many
@@ -280,6 +298,7 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
 /// directly instead, the same way a repeated caller should prefer building
 /// one `Store` over passing raw text here repeatedly (see this module's own
 /// docs and `sparql-relax-py`'s `Store` docstring).
+#[allow(clippy::too_many_arguments)]
 pub fn diagnose_and_relax(
     query_text: &str,
     store: &Store,
@@ -290,6 +309,7 @@ pub fn diagnose_and_relax(
     namespace_scope: NamespaceScope,
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
+    ignore_cartesian_risk: bool,
 ) -> Result<RelaxReport> {
     let fanout_index = FanoutIndex::build(store);
     diagnose_and_relax_with_fanout_index(
@@ -303,6 +323,7 @@ pub fn diagnose_and_relax(
         namespace_scope,
         timeout,
         diagnose_timeout,
+        ignore_cartesian_risk,
     )
 }
 
@@ -325,11 +346,12 @@ pub fn diagnose_and_relax_with_fanout_index(
     namespace_scope: NamespaceScope,
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
+    ignore_cartesian_risk: bool,
 ) -> Result<RelaxReport> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
-    let diagnosis = diagnose_parsed(&query, &pattern, store, ablation_depth, diagnose_timeout)?;
+    let diagnosis = diagnose_parsed(&query, &pattern, store, ablation_depth, diagnose_timeout, ignore_cartesian_risk)?;
     let allowed_namespaces = namespace_scope.as_filter();
 
     // Every culprit combination is relaxed independently against the same

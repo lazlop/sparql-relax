@@ -340,6 +340,7 @@ class Store:
         allowed_namespaces: Optional[Sequence[str]] = DEFAULT_RELAX_NAMESPACES,
         timeout: Optional[float] = DEFAULT_RELAX_TIMEOUT,
         diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
+        ignore_cartesian_risk: bool = False,
     ) -> RelaxReport:
         """See the module-level `diagnose_and_relax` for what this does and what its parameters
         control."""
@@ -352,6 +353,7 @@ class Store:
             allowed_namespaces=list(allowed_namespaces) if allowed_namespaces is not None else None,
             timeout=timeout,
             diagnose_timeout=diagnose_timeout,
+            ignore_cartesian_risk=ignore_cartesian_risk,
         )
         return _relax_report_from_tuples(original_row_count, results, filter_results)
 
@@ -461,6 +463,7 @@ def diagnose_and_relax(
     allowed_namespaces: Optional[Sequence[str]] = DEFAULT_RELAX_NAMESPACES,
     timeout: Optional[float] = DEFAULT_RELAX_TIMEOUT,
     diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
+    ignore_cartesian_risk: bool = False,
 ) -> RelaxReport:
     """Diagnoses `query` and searches for a real forward/inverse graph path fixing each culprit
     combination found.
@@ -527,6 +530,20 @@ def diagnose_and_relax(
     relaxation work starts, so the two budgets don't interact. Also defaults to
     `DEFAULT_ABLATION_TIMEOUT` (5 seconds).
 
+    `ignore_cartesian_risk` disables diagnosis's disconnected-pattern guard for this call: a
+    culprit combination whose reduced pattern (with it removed) is disconnected is normally never
+    evaluated at all — it's reported as a `CartesianRiskCombo` and silently dropped, so
+    `diagnose_and_relax` never even attempts to relax it (see `diagnose`'s and
+    `Store.check_cartesian_risks`'s docs for why: a disconnected BGP can make the query engine
+    materialize a full N×M cross product before yielding a single row, regardless of `timeout`).
+    Passing `True` folds the separate diagnose-then-`check_cartesian_risks` dance into this one
+    call instead: every combination is actually evaluated, and one confirmed a genuine culprit gets
+    a real relaxation attempt like any other. Defaults to `False`, preserving the guard. Only set
+    this once you've independently judged the risk worth taking for this specific query/graph,
+    ideally from a process you can afford to kill outright if a check gets stuck — see
+    `Store.check_cartesian_risks`'s docs for a measured case where an unguarded evaluation of
+    exactly this shape ran for over 200 seconds and permanently occupied a worker thread.
+
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
     same graph, build a `Store` once instead and call its `diagnose_and_relax` method.
     """
@@ -539,6 +556,7 @@ def diagnose_and_relax(
         allowed_namespaces=allowed_namespaces,
         timeout=timeout,
         diagnose_timeout=diagnose_timeout,
+        ignore_cartesian_risk=ignore_cartesian_risk,
     )
 
 

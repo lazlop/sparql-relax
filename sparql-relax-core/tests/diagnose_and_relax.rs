@@ -165,6 +165,7 @@ fn diagnose_and_relax_propagates_a_timeout_error_when_diagnose_timeout_is_exceed
         NamespaceScope::Unrestricted,
         None,
         Some(Duration::from_nanos(1)),
+        false,
     );
     assert!(matches!(result, Err(RelaxError::Timeout)), "expected a Timeout error");
 }
@@ -172,7 +173,7 @@ fn diagnose_and_relax_propagates_a_timeout_error_when_diagnose_timeout_is_exceed
 #[test]
 fn finds_a_real_forward_forward_path_and_fixes_the_query() {
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
 
     assert_eq!(report.original_row_count, 0);
     assert_eq!(report.results.len(), 1);
@@ -221,7 +222,7 @@ fn relaxes_a_culprit_triple_whose_variable_is_not_in_the_select_list() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.original_row_count, 0);
     assert_eq!(report.results.len(), 1);
 
@@ -272,7 +273,7 @@ fn finds_an_inverse_hop_path() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let relaxed_triple = &report.results[0].triples[0];
     assert_eq!(
@@ -286,7 +287,7 @@ fn finds_an_inverse_hop_path() {
 #[test]
 fn reports_no_relaxation_when_depth_is_too_small() {
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(1), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(1), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
     assert!(result.triples[0].hop_alternatives.is_empty());
@@ -305,7 +306,7 @@ fn pruned_query_is_present_even_when_a_real_relaxation_is_found() {
     // even alongside a successful relaxed_query, so callers can compare
     // the two or fall back later without a second call.
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     let result = &report.results[0];
     assert!(result.relaxed_query.is_some(), "sanity check: a real relaxation was found here");
     assert!(!result.pruned_query.contains("hasSensor"), "the culprit triple should be dropped, not replaced");
@@ -341,10 +342,10 @@ fn pruned_row_count_respects_result_limit() {
         }
     "#;
 
-    let unbounded = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let unbounded = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(unbounded.results[0].pruned_row_count, 2);
 
-    let capped = diagnose_and_relax(query, &store, 1, Some(4), Some(5), Some(1), NamespaceScope::Unrestricted, None, None).unwrap();
+    let capped = diagnose_and_relax(query, &store, 1, Some(4), Some(5), Some(1), NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(capped.results[0].pruned_row_count, 1, "result_limit tightens pruned_row_count too");
 }
 
@@ -366,6 +367,7 @@ fn falls_back_to_pruned_query_when_the_relaxation_timeout_is_exceeded() {
         NamespaceScope::Unrestricted,
         Some(Duration::from_nanos(1)),
         None,
+        false,
     )
     .unwrap();
     assert_eq!(report.results.len(), 1);
@@ -439,7 +441,7 @@ fn diagnose_and_relax_reports_filters_without_attempting_a_relaxation() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert!(report.results.is_empty());
     assert_eq!(report.filter_results.len(), 1);
     assert_eq!(report.filter_results[0].row_count_without_filter, 1);
@@ -479,7 +481,7 @@ fn combines_distinct_paths_from_different_bound_pairs_as_alternatives() {
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1);
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
 
@@ -525,7 +527,7 @@ fn reuses_one_path_across_endpoints_that_share_its_shape() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
 
@@ -556,10 +558,10 @@ fn sample_limit_none_samples_every_distinct_bound_pair() {
         }
     "#;
 
-    let capped = diagnose_and_relax(query, &store, 1, Some(2), Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let capped = diagnose_and_relax(query, &store, 1, Some(2), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(capped.results[0].triples[0].hop_alternatives.len(), 5, "capped sampling stops at the limit");
 
-    let uncapped = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let uncapped = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(
         uncapped.results[0].triples[0].hop_alternatives.len(),
         6,
@@ -617,7 +619,7 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
     // the combination should still be relaxed as a whole: hasSensor spliced
     // in with its discovered path, hasUnit simply dropped — recovering
     // sensor1 rather than giving up on the pair entirely.
-    let report = diagnose_and_relax(query, &store, 3, Some(4), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 3, Some(4), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
     assert_eq!(result.triples.len(), 2);
@@ -664,7 +666,7 @@ fn does_not_relax_when_the_object_is_unconstrained_elsewhere() {
     let diagnosis = diagnose(query, &store, 1, None).unwrap();
     assert_eq!(diagnosis.culprits.len(), 1, "building has no direct hasSensor edge");
 
-    let report = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let relaxed_triple = &report.results[0].triples[0];
     assert!(relaxed_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
@@ -696,7 +698,7 @@ fn does_not_relax_when_the_subject_is_unconstrained_elsewhere() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let relaxed_triple = &report.results[0].triples[0];
     assert!(relaxed_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
@@ -762,7 +764,7 @@ fn default_max_depth_is_2_for_pair_search() {
             ?sensor a ex:TempSensor .
         }
     "#;
-    let pair_report = diagnose_and_relax(pair_query, &store, 1, None, Some(5), None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let pair_report = diagnose_and_relax(pair_query, &store, 1, None, Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(pair_report.results[0].row_count, 1, "default pair-search depth (2) finds the 2-hop path");
 }
 
@@ -792,11 +794,11 @@ fn namespace_scope_restricts_path_search_to_allowed_prefixes() {
         }
     "#;
 
-    let unrestricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let unrestricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(unrestricted.results[0].triples[0].hop_alternatives.len(), 1, "the real altPath edge should be found");
     assert_eq!(unrestricted.results[0].row_count, 1);
 
-    let brick_restricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::default(), None, None).unwrap();
+    let brick_restricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::default(), None, None, false).unwrap();
     assert!(
         brick_restricted.results[0].triples[0].hop_alternatives.is_empty(),
         "ex:altPath isn't in any allowed namespace, so it shouldn't be found"
@@ -813,6 +815,7 @@ fn namespace_scope_restricts_path_search_to_allowed_prefixes() {
         NamespaceScope::Only(vec!["urn:example#alt".to_string()]),
         None,
         None,
+        false,
     )
     .unwrap();
     assert_eq!(
@@ -880,10 +883,36 @@ fn a_disconnected_reduced_pattern_is_reported_as_a_cartesian_risk_not_silently_r
 #[test]
 fn diagnose_and_relax_does_not_hang_or_error_on_a_disconnected_query() {
     let store = disconnected_store();
-    let report = diagnose_and_relax(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None).unwrap();
+    let report = diagnose_and_relax(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     // No culprit was ever confirmed (see the diagnosis-only test above), so
     // there's nothing for the relax phase to even attempt.
     assert!(report.results.is_empty());
+}
+
+/// `ignore_cartesian_risk: true` folds the two-step
+/// diagnose-then-`check_cartesian_risks` dance (see
+/// `check_cartesian_risks_recovers_the_real_culprit_diagnose_skipped` above)
+/// straight into `diagnose_and_relax`: the disconnected `{T2, T3}` combo left
+/// by removing the real culprit (T1, `hasBrokenLink`) is actually evaluated
+/// instead of skipped, confirms T1 as a genuine culprit, and relaxation then
+/// gets a real shot at fixing it — here, no path connects
+/// `ex:building223`/`?sensor` other than the missing `hasBrokenLink` edge
+/// itself, so the pair falls back to `pruned_query` rather than a spliced-in
+/// path, but it's no longer silently absent from `report.results` the way it
+/// is with the guard left on.
+#[test]
+fn ignore_cartesian_risk_lets_relax_attempt_a_combo_diagnose_would_otherwise_skip() {
+    let store = disconnected_store();
+
+    let guarded = diagnose_and_relax(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    assert!(guarded.results.is_empty(), "sanity check: the guard leaves nothing to relax");
+
+    let unguarded = diagnose_and_relax(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None, true).unwrap();
+    assert_eq!(unguarded.results.len(), 1, "the real culprit should now be confirmed and attempted");
+    let result = &unguarded.results[0];
+    assert!(result.triples[0].triple_text.contains("hasBrokenLink"));
+    assert!(!result.pruned_query.contains("hasBrokenLink"), "the culprit triple should be dropped from the pruned fallback");
+    assert_eq!(result.pruned_row_count, 1, "sensor1/widget1 still match once hasBrokenLink is dropped");
 }
 
 /// `diagnose`'s guard skipped both single-triple combos in
