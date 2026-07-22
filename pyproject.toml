@@ -3,3 +3,8 @@ members = ["sparql-relax-py", "sparql-relax-mcp", "eval"]
 
 [tool.uv.sources]
 sparql-relax-rs = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+]
