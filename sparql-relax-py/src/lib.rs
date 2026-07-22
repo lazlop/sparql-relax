@@ -549,7 +549,7 @@ mod _sparql_relax {
         // (e.g. removing a triple leaves the rest of the query essentially
         // unconstrained).
         py.detach(|| {
-            let fanout_index = FanoutIndex::build(&store);
+            let fanout_index = FanoutIndex::build(&store, scope.as_filter());
             diagnose_and_connect_tuples(
                 &store,
                 &fanout_index,
@@ -585,6 +585,15 @@ mod _sparql_relax {
     /// here, for the same reason: it's a one-time, whole-graph scan, and
     /// `diagnose_and_connect`'s path search reuses it on every call rather
     /// than re-scanning the graph per query.
+    ///
+    /// `FanoutIndex`'s graph-wide fan-out cap is only computed over
+    /// predicates `allowed_namespaces` admits (see
+    /// `FanoutIndex::build`'s docs), so it should match whatever
+    /// `allowed_namespaces` `diagnose_and_connect` calls against this
+    /// `Store` actually use. Defaults to the same
+    /// `DEFAULT_CONNECT_NAMESPACES` those calls default to; a caller that
+    /// always passes a different, fixed `allowed_namespaces` to every call
+    /// on this `Store` should pass the same one here.
     #[pyclass(name = "Store")]
     struct RdfStore {
         inner: Store,
@@ -594,10 +603,10 @@ mod _sparql_relax {
     #[pymethods]
     impl RdfStore {
         #[new]
-        #[pyo3(signature = (data, format="turtle"))]
-        fn new(data: &str, format: &str) -> PyResult<Self> {
+        #[pyo3(signature = (data, format="turtle", allowed_namespaces=default_connect_namespaces()))]
+        fn new(data: &str, format: &str, allowed_namespaces: Option<Vec<String>>) -> PyResult<Self> {
             let inner = load_store(data, format)?;
-            let fanout_index = FanoutIndex::build(&inner);
+            let fanout_index = FanoutIndex::build(&inner, allowed_namespaces.as_deref());
             Ok(Self { inner, fanout_index })
         }
 

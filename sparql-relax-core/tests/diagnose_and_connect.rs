@@ -106,12 +106,12 @@ fn fanout_index_rejects_a_hop_through_a_shared_hub_value_but_not_a_normal_one() 
     // Ten entities share one generic tag (`commonTag`) -- a "hub" value in
     // exactly the shape that produced this tool's worst measured
     // regressions (two unrelated entities "connected" only because they
-    // happen to share a common tag/quantity-kind/etc.). Seven other
-    // entities each have their own distinct tag, so `hasTag` has something
-    // to be typically-used-like: every *other* tag value has exactly one
-    // subject, which is what makes `commonTag`'s ten subjects an outlier
-    // relative to `hasTag`'s own usage, not some fixed number picked in
-    // isolation.
+    // happen to share a common tag/quantity-kind/etc.). Every other node in
+    // this graph (the seven `b`s, their seven distinct tags, and the
+    // `hasPart` chain) has degree 1 or 2, so the graph-wide 90th-percentile
+    // degree (see FANOUT_PERCENTILE's docs) comes out to 1 -- comfortably
+    // below commonTag's degree of 10, but not below any of the normal,
+    // structural hops this test also checks.
     let store = Store::new().unwrap();
     let mut ttl = String::from("@prefix ex: <urn:example#> .\n");
     for i in 1..=10 {
@@ -122,7 +122,7 @@ fn fanout_index_rejects_a_hop_through_a_shared_hub_value_but_not_a_normal_one() 
     }
     ttl.push_str("ex:c1 ex:hasPart ex:c2 .\nex:c2 ex:hasPart ex:c3 .\n");
     store.load_from_slice(RdfParser::from_format(RdfFormat::Turtle), &ttl).unwrap();
-    let index = sparql_relax_core::FanoutIndex::build(&store);
+    let index = sparql_relax_core::FanoutIndex::build(&store, None);
 
     let a1 = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#a1").unwrap());
     let a2 = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#a2").unwrap());
@@ -132,11 +132,9 @@ fn fanout_index_rejects_a_hop_through_a_shared_hub_value_but_not_a_normal_one() 
     let unfiltered = sparql_relax_core::bfs::find_path(&store, &a1, &a2, 2, None, None, None);
     assert!(unfiltered.is_some(), "sanity check: the hasTag/^hasTag route through the shared tag should exist without filtering");
 
-    // With the index: commonTag's fan-out (10 subjects) is more than half of
-    // hasTag's total usage in this direction (10 of 17), so the majority-share
-    // backstop excludes the inverse hop off it regardless of the percentile
-    // itself (which degenerates to the max with only 8 distinct tag values --
-    // see FANOUT_PERCENTILE's docs), leaving a1 and a2 with no path at all.
+    // With the index: commonTag's fan-out (10 subjects reaching it via
+    // ^hasTag) is far above this graph's typical node degree, so the
+    // inverse hop off it is excluded, leaving a1 and a2 with no path at all.
     let filtered = sparql_relax_core::bfs::find_path(&store, &a1, &a2, 2, None, Some(&index), None);
     assert!(filtered.is_none(), "the hop through the shared hub value should be rejected, leaving a1 and a2 unconnected");
 

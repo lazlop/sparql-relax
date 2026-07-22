@@ -149,7 +149,12 @@ impl Default for NamespaceScope {
 }
 
 impl NamespaceScope {
-    fn as_filter(&self) -> Option<&[String]> {
+    /// The predicate-namespace filter this scope resolves to — `None` means
+    /// unrestricted. Used both by path search itself and, since
+    /// [`FanoutIndex::build`] needs to scan the same predicate set path
+    /// search is restricted to (see its docs), by callers building a
+    /// [`FanoutIndex`] to match a given `NamespaceScope`.
+    pub fn as_filter(&self) -> Option<&[String]> {
         match self {
             NamespaceScope::Only(namespaces) => Some(namespaces),
             NamespaceScope::Unrestricted => None,
@@ -358,7 +363,7 @@ pub fn diagnose_and_connect(
     ignore_cartesian_risk: bool,
     find_all_paths: bool,
 ) -> Result<ConnectReport> {
-    let fanout_index = FanoutIndex::build(store);
+    let fanout_index = FanoutIndex::build(store, namespace_scope.as_filter());
     diagnose_and_connect_with_fanout_index(
         query_text,
         store,
@@ -382,6 +387,16 @@ pub fn diagnose_and_connect(
 /// re-scanning the whole graph on every call. The index only matters for
 /// path search's candidate filtering (see [`crate::bfs::find_path`] and
 /// [`crate::fanout`]'s module docs); it plays no role in diagnosis itself.
+///
+/// `fanout_index` should have been built with the same `allowed_namespaces`
+/// as `namespace_scope` below resolves to (see [`FanoutIndex::build`]):
+/// its graph-wide degree cap is only computed over predicates a namespace
+/// filter admits, so a mismatched `fanout_index` (e.g. built unrestricted,
+/// then called here with a narrower `namespace_scope`) would rank fan-out
+/// against a different, larger population than the one path search is
+/// actually restricted to. A caller that always uses the same
+/// `namespace_scope` for a given `Store` (the common case) never has to
+/// think about this.
 #[allow(clippy::too_many_arguments)]
 pub fn diagnose_and_connect_with_fanout_index(
     query_text: &str,

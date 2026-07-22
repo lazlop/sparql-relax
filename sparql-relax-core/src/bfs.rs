@@ -11,12 +11,12 @@
 //! An optional [`FanoutIndex`] further restricts which edges are eligible
 //! to *expand through* (not just which predicates are allowed at all): a
 //! hop whose specific endpoint has unusually many neighbors via that
-//! predicate — relative to how that predicate is typically used elsewhere
-//! in the graph — is excluded from the frontier, so the search can't walk
-//! out to a shared "hub" value (a common tag, a shared quantity kind) and
-//! back to an otherwise-unrelated entity. See [`crate::fanout`]'s module
-//! docs for why this has to be relative to each predicate's own typical
-//! fan-out rather than one fixed cutoff.
+//! predicate — relative to how connected nodes in this graph typically
+//! are — is excluded from the frontier, so the search can't walk out to a
+//! shared "hub" value (a common tag, a shared quantity kind) and back to an
+//! otherwise-unrelated entity. See [`crate::fanout`]'s module docs for why
+//! this is measured against the whole graph's typical connectivity rather
+//! than one fixed cutoff or a per-predicate one.
 //!
 //! This never touches the SPARQL query engine (it's direct `Store` quad
 //! lookups), so it can't use Oxigraph's `CancellationToken` the way
@@ -29,7 +29,7 @@
 //! unnoticed the way it could if the check only happened once *before* that
 //! one node's (potentially huge) edge set was walked.
 
-use crate::fanout::{Direction, FanoutIndex};
+use crate::fanout::FanoutIndex;
 use oxigraph::model::{GraphNameRef, NamedNode, NamedOrBlankNode, Term};
 use oxigraph::store::Store;
 use spargebra::algebra::PropertyPathExpression;
@@ -179,9 +179,9 @@ pub fn path_holds(store: &Store, start: &Term, goal: &Term, hops: &[Hop]) -> boo
 /// predicates under one of `allowed_namespaces`' prefixes (`None` allows
 /// any predicate), and optionally further restricted by `fanout_index`
 /// (see the module docs and [`crate::fanout`]): a predicate whose fan-out
-/// *specifically at `node`* exceeds that predicate's own typical (90th
-/// percentile, see [`crate::fanout::FANOUT_PERCENTILE`]) fan-out is
-/// excluded, `None` allows any fan-out.
+/// *specifically at `node`* exceeds this graph's typical node degree (90th
+/// percentile, see [`crate::fanout::FANOUT_PERCENTILE`]) is excluded, `None`
+/// allows any fan-out.
 ///
 /// Each distinct predicate encountered is only checked against
 /// `fanout_index` once per call (memoized in `admitted`/`admitted_inv`
@@ -218,7 +218,7 @@ fn neighbors<'a>(
                         .quads_for_pattern(Some(subject.as_ref()), Some(quad.predicate.as_ref()), None, Some(GraphNameRef::DefaultGraph))
                         .flatten()
                         .count();
-                    !index.exceeds_threshold(&quad.predicate, Direction::Forward, count)
+                    !index.exceeds_threshold(count)
                 })
             })
             .map(|quad| (Hop::Forward(quad.predicate), quad.object))
@@ -236,7 +236,7 @@ fn neighbors<'a>(
                     .quads_for_pattern(None, Some(quad.predicate.as_ref()), Some(node.as_ref()), Some(GraphNameRef::DefaultGraph))
                     .flatten()
                     .count();
-                !index.exceeds_threshold(&quad.predicate, Direction::Inverse, count)
+                !index.exceeds_threshold(count)
             })
         })
         .map(|quad| (Hop::Inverse(quad.predicate), Term::from(quad.subject)));
@@ -244,7 +244,7 @@ fn neighbors<'a>(
     forward.chain(inverse)
 }
 
-fn predicate_allowed(predicate: &NamedNode, allowed_namespaces: Option<&[String]>) -> bool {
+pub(crate) fn predicate_allowed(predicate: &NamedNode, allowed_namespaces: Option<&[String]>) -> bool {
     match allowed_namespaces {
         None => true,
         Some(namespaces) => namespaces.iter().any(|ns| predicate.as_str().starts_with(ns.as_str())),

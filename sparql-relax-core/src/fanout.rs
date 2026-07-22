@@ -1,8 +1,8 @@
-//! Per-predicate, per-direction fan-out index: for each predicate a graph
-//! actually uses, how many distinct neighbors is *typical* to have via it,
-//! in each direction — used by [`crate::bfs::find_path`] to reject a
-//! candidate hop whose *specific* endpoint has an unusually large number of
-//! neighbors via that predicate.
+//! Graph-wide fan-out cap: how many distinct neighbors is *typical* for a
+//! node in this specific graph to have, via any one predicate/direction —
+//! used by [`crate::bfs::find_path`] to reject a candidate hop whose
+//! specific endpoint has an unusually large number of neighbors via the
+//! predicate being walked.
 //!
 //! The motivating failure mode (found by tracing real regressions in this
 //! tool's building-automation eval set): a path search bouncing out to a
@@ -10,32 +10,30 @@
 //! share a generic Brick tag, or two unrelated properties that happen to
 //! share a QUDT quantity kind — can "connect" almost any two entities of a
 //! given kind, which is indistinguishable from noise even though every
-//! individual edge involved is real. A single global cutoff on fan-out
-//! doesn't separate this from genuinely useful connections, though: a
-//! predicate like `feeds`/`isFedBy` (a near-bijective supply-chain
-//! hierarchy) can have the *same* raw fan-out as a dangerous hop through
-//! `hasAssociatedTag`, yet tracing a real supply chain is exactly the kind
-//! of fix this tool exists to find. What actually separates them is
-//! *relative* to each predicate's own usage: `feeds`/`isFedBy` are used
-//! consistently (every endpoint's fan-out sits at or near that predicate's
-//! own typical value), while `hasAssociatedTag`/`hasQuantityKind`-style
-//! predicates are dominated by rare, specific values with a long tail of
-//! generic "hub" values shared by everything. Rejecting a hop whose
-//! specific endpoint's fan-out sits in that tail — above the *90th
-//! percentile of its own predicate's* fan-out (see [`FANOUT_PERCENTILE`]),
-//! not some fixed number shared across every predicate — catches the hub
-//! case while leaving structural, near-uniform relations untouched.
+//! individual edge involved is real.
 //!
-//! The percentile alone breaks down for a low-cardinality predicate — a
-//! boolean like `writable` has exactly two possible values, so with only
-//! two (predicate, direction) groups to rank, the 90th percentile always
-//! lands on whichever of the two has the larger count, and `>` never fires
-//! against its own value (the same degeneracy applies to any predicate with
-//! fewer than 10 distinct values in a direction, not just booleans — see
-//! [`FANOUT_PERCENTILE`]). A majority-share backstop catches this: a value
-//! that alone accounts for more than half of a predicate's total usage in
-//! that direction is a hub regardless of how many other values exist to
-//! rank it against (see [`collect_thresholds`]).
+//! The cap is a single number — the [`FANOUT_PERCENTILE`] percentile of
+//! every node's own total degree in this graph (distinct
+//! `(predicate, neighbor)` pairs, summed over both directions) — rather
+//! than one computed separately per predicate. A per-predicate version was
+//! tried first, but it has its own failure mode: a predicate that's
+//! genuinely, uniformly high-fan-out everywhere it's used (or one used so
+//! rarely that there's barely any data to rank against) never looks
+//! unusual *relative to itself*, so nothing about it ever exceeds its own
+//! threshold — e.g. `feeds`/`isFedBy`, where the overwhelming majority of
+//! subjects feed exactly one thing and only a handful of genuine
+//! supply-hub nodes feed many, ends up with a per-predicate threshold of 1
+//! regardless of percentile chosen, rejecting the very supply-chain hops
+//! this tool exists to help trace. Measuring against *this graph's* overall
+//! connectivity instead sidesteps that: a hop is compared to how connected
+//! nodes in this graph typically are at all, not to how one specific
+//! predicate happens to be used.
+//!
+//! Still computed fresh per [`Store`] (not a fixed constant baked into the
+//! tool) so it generalizes to graphs this tool hasn't seen, rather than
+//! being tuned to one dataset's raw fan-out numbers — a sparse graph and a
+//! densely-connected one each get their own cap, reflecting their own
+//! typical connectivity.
 //!
 //! Built once per [`Store`] (like the store itself) rather than recomputed
 //! per search: it's a single pass over every triple, and the resulting
@@ -43,24 +41,14 @@
 //! `diagnose_and_connect`/`find_path` call against it reuses the same one
 //! rather than re-scanning the whole graph per query.
 
+use crate::bfs::predicate_allowed;
 use oxigraph::model::{GraphNameRef, NamedNode, Term};
 use oxigraph::store::Store;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-/// Which side of a `(subject, predicate, object)` triple a hop travels
-/// away from: [`Direction::Forward`] leaves the subject (following `<p>`
-/// toward the object), [`Direction::Inverse`] leaves the object (following
-/// `^<p>` toward the subject) — see [`crate::bfs::Hop`], which this
-/// mirrors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Direction {
-    Forward,
-    Inverse,
-}
-
-/// Percentile (of a predicate's own per-endpoint fan-out, in one direction)
-/// above which a specific endpoint is treated as a hub and excluded from
-/// path search — see the module docs and [`percentile`].
+/// Percentile of graph-wide node degree above which a specific endpoint is
+/// treated as a hub and excluded from path search — see the module docs and
+/// [`percentile`].
 ///
 /// Chosen empirically against this project's building-automation eval set
 /// (`eval/buildings`): across all four sample buildings, per-node degree
@@ -69,96 +57,80 @@ pub enum Direction {
 /// an order of magnitude or more into a handful of genuine hub values (a
 /// shared Brick tag, a QUDT quantity kind, a shared `s223:ConnectionPoint`
 /// instance). 90 sits just past where normal structure ends across that
-/// sample. Kept as a percentile — relative to each predicate's own usage —
-/// rather than an absolute cutoff so this generalizes to graphs this tool
-/// hasn't seen, instead of being tuned to one dataset's raw fan-out numbers.
+/// sample.
 pub(crate) const FANOUT_PERCENTILE: f64 = 0.90;
 
-/// The [`FANOUT_PERCENTILE`] percentile of local fan-out for every
-/// `(predicate, direction)` pair a [`Store`] actually contains, computed once
-/// (see [`FanoutIndex::build`]) and reused for every hop
-/// [`crate::bfs::find_path`] considers against it.
+/// The [`FANOUT_PERCENTILE`] percentile of node degree across an entire
+/// graph, computed once (see [`FanoutIndex::build`]) and reused for every
+/// hop [`crate::bfs::find_path`] considers against it.
 pub struct FanoutIndex {
-    thresholds: HashMap<(NamedNode, Direction), usize>,
+    threshold: usize,
 }
 
 impl FanoutIndex {
-    /// Scans every default-graph triple in `store` once, grouping by
-    /// `(predicate, direction)` and, within each group, by the endpoint a
-    /// hop in that direction would leave from (the subject for `Forward`,
-    /// the object for `Inverse`) — counting each endpoint's *distinct*
-    /// neighbors, not its raw triple count, so a handful of duplicate
-    /// statements can't inflate a single endpoint's apparent fan-out. The
-    /// [`FANOUT_PERCENTILE`] percentile of those per-endpoint counts becomes
-    /// that `(predicate, direction)` pair's threshold.
+    /// Scans every default-graph triple in `store` once (skipping any whose
+    /// predicate `allowed_namespaces` excludes — see
+    /// [`crate::bfs::predicate_allowed`], the same filter path search itself
+    /// applies, so a predicate invisible to the search never contributes to
+    /// what "typical connectivity" means for it either) and computes each
+    /// node's total degree: the number of distinct `(predicate, neighbor)`
+    /// pairs it participates in, as either subject or object. A node reached
+    /// only as a literal object is not counted (a literal can never be a
+    /// subject, so it has no "typical connectivity" of its own to rank
+    /// against others') — but a literal endpoint can still be *checked*
+    /// against the resulting threshold at search time, same as any other
+    /// endpoint.
+    ///
+    /// The [`FANOUT_PERCENTILE`] percentile of that degree distribution
+    /// becomes the single threshold every hop in this graph is checked
+    /// against, regardless of which predicate or direction it's on — see
+    /// the module docs for why this is graph-wide rather than per-predicate.
     ///
     /// A graph with on the order of a hundred distinct predicates (typical
     /// for the building-automation ontologies this tool targets) costs a
     /// single linear pass to index this way, comparable to the store's own
     /// one-time parse — see this module's docs on why that's worth paying
     /// once rather than folding into every search.
-    pub fn build(store: &Store) -> Self {
-        let mut forward_neighbors: HashMap<(NamedNode, Term), HashSetTerm> = HashMap::new();
-        let mut inverse_neighbors: HashMap<(NamedNode, Term), HashSetTerm> = HashMap::new();
+    pub fn build(store: &Store, allowed_namespaces: Option<&[String]>) -> Self {
+        let mut out_neighbors: HashMap<Term, HashSet<(NamedNode, Term)>> = HashMap::new();
+        let mut in_neighbors: HashMap<Term, HashSet<(NamedNode, Term)>> = HashMap::new();
 
         for quad in store.quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph)).flatten() {
+            if !predicate_allowed(&quad.predicate, allowed_namespaces) {
+                continue;
+            }
             let subject = Term::from(quad.subject);
-            forward_neighbors.entry((quad.predicate.clone(), subject.clone())).or_default().insert(quad.object.clone());
-            inverse_neighbors.entry((quad.predicate, quad.object)).or_default().insert(subject);
+            let object = quad.object;
+            out_neighbors.entry(subject.clone()).or_default().insert((quad.predicate.clone(), object.clone()));
+            if matches!(object, Term::NamedNode(_) | Term::BlankNode(_)) {
+                in_neighbors.entry(object).or_default().insert((quad.predicate, subject));
+            }
         }
 
-        let mut thresholds = HashMap::new();
-        collect_thresholds(forward_neighbors, Direction::Forward, &mut thresholds);
-        collect_thresholds(inverse_neighbors, Direction::Inverse, &mut thresholds);
-        Self { thresholds }
+        let mut nodes: HashSet<&Term> = out_neighbors.keys().collect();
+        nodes.extend(in_neighbors.keys());
+
+        let degrees: Vec<usize> = nodes
+            .into_iter()
+            .map(|n| out_neighbors.get(n).map_or(0, HashSet::len) + in_neighbors.get(n).map_or(0, HashSet::len))
+            .collect();
+
+        // An empty (or fully-filtered-out) graph has no basis to rank
+        // anything against; nothing should ever be rejected as a hub in
+        // that case, hence `usize::MAX` rather than `0` (which would reject
+        // every single edge).
+        let threshold = if degrees.is_empty() { usize::MAX } else { percentile(degrees) };
+        Self { threshold }
     }
 
-    /// Whether `count` — an actual endpoint's local fan-out via `predicate`
-    /// in `direction` — exceeds that *specific predicate's own*
-    /// [`FANOUT_PERCENTILE`] fan-out (see [`FanoutIndex::build`]), i.e. whether this
-    /// particular hop is unusually promiscuous for this predicate
-    /// specifically, not against some threshold shared across every
-    /// predicate. A predicate this index never saw (nothing to compare
-    /// against) is never rejected.
-    pub fn exceeds_threshold(&self, predicate: &NamedNode, direction: Direction, count: usize) -> bool {
-        self.thresholds.get(&(predicate.clone(), direction)).is_some_and(|&threshold| count > threshold)
-    }
-}
-
-type HashSetTerm = std::collections::HashSet<Term>;
-
-/// For each predicate, folds its per-endpoint fan-out counts down to one
-/// threshold: the smaller of the [`FANOUT_PERCENTILE`]-percentile count (the
-/// normal case, see the module docs) and half the predicate's total usage in
-/// this direction — a single endpoint value accounting for a majority of
-/// every occurrence of the predicate is a hub on its own terms, independent
-/// of how many *other* distinct values exist to rank it against. Without
-/// this second term, a low-cardinality predicate (a boolean, an enum with a
-/// handful of values) can't produce a useful percentile at all: with `n`
-/// distinct values to rank, `n < 1 / (1 - FANOUT_PERCENTILE)` (10 values, at
-/// the default 0.90) means the largest *is* the percentile, so it can never
-/// exceed its own threshold.
-///
-/// The majority-share term only applies with at least two distinct endpoint
-/// values for the predicate: with only one, that lone value *is* the
-/// predicate's entire usage in this direction, and "it accounts for a
-/// majority of the total" is trivially true of any single-use predicate
-/// (the common case in a small or sparsely-connected graph) rather than a
-/// sign of anything hub-like — there's nothing else to have been
-/// disproportionate relative to.
-fn collect_thresholds(groups: HashMap<(NamedNode, Term), HashSetTerm>, direction: Direction, out: &mut HashMap<(NamedNode, Direction), usize>) {
-    let mut counts_by_predicate: HashMap<NamedNode, Vec<usize>> = HashMap::new();
-    for ((predicate, _endpoint), neighbors) in groups {
-        counts_by_predicate.entry(predicate).or_default().push(neighbors.len());
-    }
-    for (predicate, counts) in counts_by_predicate {
-        let threshold = if counts.len() >= 2 {
-            let total: usize = counts.iter().sum();
-            percentile(counts).min(total / 2)
-        } else {
-            percentile(counts)
-        };
-        out.insert((predicate, direction), threshold);
+    /// Whether `count` — an actual endpoint's local fan-out via one specific
+    /// predicate and direction — exceeds this graph's [`FANOUT_PERCENTILE`]
+    /// node degree (see [`FanoutIndex::build`]), i.e. whether this
+    /// particular hop is unusually promiscuous for *this graph*, not
+    /// against some fixed number shared across every graph this tool is
+    /// ever run against.
+    pub fn exceeds_threshold(&self, count: usize) -> bool {
+        count > self.threshold
     }
 }
 
