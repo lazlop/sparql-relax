@@ -404,9 +404,12 @@ mod _sparql_relax {
     /// every distinct path found for that triple is combined into a single
     /// SPARQL alternation (`|`) so the fix recovers all of them.
     /// `sample_limit` controls how many bound pairs are considered per
-    /// triple (default 5 — a representative sample rather than every row) —
-    /// pass `None` to consider every distinct pair instead of stopping
-    /// early.
+    /// triple (default 500 — a cartesian-risk combination evaluated with
+    /// `ignore_cartesian_risk` cross-joins its endpoints, and the reduced
+    /// query's row order tends to exhaust one side's matches before moving
+    /// to the next, so a small sample can miss the pairing that actually
+    /// connects) — pass `None` to consider every distinct pair instead of
+    /// stopping early.
     ///
     /// `max_depth` bounds the forward/inverse path search itself. Left as
     /// `None` (the default), it uses depth 2. A triple whose other side
@@ -485,7 +488,7 @@ mod _sparql_relax {
     /// call its `diagnose_and_connect` method, which reuses it.
     #[pyfunction]
     #[pyo3(signature = (
-        data, query, format="turtle", ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
+        data, query, format="turtle", ablation_depth=3, max_depth=None, sample_limit=500, result_limit=50_000,
         allowed_namespaces=default_connect_namespaces(), timeout=default_connect_timeout(),
         diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
     ))]
@@ -579,7 +582,7 @@ mod _sparql_relax {
         }
 
         #[pyo3(signature = (
-            query, ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
+            query, ablation_depth=3, max_depth=None, sample_limit=500, result_limit=50_000,
             allowed_namespaces=default_connect_namespaces(), timeout=default_connect_timeout(),
             diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
         ))]

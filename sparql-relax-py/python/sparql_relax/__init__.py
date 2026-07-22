@@ -351,7 +351,7 @@ class Store:
         query: str,
         ablation_depth: int = 3,
         max_depth: Optional[int] = None,
-        sample_limit: Optional[int] = 5,
+        sample_limit: Optional[int] = 500,
         result_limit: Optional[int] = 50_000,
         allowed_namespaces: Optional[Sequence[str]] = DEFAULT_CONNECT_NAMESPACES,
         timeout: Optional[float] = DEFAULT_CONNECT_TIMEOUT,
@@ -456,7 +456,7 @@ def diagnose_and_connect(
     format: str = "turtle",
     ablation_depth: int = 3,
     max_depth: Optional[int] = None,
-    sample_limit: Optional[int] = 5,
+    sample_limit: Optional[int] = 500,
     result_limit: Optional[int] = 50_000,
     allowed_namespaces: Optional[Sequence[str]] = DEFAULT_CONNECT_NAMESPACES,
     timeout: Optional[float] = DEFAULT_CONNECT_TIMEOUT,
@@ -498,10 +498,13 @@ def diagnose_and_connect(
 
     `max_depth` bounds the path search itself; defaults to 2 (`None`).
 
-    `sample_limit` caps how many distinct bound pairs are considered per triple; defaults to 5 (a
-    representative sample rather than every row). Pass `None` to consider every distinct pair
-    instead of stopping early (only worth doing for small graphs/result sets, since it means
-    examining every row the reduced query returns).
+    `sample_limit` caps how many distinct bound pairs are considered per triple; defaults to 500.
+    A cartesian-risk combination evaluated with `ignore_cartesian_risk` cross-joins its bound
+    endpoints, and the reduced query's row order tends to exhaust every match for one side before
+    advancing to the next, so a small sample can land entirely on mismatched pairings and never
+    reach the one that actually connects. Pass `None` to consider every distinct pair instead of
+    stopping early (only worth doing for small graphs/result sets, since it means examining every
+    row the reduced query returns).
 
     `result_limit` caps how many rows a connected query's `LIMIT` allows; defaults to 50,000, since a
     connected path (especially an alternation of several distinct paths) can match far more broadly

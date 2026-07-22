@@ -66,10 +66,17 @@ use spargebra::algebra::{GraphPattern, PropertyPathExpression};
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
-/// Default for `sample_limit`: a representative handful of bound endpoints
-/// is normally enough to find a generalizable path without examining every
-/// row of a potentially large reduced query.
-pub const DEFAULT_SAMPLE_LIMIT: usize = 5;
+/// Default for `sample_limit`: a small sample is normally enough to find a
+/// generalizable path, but a cartesian-risk combination evaluated with
+/// `ignore_cartesian_risk` cross-joins its bound endpoints — the reduced
+/// query's row order tends to exhaust every match for one side before
+/// advancing to the next, so a handful of samples can land entirely on one
+/// bound value's mismatched pairings and never reach the pairing that
+/// actually connects. 500 is cheap relative to the search it bounds (each
+/// unmatched sample is at most a `max_depth`-bounded BFS, not a full store
+/// scan) and comfortably covers that skew without examining every row of a
+/// potentially large reduced query the way `None` would.
+pub const DEFAULT_SAMPLE_LIMIT: usize = 500;
 
 /// Default path-search depth: a culprit triple is only ever searched once
 /// both its subject and object are known (see the module docs), so this is
