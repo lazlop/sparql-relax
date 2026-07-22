@@ -274,9 +274,9 @@ pub fn path_holds(store: &Store, start: &Term, goal: &Term, hops: &[Hop]) -> boo
 /// predicates under one of `allowed_namespaces`' prefixes (`None` allows
 /// any predicate), and optionally further restricted by `fanout_index`
 /// (see the module docs and [`crate::fanout`]): a predicate whose fan-out
-/// *specifically at `node`* exceeds this graph's typical node degree (90th
-/// percentile, see [`crate::fanout::FANOUT_PERCENTILE`]) is excluded, `None`
-/// allows any fan-out.
+/// *specifically at `node`* exceeds this graph's typical node degree (see
+/// [`crate::fanout::FANOUT_PERCENTILE`]) is excluded, `None` allows any
+/// fan-out.
 ///
 /// Reads from every graph in the store (see the module docs on why this
 /// isn't restricted to the default graph).

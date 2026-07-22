@@ -51,14 +51,29 @@ use std::collections::{HashMap, HashSet};
 /// [`percentile`].
 ///
 /// Chosen empirically against this project's building-automation eval set
-/// (`eval/buildings`): across all four sample buildings, per-node degree
-/// (restricted to the predicates path search can actually traverse) stays
-/// essentially flat out through roughly the 90th–95th percentile, then jumps
-/// an order of magnitude or more into a handful of genuine hub values (a
-/// shared Brick tag, a QUDT quantity kind, a shared `s223:ConnectionPoint`
-/// instance). 90 sits just past where normal structure ends across that
-/// sample.
-pub(crate) const FANOUT_PERCENTILE: f64 = 0.90;
+/// (`eval/buildings`). A lower value (0.90) was tried first, but it measurably
+/// regressed real connections in the smaller/sparser sample buildings: e.g.
+/// `TUC_building` has only 552 relevant nodes, so its 90th-percentile degree
+/// is just 3, while `brick:hasPoint` there is legitimately, uniformly
+/// fan-out-10 (every one of ~19 pieces of equipment has exactly 10 points) —
+/// completely normal structure, not a hub, but the cap couldn't tell the
+/// difference at that percentile and rejected it. 0.98 clears that (and the
+/// analogous case in `dflexlibs_multizone`, the other sparse sample building)
+/// while staying far below every genuine hub value measured across all four
+/// buildings (the smallest of which — a Brick tag shared by dozens of
+/// entities — is still several times larger than the resulting cap in every
+/// sample building).
+///
+/// A graph with fewer than `1 / (1 - FANOUT_PERCENTILE)` relevant nodes (50,
+/// at the current value) loses this protection entirely: the nearest-rank
+/// percentile degenerates to the single largest degree in the graph, so
+/// nothing can ever exceed it (the same degeneracy the old per-predicate
+/// design hit for a low-cardinality predicate, just triggered here by a
+/// small overall population instead). None of this project's four sample
+/// buildings are anywhere near that small (the smallest has 223 relevant
+/// nodes), so this is a real limit worth documenting, not one currently
+/// biting any graph this tool is actually run against.
+pub(crate) const FANOUT_PERCENTILE: f64 = 0.98;
 
 /// The [`FANOUT_PERCENTILE`] percentile of node degree across an entire
 /// graph, computed once (see [`FanoutIndex::build`]) and reused for every

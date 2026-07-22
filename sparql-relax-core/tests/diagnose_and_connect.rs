@@ -120,21 +120,28 @@ fn find_path_sees_edges_in_named_graphs_not_just_the_default_graph() {
 
 #[test]
 fn fanout_index_rejects_a_hop_through_a_shared_hub_value_but_not_a_normal_one() {
-    // Ten entities share one generic tag (`commonTag`) -- a "hub" value in
+    // Fifty entities share one generic tag (`commonTag`) -- a "hub" value in
     // exactly the shape that produced this tool's worst measured
     // regressions (two unrelated entities "connected" only because they
     // happen to share a common tag/quantity-kind/etc.). Every other node in
-    // this graph (the seven `b`s, their seven distinct tags, and the
-    // `hasPart` chain) has degree 1 or 2, so the graph-wide 90th-percentile
-    // degree (see FANOUT_PERCENTILE's docs) comes out to 1 -- comfortably
-    // below commonTag's degree of 10, but not below any of the normal,
-    // structural hops this test also checks.
+    // this graph (the 45 `b`s, their 45 distinct tags, and the `hasPart`
+    // chain) has degree 1 or 2, so the graph-wide percentile degree (see
+    // FANOUT_PERCENTILE's docs) comes out to 1 -- comfortably below
+    // commonTag's degree of 50, but not below any of the normal, structural
+    // hops this test also checks.
+    //
+    // Needs at least ~50 total nodes at the current FANOUT_PERCENTILE (see
+    // its docs on the small-graph degeneracy) for the percentile itself to
+    // land on a real, non-degenerate value instead of `commonTag`'s own
+    // degree -- a smaller version of this same graph (as used before
+    // FANOUT_PERCENTILE was raised) would no longer exercise the rejection
+    // this test is actually checking for.
     let store = Store::new().unwrap();
     let mut ttl = String::from("@prefix ex: <urn:example#> .\n");
-    for i in 1..=10 {
+    for i in 1..=50 {
         ttl.push_str(&format!("ex:a{i} ex:hasTag ex:commonTag .\n"));
     }
-    for i in 1..=7 {
+    for i in 1..=45 {
         ttl.push_str(&format!("ex:b{i} ex:hasTag ex:uniqueTag{i} .\n"));
     }
     ttl.push_str("ex:c1 ex:hasPart ex:c2 .\nex:c2 ex:hasPart ex:c3 .\n");
