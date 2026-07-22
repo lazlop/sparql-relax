@@ -1,0 +1,18 @@
+[project]
+name = "sparql-relax-eval"
+version = "0.1.0"
+description = "Evaluation scripts for sparql-relax (not a package, just deps)"
+requires-python = ">=3.9"
+dependencies = [
+    "sparql-relax-rs",
+    "pyoxigraph",
+    "pandas",
+    "numpy",
+    "matplotlib",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+sparql-relax-rs = { workspace = true }

@@ -11,15 +11,27 @@ SPARQL-Relax is a toolkit for diagnosing broken SPARQL queries over RDF graphs. 
 
 ## Getting Started
 
-### Use as a Python Library
-If you want to integrate SPARQL-Relax into your own Python project, see the [Python Bindings README](./sparql-relax-py/README.md).
-Quick start:
+### Working on this repo
+`sparql-relax-py`, `sparql-relax-mcp`, and `eval/` are all members of a single
+[`uv` workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/) rooted at the top of this
+repo, so there's one shared virtual environment for everything instead of a separate venv per
+subfolder. From the repo root:
 ```bash
-cd sparql-relax-py
-maturin develop --release
+uv sync
+```
+This builds the Rust extension (via `maturin`, requires a Rust toolchain) and installs it plus the
+MCP server and eval dependencies into `.venv/`. Run anything with `uv run`, e.g. `uv run python`,
+`uv run pytest` (from `sparql-relax-mcp/`), or `uv run jupyter lab` for the tutorial notebook.
+
+After changing Rust code, rebuild the extension in place with:
+```bash
+cd sparql-relax-py && uv run maturin develop --release --uv
 ```
 
-Or add it to another project directly from GitHub with [`uv`](https://docs.astral.sh/uv/) (requires a Rust toolchain, since it builds the PyO3 extension from source):
+### Use as a Python Library
+If you want to integrate SPARQL-Relax into your own Python project, see the [Python Bindings README](./sparql-relax-py/README.md).
+
+Add it to another project directly from GitHub with [`uv`](https://docs.astral.sh/uv/) (requires a Rust toolchain, since it builds the PyO3 extension from source):
 ```toml
 [tool.uv.sources]
 sparql-relax-rs = { git = "https://github.com/lazlop/sparql-relax", subdirectory = "sparql-relax-py" }
@@ -45,8 +57,7 @@ We provide a Jupyter Notebook tutorial to get you started:
 - [tutorial.ipynb](./tutorial.ipynb)
 
 ## Evaluation
-The `eval/` directory contains tools to benchmark the system against generated queries and ground-truth results. You can run the evaluation script:
+The `eval/` directory contains tools to benchmark the system against generated queries and ground-truth results. You can run the evaluation script (from the repo root, using the shared workspace venv):
 ```bash
-cd eval
-python3 run_eval.py
+uv run eval/run_eval.py
 ```

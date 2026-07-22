@@ -20,7 +20,7 @@ build-backend = "hatchling.build"
 packages = ["src/sparql_relax_mcp"]
 
 [tool.uv.sources]
-sparql-relax-rs = { path = "../sparql-relax-py", editable = true }
+sparql-relax-rs = { workspace = true }
 
 [dependency-groups]
 dev = [
