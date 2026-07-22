@@ -21,16 +21,18 @@
 //! own typical value), while `hasAssociatedTag`/`hasQuantityKind`-style
 //! predicates are dominated by rare, specific values with a long tail of
 //! generic "hub" values shared by everything. Rejecting a hop whose
-//! specific endpoint's fan-out sits in that tail — above the *75th
-//! percentile of its own predicate's* fan-out, not some fixed number
-//! shared across every predicate — catches the hub case while leaving
-//! structural, near-uniform relations untouched.
+//! specific endpoint's fan-out sits in that tail — above the *90th
+//! percentile of its own predicate's* fan-out (see [`FANOUT_PERCENTILE`]),
+//! not some fixed number shared across every predicate — catches the hub
+//! case while leaving structural, near-uniform relations untouched.
 //!
 //! The percentile alone breaks down for a low-cardinality predicate — a
 //! boolean like `writable` has exactly two possible values, so with only
-//! two (predicate, direction) groups to rank, the 75th percentile always
+//! two (predicate, direction) groups to rank, the 90th percentile always
 //! lands on whichever of the two has the larger count, and `>` never fires
-//! against its own value. A majority-share backstop catches this: a value
+//! against its own value (the same degeneracy applies to any predicate with
+//! fewer than 10 distinct values in a direction, not just booleans — see
+//! [`FANOUT_PERCENTILE`]). A majority-share backstop catches this: a value
 //! that alone accounts for more than half of a predicate's total usage in
 //! that direction is a hub regardless of how many other values exist to
 //! rank it against (see [`collect_thresholds`]).
@@ -56,9 +58,26 @@ pub enum Direction {
     Inverse,
 }
 
-/// The 75th percentile of local fan-out for every `(predicate, direction)`
-/// pair a [`Store`] actually contains, computed once (see [`FanoutIndex::build`])
-/// and reused for every hop [`crate::bfs::find_path`] considers against it.
+/// Percentile (of a predicate's own per-endpoint fan-out, in one direction)
+/// above which a specific endpoint is treated as a hub and excluded from
+/// path search — see the module docs and [`percentile`].
+///
+/// Chosen empirically against this project's building-automation eval set
+/// (`eval/buildings`): across all four sample buildings, per-node degree
+/// (restricted to the predicates path search can actually traverse) stays
+/// essentially flat out through roughly the 90th–95th percentile, then jumps
+/// an order of magnitude or more into a handful of genuine hub values (a
+/// shared Brick tag, a QUDT quantity kind, a shared `s223:ConnectionPoint`
+/// instance). 90 sits just past where normal structure ends across that
+/// sample. Kept as a percentile — relative to each predicate's own usage —
+/// rather than an absolute cutoff so this generalizes to graphs this tool
+/// hasn't seen, instead of being tuned to one dataset's raw fan-out numbers.
+pub(crate) const FANOUT_PERCENTILE: f64 = 0.90;
+
+/// The [`FANOUT_PERCENTILE`] percentile of local fan-out for every
+/// `(predicate, direction)` pair a [`Store`] actually contains, computed once
+/// (see [`FanoutIndex::build`]) and reused for every hop
+/// [`crate::bfs::find_path`] considers against it.
 pub struct FanoutIndex {
     thresholds: HashMap<(NamedNode, Direction), usize>,
 }
@@ -70,8 +89,8 @@ impl FanoutIndex {
     /// the object for `Inverse`) — counting each endpoint's *distinct*
     /// neighbors, not its raw triple count, so a handful of duplicate
     /// statements can't inflate a single endpoint's apparent fan-out. The
-    /// 75th percentile of those per-endpoint counts becomes that
-    /// `(predicate, direction)` pair's threshold.
+    /// [`FANOUT_PERCENTILE`] percentile of those per-endpoint counts becomes
+    /// that `(predicate, direction)` pair's threshold.
     ///
     /// A graph with on the order of a hundred distinct predicates (typical
     /// for the building-automation ontologies this tool targets) costs a
@@ -95,8 +114,8 @@ impl FanoutIndex {
     }
 
     /// Whether `count` — an actual endpoint's local fan-out via `predicate`
-    /// in `direction` — exceeds that *specific predicate's own* 75th
-    /// percentile fan-out (see [`FanoutIndex::build`]), i.e. whether this
+    /// in `direction` — exceeds that *specific predicate's own*
+    /// [`FANOUT_PERCENTILE`] fan-out (see [`FanoutIndex::build`]), i.e. whether this
     /// particular hop is unusually promiscuous for this predicate
     /// specifically, not against some threshold shared across every
     /// predicate. A predicate this index never saw (nothing to compare
@@ -109,15 +128,16 @@ impl FanoutIndex {
 type HashSetTerm = std::collections::HashSet<Term>;
 
 /// For each predicate, folds its per-endpoint fan-out counts down to one
-/// threshold: the smaller of the 75th-percentile count (the normal case,
-/// see the module docs) and half the predicate's total usage in this
-/// direction — a single endpoint value accounting for a majority of every
-/// occurrence of the predicate is a hub on its own terms, independent of
-/// how many *other* distinct values exist to rank it against. Without this
-/// second term, a low-cardinality predicate (a boolean, an enum with a
-/// handful of values) can't produce a useful percentile at all: with only
-/// two values to rank, the larger one *is* the 75th percentile, so it can
-/// never exceed its own threshold.
+/// threshold: the smaller of the [`FANOUT_PERCENTILE`]-percentile count (the
+/// normal case, see the module docs) and half the predicate's total usage in
+/// this direction — a single endpoint value accounting for a majority of
+/// every occurrence of the predicate is a hub on its own terms, independent
+/// of how many *other* distinct values exist to rank it against. Without
+/// this second term, a low-cardinality predicate (a boolean, an enum with a
+/// handful of values) can't produce a useful percentile at all: with `n`
+/// distinct values to rank, `n < 1 / (1 - FANOUT_PERCENTILE)` (10 values, at
+/// the default 0.90) means the largest *is* the percentile, so it can never
+/// exceed its own threshold.
 ///
 /// The majority-share term only applies with at least two distinct endpoint
 /// values for the predicate: with only one, that lone value *is* the
@@ -134,21 +154,22 @@ fn collect_thresholds(groups: HashMap<(NamedNode, Term), HashSetTerm>, direction
     for (predicate, counts) in counts_by_predicate {
         let threshold = if counts.len() >= 2 {
             let total: usize = counts.iter().sum();
-            percentile_75(counts).min(total / 2)
+            percentile(counts).min(total / 2)
         } else {
-            percentile_75(counts)
+            percentile(counts)
         };
         out.insert((predicate, direction), threshold);
     }
 }
 
-/// The 75th percentile of `counts` (nearest-rank method): sorts, then takes
-/// the smallest value at or past the 75%-of-the-way point. Doesn't need to
-/// match any particular statistics library's interpolation exactly — this
-/// is a threshold for a heuristic filter, not a reported statistic.
-fn percentile_75(mut counts: Vec<usize>) -> usize {
+/// The [`FANOUT_PERCENTILE`] percentile of `counts` (nearest-rank method):
+/// sorts, then takes the smallest value at or past that fraction of the way
+/// through. Doesn't need to match any particular statistics library's
+/// interpolation exactly — this is a threshold for a heuristic filter, not a
+/// reported statistic.
+fn percentile(mut counts: Vec<usize>) -> usize {
     counts.sort_unstable();
     let n = counts.len();
-    let idx = ((n as f64) * 0.75).ceil() as usize;
+    let idx = ((n as f64) * FANOUT_PERCENTILE).ceil() as usize;
     counts[idx.saturating_sub(1).min(n - 1)]
 }

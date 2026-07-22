@@ -132,10 +132,11 @@ fn fanout_index_rejects_a_hop_through_a_shared_hub_value_but_not_a_normal_one() 
     let unfiltered = sparql_relax_core::bfs::find_path(&store, &a1, &a2, 2, None, None, None);
     assert!(unfiltered.is_some(), "sanity check: the hasTag/^hasTag route through the shared tag should exist without filtering");
 
-    // With the index: commonTag's fan-out (10 subjects) is far above
-    // hasTag's own 75th-percentile usage elsewhere in the graph (every
-    // other tag has exactly 1 subject), so the inverse hop off it should be
-    // excluded, leaving a1 and a2 with no path at all.
+    // With the index: commonTag's fan-out (10 subjects) is more than half of
+    // hasTag's total usage in this direction (10 of 17), so the majority-share
+    // backstop excludes the inverse hop off it regardless of the percentile
+    // itself (which degenerates to the max with only 8 distinct tag values --
+    // see FANOUT_PERCENTILE's docs), leaving a1 and a2 with no path at all.
     let filtered = sparql_relax_core::bfs::find_path(&store, &a1, &a2, 2, None, Some(&index), None);
     assert!(filtered.is_none(), "the hop through the shared hub value should be rejected, leaving a1 and a2 unconnected");
 

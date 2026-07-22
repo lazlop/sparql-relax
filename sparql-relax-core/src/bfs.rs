@@ -179,8 +179,9 @@ pub fn path_holds(store: &Store, start: &Term, goal: &Term, hops: &[Hop]) -> boo
 /// predicates under one of `allowed_namespaces`' prefixes (`None` allows
 /// any predicate), and optionally further restricted by `fanout_index`
 /// (see the module docs and [`crate::fanout`]): a predicate whose fan-out
-/// *specifically at `node`* exceeds that predicate's own 75th-percentile
-/// fan-out is excluded, `None` allows any fan-out.
+/// *specifically at `node`* exceeds that predicate's own typical (90th
+/// percentile, see [`crate::fanout::FANOUT_PERCENTILE`]) fan-out is
+/// excluded, `None` allows any fan-out.
 ///
 /// Each distinct predicate encountered is only checked against
 /// `fanout_index` once per call (memoized in `admitted`/`admitted_inv`
