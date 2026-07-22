@@ -48,8 +48,7 @@
 //! stop running unless *something* inside it is enforcing a real deadline.
 
 use crate::algebra::{
-    collect_required_bgp_triples, has_cartesian_join, pattern_of, remove_triple, replace_triple_with_path, variables_of_triples,
-    widen_projection, with_limit, with_pattern,
+    pattern_of, remove_triple, replace_triple_with_path, variables_of_triples, widen_projection, with_limit, with_pattern,
 };
 use crate::bfs::{Hop, find_path, find_path_to_any, path_holds, path_to_property_path};
 use crate::diagnose::{
@@ -67,17 +66,32 @@ use spargebra::algebra::{GraphPattern, PropertyPathExpression};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// Default for `sample_limit`: a small sample is normally enough to find a
-/// generalizable path, but a cartesian-risk combination evaluated with
-/// `ignore_cartesian_risk` cross-joins its bound endpoints — the reduced
-/// query's row order tends to exhaust every match for one side before
-/// advancing to the next, so a handful of samples can land entirely on one
-/// bound value's mismatched pairings and never reach the pairing that
-/// actually connects. 500 is cheap relative to the search it bounds (each
-/// unmatched sample is at most a `max_depth`-bounded BFS, not a full store
-/// scan) and comfortably covers that skew without examining every row of a
-/// potentially large reduced query the way `None` would.
+/// Default for `sample_limit`: by default (see [`DEFAULT_FIND_ALL_PATHS`]),
+/// this caps how many *distinct subjects* [`search_candidates_grouped`]
+/// searches, not flat pairs — and a cartesian-risk combination evaluated
+/// with `ignore_cartesian_risk` cross-joins its bound endpoints, so the
+/// reduced query's row order tends to exhaust every match for one subject
+/// before advancing to the next. 500 is cheap relative to the search it
+/// bounds (each subject's search is at most a `max_depth`-bounded BFS
+/// against its own candidate set, not a full store scan) and comfortably
+/// covers that skew without examining every row of a potentially large
+/// reduced query the way `None` would.
 pub const DEFAULT_SAMPLE_LIMIT: usize = 500;
+
+/// Default for `find_all_paths`: `false`, meaning path search stops as soon
+/// as it has found *a* connecting path (the shortest one reachable within
+/// `max_depth`, across all sampled endpoints — see
+/// [`search_candidates_grouped`]) rather than continuing to search every
+/// sampled endpoint for every distinct path it might individually need.
+/// That's the right default for most callers: a single short property path
+/// is a simpler, easier-to-read fix, and it's cheaper to find. Pass `true`
+/// when a broken triple's *different* bound pairs are known (or suspected)
+/// to genuinely need different real paths — e.g. one entity reached via a
+/// 2-hop path, another via an unrelated 1-hop path — so the fix should
+/// recover all of them via [`search_candidates`] instead of just the first
+/// one found (see
+/// `combines_distinct_paths_from_different_bound_pairs_as_alternatives`).
+pub const DEFAULT_FIND_ALL_PATHS: bool = false;
 
 /// Default path-search depth: a culprit triple is only ever searched once
 /// both its subject and object are known (see the module docs), so this is
@@ -153,12 +167,15 @@ type BoundEndpoint = (Term, Term);
 pub struct ConnectedTriple {
     /// The broken triple pattern, as SPARQL text (e.g. `?s <p> ?o`).
     pub triple_text: String,
-    /// Every distinct forward/inverse hop sequence found (one per sampled
-    /// bound endpoint, deduplicated), combined into the path below via `|`.
-    /// Different endpoints can genuinely need different paths (e.g. one
-    /// entity reached via a 2-hop path, another via an unrelated 1-hop
-    /// path) — picking only one would silently drop the others, so every
-    /// distinct path found is kept and used.
+    /// Every distinct forward/inverse hop sequence found, combined into the
+    /// path below via `|`. By default (`find_all_paths: false`, see
+    /// [`DEFAULT_FIND_ALL_PATHS`]) this holds at most one: search stops as
+    /// soon as it finds a connecting path, the shortest one reachable
+    /// within `max_depth`. Different sampled bound endpoints can genuinely
+    /// need different paths (e.g. one entity reached via a 2-hop path,
+    /// another via an unrelated 1-hop path) — pass `find_all_paths: true`
+    /// to search every sampled endpoint and keep every distinct path found,
+    /// rather than only the first.
     pub hop_alternatives: Vec<Vec<Hop>>,
     /// The hop alternatives rendered as a single SPARQL property path (e.g.
     /// `<p1>/<p2>` alone, or `(<p1>/<p2>)|<p3>` when more than one distinct
@@ -243,6 +260,7 @@ pub fn diagnose_and_connect_default(query_text: &str, store: &Store) -> Result<C
         Some(DEFAULT_CONNECT_TIMEOUT),
         Some(DEFAULT_ABLATION_TIMEOUT),
         false,
+        DEFAULT_FIND_ALL_PATHS,
     )
 }
 
@@ -307,6 +325,14 @@ pub fn diagnose_and_connect_default(query_text: &str, store: &Store) -> Result<C
 /// this specific query/graph, ideally from a process you can afford to kill
 /// outright if a check gets stuck.
 ///
+/// `find_all_paths` controls how many distinct paths are searched for per
+/// broken triple — see [`DEFAULT_FIND_ALL_PATHS`] and
+/// [`ConnectedTriple::hop_alternatives`]. `false` (the default via
+/// [`diagnose_and_connect_default`]) stops at the first (shortest)
+/// connecting path found; `true` searches every sampled bound endpoint and
+/// keeps every distinct path found, in case different endpoints genuinely
+/// need different ones.
+///
 /// Builds a fresh [`FanoutIndex`] from `store` on every call — see
 /// [`diagnose_and_connect_with_fanout_index`], which this delegates to, for
 /// what that's for. Fine for a one-off query; a caller connecting many
@@ -327,6 +353,7 @@ pub fn diagnose_and_connect(
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
+    find_all_paths: bool,
 ) -> Result<ConnectReport> {
     let fanout_index = FanoutIndex::build(store);
     diagnose_and_connect_with_fanout_index(
@@ -341,6 +368,7 @@ pub fn diagnose_and_connect(
         timeout,
         diagnose_timeout,
         ignore_cartesian_risk,
+        find_all_paths,
     )
 }
 
@@ -364,6 +392,7 @@ pub fn diagnose_and_connect_with_fanout_index(
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
+    find_all_paths: bool,
 ) -> Result<ConnectReport> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
@@ -380,7 +409,19 @@ pub fn diagnose_and_connect_with_fanout_index(
         .culprits
         .par_iter()
         .map(|culprit| {
-            connect_combo(&query, &pattern, culprit, store, max_depth, sample_limit, result_limit, allowed_namespaces, fanout_index, timeout)
+            connect_combo(
+                &query,
+                &pattern,
+                culprit,
+                store,
+                max_depth,
+                sample_limit,
+                result_limit,
+                allowed_namespaces,
+                fanout_index,
+                timeout,
+                find_all_paths,
+            )
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -408,11 +449,6 @@ struct BoundEndpoints {
     per_triple: Vec<Vec<BoundEndpoint>>,
     pruned_query: String,
     pruned_row_count: usize,
-    /// Whether this combo's reduced pattern (every triple in it removed) is
-    /// disconnected — see [`bind_endpoints`]'s docs on why this can be
-    /// `true` here despite [`crate::diagnose::diagnose`] having its own
-    /// identical-looking guard.
-    is_cartesian_risk: bool,
 }
 
 /// Removes every triple in `culprit` together (mirroring how diagnosis
@@ -447,21 +483,6 @@ fn bind_endpoints(
             .ok_or_else(|| RelaxError::CulpritNotFound(triple.to_string()))?;
     }
 
-    // `classify_combo` in `diagnose.rs` (the only place a `Culprit` is ever
-    // produced) already ran this exact `has_cartesian_join` check on this
-    // exact reduced pattern — but only enforced it when `ignore_cartesian_risk`
-    // was false; with it true, a `Culprit` can very much have a disconnected
-    // reduced pattern, exactly the shape `ignore_cartesian_risk` opted into
-    // evaluating anyway. Recomputed here (cheap — a structural scan of the
-    // combo's own triples, no store access) so path search below can tell
-    // the two situations apart: with a connected reduced pattern, sampled
-    // endpoints are genuinely-related rows worth searching exhaustively for
-    // every distinct path (see the module docs); with a disconnected one,
-    // they're arbitrary cross-joined pairs, and continuing to search past a
-    // shortest-possible (1-hop) match already found only risks surfacing
-    // more coincidental noise from mismatched pairs, not real alternatives.
-    let is_cartesian_risk = has_cartesian_join(&collect_required_bgp_triples(&reduced_pattern));
-
     let mut pruned_pattern = reduced_pattern;
     if let Some(limit) = result_limit {
         pruned_pattern = with_limit(pruned_pattern, limit);
@@ -483,7 +504,7 @@ fn bind_endpoints(
     let reduced_query = with_pattern(query, widened_pattern);
     let Some(reduced_rows) = run_select_query_with_deadline(reduced_query, store, deadline)? else {
         let per_triple = culprit.triples.iter().map(|_| Vec::new()).collect();
-        return Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count: 0, is_cartesian_risk });
+        return Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count: 0 });
     };
 
     let per_triple = culprit
@@ -506,7 +527,7 @@ fn bind_endpoints(
         .collect();
 
     let pruned_row_count = reduced_rows.len();
-    Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count, is_cartesian_risk })
+    Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count })
 }
 
 /// One bound endpoint's shortest hop sequence at exactly `depth` hops (not
@@ -545,11 +566,10 @@ fn candidate_at_depth(
 /// for one entity doesn't rule out a different, unrelated entity needing
 /// its own separate path (see
 /// `combines_distinct_paths_from_different_bound_pairs_as_alternatives`).
-/// That's only sound for a *connected* reduced pattern's genuinely-related
-/// endpoints, though — for a cartesian-risk combo's arbitrary cross-joined
-/// pairs, see [`search_candidates_grouped`] instead, which this crate's
-/// caller always prefers whenever [`BoundEndpoints::is_cartesian_risk`] is
-/// set.
+/// Used only when the caller passes `find_all_paths: true` (see
+/// [`DEFAULT_FIND_ALL_PATHS`]); the default instead prefers
+/// [`search_candidates_grouped`], which stops at the first connecting path
+/// found rather than searching every sample for every distinct one.
 fn search_candidates(
     store: &Store,
     sampled: &[&BoundEndpoint],
@@ -594,12 +614,12 @@ fn search_candidates(
 /// `subject_limit` distinct subjects (`None` keeps every distinct subject)
 /// — but, for whichever subjects are kept, *every* object they were ever
 /// paired with, not just the first one encountered. Used to build
-/// [`search_candidates_grouped`]'s per-subject goal sets: a cartesian-risk
-/// combo's endpoints are arbitrary cross-joined pairs (see
-/// [`bind_endpoints`]), so a subject's real match can be anywhere among the
-/// objects it was crossed with — truncating that per-subject list the way a
-/// flat sample truncates pairs would reintroduce the exact
-/// order-dependence this grouping exists to remove.
+/// [`search_candidates_grouped`]'s per-subject goal sets: for a
+/// cartesian-risk combo especially (whose endpoints are arbitrary
+/// cross-joined pairs — see [`bind_endpoints`]), a subject's real match can
+/// be anywhere among the objects it was crossed with, so truncating that
+/// per-subject list the way a flat sample truncates pairs would reintroduce
+/// the exact order-dependence this grouping exists to remove.
 fn group_by_subject(endpoints: &[BoundEndpoint], subject_limit: Option<usize>) -> Vec<(Term, HashSet<Term>)> {
     let mut chosen: Vec<Term> = Vec::new();
     let mut chosen_set: HashSet<Term> = HashSet::new();
@@ -624,10 +644,8 @@ fn group_by_subject(endpoints: &[BoundEndpoint], subject_limit: Option<usize>) -
     chosen.into_iter().map(|s| { let goals = goals_by_subject.remove(&s).unwrap_or_default(); (s, goals) }).collect()
 }
 
-/// Cartesian-risk counterpart to [`search_candidates`]: since a disconnected
-/// combo's bound endpoints are arbitrary cross-joined pairs rather than
-/// genuinely-related rows (see [`bind_endpoints`]), this searches by
-/// subject instead of by flat pair — up to `subject_limit` distinct
+/// The default search strategy (see [`DEFAULT_FIND_ALL_PATHS`]): searches
+/// by subject instead of by flat pair — up to `subject_limit` distinct
 /// subjects (see [`group_by_subject`]), each checked against its *entire*
 /// candidate-object set at once via [`crate::bfs::find_path_to_any`] rather
 /// than one [`crate::bfs::find_path`] call per candidate object. That
@@ -635,16 +653,20 @@ fn group_by_subject(endpoints: &[BoundEndpoint], subject_limit: Option<usize>) -
 /// exists — no dependence on where in an arbitrarily-ordered flat sample it
 /// happens to fall — and it's cheaper too: one BFS expansion per subject
 /// serves every one of its candidates, instead of re-fetching and
-/// re-filtering the same subject's edges once per candidate.
+/// re-filtering the same subject's edges once per candidate. That property
+/// matters most for a cartesian-risk combo, whose bound endpoints are an
+/// arbitrary cross join rather than genuinely-related rows (see
+/// [`bind_endpoints`]) — a flat sample there can easily exhaust one
+/// subject's mismatched pairings before ever reaching another's real match.
 ///
 /// Sweeps depth levels the same way [`search_candidates`] does — every
-/// chosen subject is tried at 1 hop before any is tried at 2 — but,
-/// unlike [`search_candidates`], stops entirely as soon as *any* depth
-/// level produces a candidate: with arbitrary cross-joined pairs, there's
-/// nothing to gain, and noise to risk, from searching deeper once one
-/// subject has found a working connection (matching the same reasoning
-/// [`search_candidates`]'s docs give for why that's *not* safe to do for a
-/// connected pattern's genuinely-related endpoints).
+/// chosen subject is tried at 1 hop before any is tried at 2 — but, unlike
+/// [`search_candidates`], stops entirely as soon as *any* depth level
+/// produces a candidate, since the point of this strategy is exactly to
+/// return the first (shortest) connecting path found rather than every
+/// distinct one every sampled subject might individually need — that
+/// exhaustive alternative is what `find_all_paths: true` (→
+/// [`search_candidates`]) is for.
 fn search_candidates_grouped(
     store: &Store,
     endpoints: &[BoundEndpoint],
@@ -702,6 +724,7 @@ fn connect_combo(
     allowed_namespaces: Option<&[String]>,
     fanout_index: &FanoutIndex,
     timeout: Option<Duration>,
+    find_all_paths: bool,
 ) -> Result<ConnectedCulprit> {
     // One budget for all of this combination's query work — resolving
     // endpoints and (later) verifying the candidate fix both draw from it,
@@ -732,21 +755,20 @@ fn connect_combo(
             // generalizes, which matters more than the parallelism given up
             // here (`sample_limit` keeps this small regardless).
             //
-            // A cartesian-risk combo's endpoints are arbitrary cross-joined
-            // pairs rather than genuinely-related rows (see
-            // `bind_endpoints`), so they're searched by subject via
-            // `search_candidates_grouped` instead of `search_candidates`'s
-            // flat per-pair sampling — see that function's docs for why a
-            // flat sample can't reliably find a real match here the way it
-            // can for a connected pattern.
-            let mut candidates = if bound.is_cartesian_risk {
-                search_candidates_grouped(store, endpoints, sample_limit, effective_max_depth, allowed_namespaces, fanout_index, deadline)
-            } else {
+            // `find_all_paths` (default `false`, see
+            // `DEFAULT_FIND_ALL_PATHS`) picks the search strategy: by
+            // default, `search_candidates_grouped` searches by subject and
+            // stops at the first (shortest) connecting path found, rather
+            // than `search_candidates`'s flat per-pair sampling that
+            // searches every sample for every distinct path it might need.
+            let mut candidates = if find_all_paths {
                 let sampled: Vec<&BoundEndpoint> = match sample_limit {
                     Some(limit) => endpoints.iter().take(limit).collect(),
                     None => endpoints.iter().collect(),
                 };
                 search_candidates(store, &sampled, effective_max_depth, allowed_namespaces, fanout_index, deadline)
+            } else {
+                search_candidates_grouped(store, endpoints, sample_limit, effective_max_depth, allowed_namespaces, fanout_index, deadline)
             };
             candidates.sort_by_key(Vec::len);
 

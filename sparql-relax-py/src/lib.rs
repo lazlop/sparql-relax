@@ -185,9 +185,22 @@ fn diagnose_and_connect_tuples(
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
+    find_all_paths: bool,
 ) -> Result<ConnectTuples, sparql_relax_core::RelaxError> {
-    let report =
-        core_connect(query, store, fanout_index, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout, ignore_cartesian_risk)?;
+    let report = core_connect(
+        query,
+        store,
+        fanout_index,
+        ablation_depth,
+        max_depth,
+        sample_limit,
+        result_limit,
+        scope,
+        timeout,
+        diagnose_timeout,
+        ignore_cartesian_risk,
+        find_all_paths,
+    )?;
     let results = report
         .results
         .into_iter()
@@ -400,9 +413,15 @@ mod _sparql_relax {
     ///
     /// Different sampled bound pairs for the same triple can need genuinely
     /// different real paths (e.g. one entity reached via a 2-hop path,
-    /// another via an unrelated 1-hop path); rather than picking just one,
-    /// every distinct path found for that triple is combined into a single
-    /// SPARQL alternation (`|`) so the fix recovers all of them.
+    /// another via an unrelated 1-hop path). By default (`find_all_paths=False`),
+    /// path search stops as soon as it finds a connecting path — the
+    /// shortest one reachable within `max_depth` across all sampled
+    /// endpoints — rather than searching every sampled endpoint for every
+    /// distinct path it might individually need. Pass `find_all_paths=True`
+    /// to search exhaustively instead: every distinct path found for that
+    /// triple is then combined into a single SPARQL alternation (`|`) so the
+    /// fix recovers all of them, not just the first found.
+    ///
     /// `sample_limit` controls how many bound pairs are considered per
     /// triple (default 500 — a cartesian-risk combination evaluated with
     /// `ignore_cartesian_risk` cross-joins its endpoints, and the reduced
@@ -490,7 +509,7 @@ mod _sparql_relax {
     #[pyo3(signature = (
         data, query, format="turtle", ablation_depth=3, max_depth=None, sample_limit=500, result_limit=50_000,
         allowed_namespaces=default_connect_namespaces(), timeout=default_connect_timeout(),
-        diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
+        diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false, find_all_paths=false
     ))]
     #[allow(clippy::too_many_arguments)]
     fn diagnose_and_connect(
@@ -506,6 +525,7 @@ mod _sparql_relax {
         timeout: Option<f64>,
         diagnose_timeout: Option<f64>,
         ignore_cartesian_risk: bool,
+        find_all_paths: bool,
     ) -> PyResult<ConnectTuples> {
         let store = load_store(data, format)?;
         let scope = namespace_scope(allowed_namespaces);
@@ -530,6 +550,7 @@ mod _sparql_relax {
                 timeout,
                 diagnose_timeout,
                 ignore_cartesian_risk,
+                find_all_paths,
             )
         })
         .map_err(to_py_err)
@@ -584,7 +605,7 @@ mod _sparql_relax {
         #[pyo3(signature = (
             query, ablation_depth=3, max_depth=None, sample_limit=500, result_limit=50_000,
             allowed_namespaces=default_connect_namespaces(), timeout=default_connect_timeout(),
-            diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
+            diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false, find_all_paths=false
         ))]
         #[allow(clippy::too_many_arguments)]
         fn diagnose_and_connect(
@@ -599,6 +620,7 @@ mod _sparql_relax {
             timeout: Option<f64>,
             diagnose_timeout: Option<f64>,
             ignore_cartesian_risk: bool,
+            find_all_paths: bool,
         ) -> PyResult<ConnectTuples> {
             let scope = namespace_scope(allowed_namespaces);
             let timeout = parse_timeout_seconds(timeout)?;
@@ -616,6 +638,7 @@ mod _sparql_relax {
                     timeout,
                     diagnose_timeout,
                     ignore_cartesian_risk,
+                    find_all_paths,
                 )
             })
             .map_err(to_py_err)

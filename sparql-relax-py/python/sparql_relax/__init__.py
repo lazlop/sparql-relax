@@ -137,8 +137,10 @@ class ConnectedTriple:
 
     triple: str
     path_text: Optional[str]
-    """The discovered path(s) rendered as a SPARQL property path, e.g. `<p1>/<p2>` or
-    `(<p1>/<p2>)|<p3>` when more than one distinct connecting path was found. `None` if no path
+    """The discovered path(s) rendered as a SPARQL property path, e.g. `<p1>/<p2>`. By default
+    (`find_all_paths=False` on `diagnose_and_connect`) this is the single shortest connecting path
+    found; with `find_all_paths=True` it can instead be an alternation like `(<p1>/<p2>)|<p3>` when
+    more than one distinct connecting path was found across sampled endpoints. `None` if no path
     was found within `max_depth` hops."""
 
 
@@ -357,6 +359,7 @@ class Store:
         timeout: Optional[float] = DEFAULT_CONNECT_TIMEOUT,
         diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
         ignore_cartesian_risk: bool = False,
+        find_all_paths: bool = False,
     ) -> ConnectReport:
         """See the module-level `diagnose_and_connect` for what this does and what its parameters
         control."""
@@ -370,6 +373,7 @@ class Store:
             timeout=timeout,
             diagnose_timeout=diagnose_timeout,
             ignore_cartesian_risk=ignore_cartesian_risk,
+            find_all_paths=find_all_paths,
         )
         return _connect_report_from_tuples(original_row_count, results, filter_results, cartesian_risks)
 
@@ -462,6 +466,7 @@ def diagnose_and_connect(
     timeout: Optional[float] = DEFAULT_CONNECT_TIMEOUT,
     diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
     ignore_cartesian_risk: bool = False,
+    find_all_paths: bool = False,
 ) -> ConnectReport:
     """Diagnoses `query` and searches for a real forward/inverse graph path fixing each culprit
     combination found.
@@ -470,10 +475,13 @@ def diagnose_and_connect(
     every triple in it, re-runs the rest of the query, and resolves each triple's subject/object
     against the resulting rows. For each triple, this gives a bounded breadth-first search over the
     graph's real edges between its bound endpoints, trying both a forward (`<p>`) and inverse
-    (`^<p>`) step at each hop. Different bound pairs can need genuinely different real paths (one
-    entity reached via a 2-hop path, another via an unrelated 1-hop path); rather than picking just
-    one, every distinct path found for that triple is combined into a single SPARQL alternation
-    (`|`) so the fix recovers all of them.
+    (`^<p>`) step at each hop. By default (`find_all_paths=False`), search stops as soon as it finds
+    a connecting path — the shortest one reachable within `max_depth` across all sampled endpoints —
+    rather than searching every sampled endpoint for every distinct path it might individually need.
+    Different bound pairs can genuinely need different real paths, though (one entity reached via a
+    2-hop path, another via an unrelated 1-hop path); pass `find_all_paths=True` to search
+    exhaustively instead, combining every distinct path found for that triple into a single SPARQL
+    alternation (`|`) so the fix recovers all of them, not just the first found.
 
     Sometimes a broken triple's other side isn't bound anywhere else in the query at all (e.g.
     `?sensor` in `building hasSensor ?sensor` if nothing else constrains `?sensor`) — there's no
@@ -543,6 +551,11 @@ def diagnose_and_connect(
     gets stuck — see `diagnose`'s docs for a measured case where an unguarded evaluation of exactly
     this shape ran for over 200 seconds and permanently occupied a worker thread.
 
+    `find_all_paths` controls how many distinct paths are searched for per broken triple; defaults
+    to `False`, meaning search stops at the first (shortest) connecting path found. Pass `True` to
+    search every sampled bound endpoint and keep every distinct path found instead, in case
+    different endpoints genuinely need different ones (see `ConnectedTriple.path_text`'s docs).
+
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
     same graph, build a `Store` once instead and call its `diagnose_and_connect` method.
     """
@@ -556,6 +569,7 @@ def diagnose_and_connect(
         timeout=timeout,
         diagnose_timeout=diagnose_timeout,
         ignore_cartesian_risk=ignore_cartesian_risk,
+        find_all_paths=find_all_paths,
     )
 
 
