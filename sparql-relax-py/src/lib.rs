@@ -3,8 +3,8 @@ use oxigraph::store::Store;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use sparql_relax_core::{
-    NamespaceScope, QueryOutcome, RdfTerm, check_cartesian_risks as core_check_cartesian_risks, diagnose as core_diagnose,
-    diagnose_and_relax as core_relax, pruned_query_text as core_pruned_query_text, query as core_query,
+    FanoutIndex, NamespaceScope, QueryOutcome, RdfTerm, check_cartesian_risks as core_check_cartesian_risks, diagnose as core_diagnose,
+    diagnose_and_relax_with_fanout_index as core_relax, pruned_query_text as core_pruned_query_text, query as core_query,
 };
 use std::fmt::Display;
 use std::time::Duration;
@@ -176,9 +176,18 @@ fn check_cartesian_risks_tuples(
 
 /// Same as [`diagnose_tuples`], but for `diagnose_and_relax` — shared by the
 /// free `diagnose_and_relax` pyfunction and `RdfStore::diagnose_and_relax`.
+///
+/// `fanout_index` is [`FanoutIndex`]'s one-time, whole-graph index of each
+/// predicate's typical fan-out, used by path search to reject a candidate
+/// hop whose specific endpoint is an unusually shared "hub" value for its
+/// predicate (see `sparql-relax-core::fanout`'s module docs). The free
+/// `diagnose_and_relax` pyfunction builds one fresh per call (it already
+/// builds a throwaway `Store` per call too); `RdfStore` builds it once
+/// alongside its `inner` store and reuses it for every call.
 #[allow(clippy::too_many_arguments)]
 fn diagnose_and_relax_tuples(
     store: &Store,
+    fanout_index: &FanoutIndex,
     query: &str,
     ablation_depth: usize,
     max_depth: Option<usize>,
@@ -188,7 +197,7 @@ fn diagnose_and_relax_tuples(
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
 ) -> Result<RelaxTuples, sparql_relax_core::RelaxError> {
-    let report = core_relax(query, store, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout)?;
+    let report = core_relax(query, store, fanout_index, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout)?;
     let results = report
         .results
         .into_iter()
@@ -472,7 +481,19 @@ mod _sparql_relax {
         // (e.g. removing a triple leaves the rest of the query essentially
         // unconstrained).
         py.detach(|| {
-            diagnose_and_relax_tuples(&store, query, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout)
+            let fanout_index = FanoutIndex::build(&store);
+            diagnose_and_relax_tuples(
+                &store,
+                &fanout_index,
+                query,
+                ablation_depth,
+                max_depth,
+                sample_limit,
+                result_limit,
+                scope,
+                timeout,
+                diagnose_timeout,
+            )
         })
         .map_err(to_py_err)
     }
@@ -489,9 +510,15 @@ mod _sparql_relax {
     /// call its methods instead; they carry the same `depth`/`timeout`/etc.
     /// parameters as their free-function counterparts, just without
     /// `data`/`format`, which were already fixed when the `Store` was built.
+    ///
+    /// Also builds its `FanoutIndex` (see `sparql-relax-core::fanout`) once
+    /// here, for the same reason: it's a one-time, whole-graph scan, and
+    /// `diagnose_and_relax`'s path search reuses it on every call rather
+    /// than re-scanning the graph per query.
     #[pyclass(name = "Store")]
     struct RdfStore {
         inner: Store,
+        fanout_index: FanoutIndex,
     }
 
     #[pymethods]
@@ -499,7 +526,9 @@ mod _sparql_relax {
         #[new]
         #[pyo3(signature = (data, format="turtle"))]
         fn new(data: &str, format: &str) -> PyResult<Self> {
-            Ok(Self { inner: load_store(data, format)? })
+            let inner = load_store(data, format)?;
+            let fanout_index = FanoutIndex::build(&inner);
+            Ok(Self { inner, fanout_index })
         }
 
         #[pyo3(signature = (query, depth=3, timeout=default_ablation_timeout()))]
@@ -532,6 +561,7 @@ mod _sparql_relax {
             py.detach(|| {
                 diagnose_and_relax_tuples(
                     &self.inner,
+                    &self.fanout_index,
                     query,
                     ablation_depth,
                     max_depth,

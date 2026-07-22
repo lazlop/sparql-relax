@@ -101,6 +101,18 @@ pub const DEFAULT_ABLATION_DEPTH: usize = 3;
 /// (see the `timeout` docs on [`diagnose`]).
 pub const DEFAULT_ABLATION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `rdf:type`'s IRI — checked against every candidate triple's predicate to
+/// prioritize the combination search below. Measured across this tool's
+/// building-automation eval set, roughly two-thirds of confirmed culprits
+/// involve at least one `rdf:type` triple (a variable typed as the wrong
+/// class), so combinations that include one are worth checking first.
+const RDF_TYPE_IRI: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// Whether `triple`'s predicate is `rdf:type` — see [`RDF_TYPE_IRI`].
+fn is_rdf_type_triple(triple: &TriplePattern) -> bool {
+    matches!(&triple.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == RDF_TYPE_IRI)
+}
+
 /// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`]
 /// and [`DEFAULT_ABLATION_TIMEOUT`]. A convenient default for callers who
 /// don't need to tune the search.
@@ -119,6 +131,16 @@ pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
 /// query (there may be more than one such combination; all are returned),
 /// or once the combination size would exceed the number of candidate
 /// triples. `depth = 1` reproduces single-triple-only diagnosis.
+///
+/// Within one combination size, combinations touching an `rdf:type` triple
+/// are checked in a first wave, ahead of every other combination of that
+/// size (see [`RDF_TYPE_IRI`]) — a real fix involving a mistyped variable is
+/// common enough in practice that finding one there skips checking the rest
+/// of that size's (usually much larger) combination space entirely. If the
+/// type-wave comes up empty, every remaining combination of that size is
+/// still checked, so this only ever prunes work on the already-successful
+/// path, never coverage on an unsuccessful one — the "all are returned"
+/// guarantee above holds within whichever wave actually finds something.
 ///
 /// `timeout` bounds every SPARQL query this call runs — the original query
 /// itself, each candidate combination's ablation check, and each filter's
@@ -207,20 +229,36 @@ pub(crate) fn diagnose_parsed(
         // `store` (Oxigraph stores support concurrent reads), so check them
         // all in parallel rather than one at a time — C(n, k) grows fast
         // once a query has more than a handful of candidate triples.
-        let verdicts: Vec<(Vec<TriplePattern>, ComboVerdict)> = combinations(&triple_candidates, k)
-            .into_par_iter()
-            .map(|combo| {
-                let verdict = classify_combo(query, pattern, &combo, store, original_rows.is_empty(), &guard, false);
-                (combo, verdict)
-            })
-            .collect();
-
+        //
+        // Split into two waves rather than one combined parallel batch: the
+        // type-wave (see [`is_rdf_type_triple`]) is checked first, and if it
+        // already unblocks the query, the rest-wave is never dispatched at
+        // all. Doing this as two sequential (each internally parallel)
+        // batches, instead of just sorting one combined batch, is what
+        // actually saves the work — a combined batch would still run every
+        // combination via `into_par_iter().collect()` before anything
+        // downstream could look at the results.
         let mut found = Vec::new();
-        for (triples, verdict) in verdicts {
-            match verdict {
-                ComboVerdict::Culprit => found.push(Culprit { triples, depth: k }),
-                ComboVerdict::CartesianRisk => cartesian_risks.push(CartesianRiskCombo { triples, depth: k }),
-                ComboVerdict::NotCulprit => {}
+        let (type_combos, rest_combos): (Vec<_>, Vec<_>) =
+            combinations(&triple_candidates, k).into_iter().partition(|combo| combo.iter().any(is_rdf_type_triple));
+        for wave in [type_combos, rest_combos] {
+            if wave.is_empty() || !found.is_empty() {
+                continue;
+            }
+            let verdicts: Vec<(Vec<TriplePattern>, ComboVerdict)> = wave
+                .into_par_iter()
+                .map(|combo| {
+                    let verdict = classify_combo(query, pattern, &combo, store, original_rows.is_empty(), &guard, false);
+                    (combo, verdict)
+                })
+                .collect();
+
+            for (triples, verdict) in verdicts {
+                match verdict {
+                    ComboVerdict::Culprit => found.push(Culprit { triples, depth: k }),
+                    ComboVerdict::CartesianRisk => cartesian_risks.push(CartesianRiskCombo { triples, depth: k }),
+                    ComboVerdict::NotCulprit => {}
+                }
             }
         }
 

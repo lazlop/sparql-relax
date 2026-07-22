@@ -71,11 +71,11 @@ fn find_path_respects_a_past_deadline_even_when_a_real_path_exists() {
     let start = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#building223").unwrap());
     let goal = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#sensor1").unwrap());
 
-    let found = sparql_relax_core::bfs::find_path(&store, &start, &goal, 2, None, None);
+    let found = sparql_relax_core::bfs::find_path(&store, &start, &goal, 2, None, None, None);
     assert!(found.is_some(), "sanity check: the real hasPart/hasSensor path should be found with no deadline");
 
     let past_deadline = Instant::now() - Duration::from_secs(1);
-    let cut_off = sparql_relax_core::bfs::find_path(&store, &start, &goal, 2, None, Some(past_deadline));
+    let cut_off = sparql_relax_core::bfs::find_path(&store, &start, &goal, 2, None, None, Some(past_deadline));
     assert!(cut_off.is_none(), "a deadline already in the past should stop the search before it finds the path");
 }
 
@@ -98,8 +98,54 @@ fn find_path_still_works_through_a_high_fan_out_hub_node() {
     let start = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#hub").unwrap());
     let goal = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#target").unwrap());
 
-    let found = sparql_relax_core::bfs::find_path(&store, &start, &goal, 1, None, None);
+    let found = sparql_relax_core::bfs::find_path(&store, &start, &goal, 1, None, None, None);
     assert_eq!(found, Some(vec![Hop::Forward(oxigraph::model::NamedNode::new("urn:example#hasPart").unwrap())]));
+}
+
+#[test]
+fn fanout_index_rejects_a_hop_through_a_shared_hub_value_but_not_a_normal_one() {
+    // Ten entities share one generic tag (`commonTag`) -- a "hub" value in
+    // exactly the shape that produced this tool's worst measured
+    // regressions (two unrelated entities "connected" only because they
+    // happen to share a common tag/quantity-kind/etc.). Seven other
+    // entities each have their own distinct tag, so `hasTag` has something
+    // to be typically-used-like: every *other* tag value has exactly one
+    // subject, which is what makes `commonTag`'s ten subjects an outlier
+    // relative to `hasTag`'s own usage, not some fixed number picked in
+    // isolation.
+    let store = Store::new().unwrap();
+    let mut ttl = String::from("@prefix ex: <urn:example#> .\n");
+    for i in 1..=10 {
+        ttl.push_str(&format!("ex:a{i} ex:hasTag ex:commonTag .\n"));
+    }
+    for i in 1..=7 {
+        ttl.push_str(&format!("ex:b{i} ex:hasTag ex:uniqueTag{i} .\n"));
+    }
+    ttl.push_str("ex:c1 ex:hasPart ex:c2 .\nex:c2 ex:hasPart ex:c3 .\n");
+    store.load_from_slice(RdfParser::from_format(RdfFormat::Turtle), &ttl).unwrap();
+    let index = sparql_relax_core::FanoutIndex::build(&store);
+
+    let a1 = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#a1").unwrap());
+    let a2 = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#a2").unwrap());
+
+    // Without the index: a1 and a2 are connected via hasTag/^hasTag through
+    // the shared commonTag value -- a real, if spurious, 2-hop path.
+    let unfiltered = sparql_relax_core::bfs::find_path(&store, &a1, &a2, 2, None, None, None);
+    assert!(unfiltered.is_some(), "sanity check: the hasTag/^hasTag route through the shared tag should exist without filtering");
+
+    // With the index: commonTag's fan-out (10 subjects) is far above
+    // hasTag's own 75th-percentile usage elsewhere in the graph (every
+    // other tag has exactly 1 subject), so the inverse hop off it should be
+    // excluded, leaving a1 and a2 with no path at all.
+    let filtered = sparql_relax_core::bfs::find_path(&store, &a1, &a2, 2, None, Some(&index), None);
+    assert!(filtered.is_none(), "the hop through the shared hub value should be rejected, leaving a1 and a2 unconnected");
+
+    // A genuinely structural, low-fan-out relation (hasPart, used 1-to-1
+    // throughout this graph) should be unaffected by the same filter.
+    let c1 = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#c1").unwrap());
+    let c3 = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#c3").unwrap());
+    let structural = sparql_relax_core::bfs::find_path(&store, &c1, &c3, 2, None, Some(&index), None);
+    assert!(structural.is_some(), "a normal, low-fan-out 2-hop relation should still be found with the filter enabled");
 }
 
 #[test]
@@ -967,4 +1013,50 @@ fn an_optional_only_shared_variable_does_not_mask_a_cartesian_risk_in_the_requir
     // (`?widget a Widget`) leaves a connected required pattern ({T1, T2}
     // share `?sensor`), so that's the one combo actually evaluated.
     assert_eq!(diagnosis.cartesian_risks.len(), 3, "every ablation candidate except removing the ?widget triple should disconnect the required pattern");
+}
+
+#[test]
+fn an_rdf_type_culprit_short_circuits_before_the_rest_of_its_depth_is_ever_checked() {
+    // `?s1 a ex:WrongType` never holds anywhere in the store, and shares no
+    // variable with anything else in the query — so it's its own isolated
+    // component, and removing it alone (an `rdf:type` combo) leaves the
+    // remaining sensor/zone/widget chain connected and satisfiable: a
+    // genuine, safely-confirmed depth-1 culprit. Every *other* single-triple
+    // combo, though, would strand `?s1 a ex:WrongType` as a disconnected
+    // component if it were ever checked (removing e.g. `hasSensor` leaves
+    // `{?s1 a ex:WrongType}` isolated from `{hasZone, hasWidget}`) — a
+    // cartesian risk, not a culprit. If the `rdf:type` combo is checked
+    // first and confirmed, none of those other combos should ever be
+    // dispatched at all, so no cartesian risk should be reported for them.
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:building ex:hasSensor ex:sensor1 .
+                ex:sensor1 ex:hasZone ex:zone1 .
+                ex:zone1 ex:hasWidget ex:widget1 .
+            "#,
+        )
+        .unwrap();
+
+    let query = r#"
+        PREFIX ex: <urn:example#>
+        SELECT ?sensor ?zone WHERE {
+            ?s1 a ex:WrongType .
+            ex:building ex:hasSensor ?sensor .
+            ?sensor ex:hasZone ?zone .
+            ?zone ex:hasWidget ex:widget1 .
+        }
+    "#;
+    let diagnosis = diagnose(query, &store, 1, None).unwrap();
+
+    assert_eq!(diagnosis.original_row_count, 0);
+    assert_eq!(diagnosis.culprits.len(), 1, "the rdf:type triple alone should be confirmed as the culprit");
+    assert!(diagnosis.culprits[0].triples[0].to_string().contains("WrongType"));
+    assert!(
+        diagnosis.cartesian_risks.is_empty(),
+        "the type-wave already found a culprit, so the other (disconnecting) combos should never have been checked"
+    );
 }

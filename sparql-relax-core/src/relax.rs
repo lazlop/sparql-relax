@@ -56,6 +56,7 @@ use crate::diagnose::{
     run_select_query_with_deadline,
 };
 use crate::error::{RelaxError, Result};
+use crate::fanout::FanoutIndex;
 use oxigraph::model::Term;
 use oxigraph::store::Store;
 use rayon::prelude::*;
@@ -270,9 +271,53 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
 /// abandon a slow call) matters. Independent of `timeout` above: diagnosis
 /// runs once, before any relaxation work starts, so the two phases'
 /// budgets don't interact.
+///
+/// Builds a fresh [`FanoutIndex`] from `store` on every call — see
+/// [`diagnose_and_relax_with_fanout_index`], which this delegates to, for
+/// what that's for. Fine for a one-off query; a caller relaxing many
+/// queries against the same `store` should build the index once with
+/// [`FanoutIndex::build`] and call [`diagnose_and_relax_with_fanout_index`]
+/// directly instead, the same way a repeated caller should prefer building
+/// one `Store` over passing raw text here repeatedly (see this module's own
+/// docs and `sparql-relax-py`'s `Store` docstring).
 pub fn diagnose_and_relax(
     query_text: &str,
     store: &Store,
+    ablation_depth: usize,
+    max_depth: Option<usize>,
+    sample_limit: Option<usize>,
+    result_limit: Option<usize>,
+    namespace_scope: NamespaceScope,
+    timeout: Option<Duration>,
+    diagnose_timeout: Option<Duration>,
+) -> Result<RelaxReport> {
+    let fanout_index = FanoutIndex::build(store);
+    diagnose_and_relax_with_fanout_index(
+        query_text,
+        store,
+        &fanout_index,
+        ablation_depth,
+        max_depth,
+        sample_limit,
+        result_limit,
+        namespace_scope,
+        timeout,
+        diagnose_timeout,
+    )
+}
+
+/// Same as [`diagnose_and_relax`], but takes an already-built
+/// [`FanoutIndex`] instead of building one fresh — for a caller (like
+/// `sparql-relax-py`'s `Store`) that relaxes many queries against the same
+/// `store` and wants to build the index once, up front, rather than
+/// re-scanning the whole graph on every call. The index only matters for
+/// path search's candidate filtering (see [`crate::bfs::find_path`] and
+/// [`crate::fanout`]'s module docs); it plays no role in diagnosis itself.
+#[allow(clippy::too_many_arguments)]
+pub fn diagnose_and_relax_with_fanout_index(
+    query_text: &str,
+    store: &Store,
+    fanout_index: &FanoutIndex,
     ablation_depth: usize,
     max_depth: Option<usize>,
     sample_limit: Option<usize>,
@@ -295,7 +340,9 @@ pub fn diagnose_and_relax(
     let results = diagnosis
         .culprits
         .par_iter()
-        .map(|culprit| relax_combo(&query, &pattern, culprit, store, max_depth, sample_limit, result_limit, allowed_namespaces, timeout))
+        .map(|culprit| {
+            relax_combo(&query, &pattern, culprit, store, max_depth, sample_limit, result_limit, allowed_namespaces, fanout_index, timeout)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     let filter_results = diagnosis
@@ -408,21 +455,26 @@ fn bind_endpoints(
 /// Candidate hop sequences (subject → object) for one bound endpoint pair.
 /// `max_depth_override` of `None` picks [`DEFAULT_PAIR_SEARCH_DEPTH`];
 /// `Some(n)` uses `n` instead. `allowed_namespaces` restricts which
-/// predicates the search may traverse (see [`NamespaceScope`]). `deadline`
-/// bounds the search itself (see the `bfs` module docs on why it's checked
-/// by hand rather than via a `CancellationToken`).
+/// predicates the search may traverse (see [`NamespaceScope`]).
+/// `fanout_index` excludes a candidate hop whose specific endpoint is an
+/// unusually shared "hub" value for its predicate (see [`crate::fanout`]).
+/// `deadline` bounds the search itself (see the `bfs` module docs on why
+/// it's checked by hand rather than via a `CancellationToken`).
+#[allow(clippy::too_many_arguments)]
 fn candidates_for(
     store: &Store,
     endpoint: &BoundEndpoint,
     max_depth_override: Option<usize>,
     allowed_namespaces: Option<&[String]>,
+    fanout_index: &FanoutIndex,
     deadline: Option<Instant>,
 ) -> Vec<Vec<Hop>> {
     let (s, o) = endpoint;
     let depth = max_depth_override.unwrap_or(DEFAULT_PAIR_SEARCH_DEPTH);
-    find_path(store, s, o, depth, allowed_namespaces, deadline).into_iter().collect()
+    find_path(store, s, o, depth, allowed_namespaces, Some(fanout_index), deadline).into_iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn relax_combo(
     query: &Query,
     pattern: &GraphPattern,
@@ -432,6 +484,7 @@ fn relax_combo(
     sample_limit: Option<usize>,
     result_limit: Option<usize>,
     allowed_namespaces: Option<&[String]>,
+    fanout_index: &FanoutIndex,
     timeout: Option<Duration>,
 ) -> Result<RelaxedCulprit> {
     // One budget for all of this combination's query work — resolving
@@ -473,7 +526,7 @@ fn relax_combo(
                 if candidates.iter().any(|hops| path_holds(store, s, o, hops)) {
                     continue;
                 }
-                for hops in candidates_for(store, endpoint, max_depth, allowed_namespaces, deadline) {
+                for hops in candidates_for(store, endpoint, max_depth, allowed_namespaces, fanout_index, deadline) {
                     if !hops.is_empty() && !candidates.contains(&hops) {
                         candidates.push(hops);
                     }
