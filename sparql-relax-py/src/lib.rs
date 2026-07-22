@@ -185,9 +185,22 @@ fn diagnose_and_connect_tuples(
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
+    find_all_paths: bool,
 ) -> Result<ConnectTuples, sparql_relax_core::RelaxError> {
-    let report =
-        core_connect(query, store, fanout_index, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout, ignore_cartesian_risk)?;
+    let report = core_connect(
+        query,
+        store,
+        fanout_index,
+        ablation_depth,
+        max_depth,
+        sample_limit,
+        result_limit,
+        scope,
+        timeout,
+        diagnose_timeout,
+        ignore_cartesian_risk,
+        find_all_paths,
+    )?;
     let results = report
         .results
         .into_iter()
@@ -280,17 +293,23 @@ mod _sparql_relax {
     /// `ignore_cartesian_risk` disables that guard entirely: every
     /// combination is actually evaluated against `data`, so a combination
     /// that would otherwise have been skipped can be confirmed a genuine
-    /// culprit instead. Defaults to `False`, preserving the guard. Passing
-    /// `True` means opting out of the protection it applies — a
-    /// disconnected BGP can make the query engine materialize a full N×M
-    /// cross product before yielding a single row, regardless of `timeout`
-    /// — a measured case elsewhere in this project sat for over 200 seconds
-    /// and permanently occupied a shared worker thread until the whole
-    /// process was killed (see `eval/run_eval.py`'s process-level watchdog
-    /// for why that backstop lives at the process level, not inside this
-    /// call). Only set this once you've independently judged the risk worth
-    /// taking for this specific query/graph, ideally from a process you can
-    /// afford to kill outright if a check gets stuck.
+    /// culprit instead. Defaults to `True` — opting out of the protection
+    /// the guard applies by default, since a disconnected BGP can make the
+    /// query engine materialize a full N×M cross product before yielding a
+    /// single row, regardless of `timeout` (a measured case elsewhere in
+    /// this project sat for over 200 seconds and permanently occupied a
+    /// shared worker thread until the whole process was killed — see
+    /// `eval/run_eval.py`'s process-level watchdog for why that backstop
+    /// lives at the process level, not inside this call), is a deliberate
+    /// default rather than a blind one: measured against this project's own
+    /// building-automation eval set, always evaluating recovers a genuine
+    /// culprit on ~12% of the rows the guarded search alone couldn't
+    /// explain (a ~14% relative increase in average value-set F1
+    /// dataset-wide), at the cost of a handful of extra hard-timeout
+    /// watchdog kills (up to ~1% of rows) — a trade worth taking for a
+    /// caller that already has, or can afford to add, a process-level
+    /// backstop for a wedged worker thread. Pass `False` to restore the
+    /// guard for a caller that can't tolerate that risk.
     ///
     /// Runs `query` (any SPARQL query form — `SELECT`, `ASK`, `CONSTRUCT`,
     /// `DESCRIBE`) against the RDF graph in `data` (parsed as `format`) and
@@ -363,7 +382,7 @@ mod _sparql_relax {
     /// one query against the same graph, build a `Store` once instead and
     /// call its `diagnose` method, which reuses it.
     #[pyfunction]
-    #[pyo3(signature = (data, query, format="turtle", depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=false))]
+    #[pyo3(signature = (data, query, format="turtle", depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true))]
     fn diagnose(
         py: Python<'_>,
         data: &str,
@@ -400,13 +419,22 @@ mod _sparql_relax {
     ///
     /// Different sampled bound pairs for the same triple can need genuinely
     /// different real paths (e.g. one entity reached via a 2-hop path,
-    /// another via an unrelated 1-hop path); rather than picking just one,
-    /// every distinct path found for that triple is combined into a single
-    /// SPARQL alternation (`|`) so the fix recovers all of them.
+    /// another via an unrelated 1-hop path). By default (`find_all_paths=False`),
+    /// path search stops as soon as it finds a connecting path — the
+    /// shortest one reachable within `max_depth` across all sampled
+    /// endpoints — rather than searching every sampled endpoint for every
+    /// distinct path it might individually need. Pass `find_all_paths=True`
+    /// to search exhaustively instead: every distinct path found for that
+    /// triple is then combined into a single SPARQL alternation (`|`) so the
+    /// fix recovers all of them, not just the first found.
+    ///
     /// `sample_limit` controls how many bound pairs are considered per
-    /// triple (default 5 — a representative sample rather than every row) —
-    /// pass `None` to consider every distinct pair instead of stopping
-    /// early.
+    /// triple (default 500 — a cartesian-risk combination evaluated with
+    /// `ignore_cartesian_risk` cross-joins its endpoints, and the reduced
+    /// query's row order tends to exhaust one side's matches before moving
+    /// to the next, so a small sample can miss the pairing that actually
+    /// connects) — pass `None` to consider every distinct pair instead of
+    /// stopping early.
     ///
     /// `max_depth` bounds the forward/inverse path search itself. Left as
     /// `None` (the default), it uses depth 2. A triple whose other side
@@ -447,17 +475,23 @@ mod _sparql_relax {
     /// guard for this call: a combination that would otherwise be reported
     /// as a `cartesian_risks` entry and never connected is instead actually
     /// evaluated against `data`, and connected like any other culprit if
-    /// confirmed. Defaults to `False`, preserving the guard. Passing `True`
-    /// means opting out of the protection that guard applies — a
-    /// disconnected BGP can make the query engine materialize a full N×M
-    /// cross product before yielding a single row, regardless of `timeout` —
-    /// a measured case elsewhere in this project sat for over 200 seconds
-    /// and permanently occupied a shared worker thread until the whole
-    /// process was killed (see `eval/run_eval.py`'s process-level watchdog
-    /// for why that backstop lives at the process level, not inside this
-    /// call). Only set this once you've independently judged the risk worth
-    /// taking for this specific query/graph, ideally from a process you can
-    /// afford to kill outright if a check gets stuck.
+    /// confirmed. Defaults to `True` — opting out of the protection that
+    /// guard applies by default, since a disconnected BGP can make the query
+    /// engine materialize a full N×M cross product before yielding a single
+    /// row, regardless of `timeout` (a measured case elsewhere in this
+    /// project sat for over 200 seconds and permanently occupied a shared
+    /// worker thread until the whole process was killed — see
+    /// `eval/run_eval.py`'s process-level watchdog for why that backstop
+    /// lives at the process level, not inside this call), is deliberate
+    /// rather than blind: measured against this project's own
+    /// building-automation eval set, always evaluating recovers a genuine
+    /// culprit on ~12% of the rows the guarded search alone couldn't
+    /// explain (a ~14% relative increase in average value-set F1
+    /// dataset-wide), at the cost of a handful of extra hard-timeout
+    /// watchdog kills (up to ~1% of rows) — a trade worth taking for a
+    /// caller that already has, or can afford to add, a process-level
+    /// backstop for a wedged worker thread. Pass `False` to restore the
+    /// guard for a caller that can't tolerate that risk.
     ///
     /// Returns `(original_row_count, results, filter_results,
     /// cartesian_risks)`. Each result is `(found_at_depth, triples,
@@ -485,9 +519,9 @@ mod _sparql_relax {
     /// call its `diagnose_and_connect` method, which reuses it.
     #[pyfunction]
     #[pyo3(signature = (
-        data, query, format="turtle", ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
+        data, query, format="turtle", ablation_depth=3, max_depth=None, sample_limit=500, result_limit=50_000,
         allowed_namespaces=default_connect_namespaces(), timeout=default_connect_timeout(),
-        diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
+        diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=true, find_all_paths=false
     ))]
     #[allow(clippy::too_many_arguments)]
     fn diagnose_and_connect(
@@ -503,6 +537,7 @@ mod _sparql_relax {
         timeout: Option<f64>,
         diagnose_timeout: Option<f64>,
         ignore_cartesian_risk: bool,
+        find_all_paths: bool,
     ) -> PyResult<ConnectTuples> {
         let store = load_store(data, format)?;
         let scope = namespace_scope(allowed_namespaces);
@@ -527,6 +562,7 @@ mod _sparql_relax {
                 timeout,
                 diagnose_timeout,
                 ignore_cartesian_risk,
+                find_all_paths,
             )
         })
         .map_err(to_py_err)
@@ -565,7 +601,7 @@ mod _sparql_relax {
             Ok(Self { inner, fanout_index })
         }
 
-        #[pyo3(signature = (query, depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=false))]
+        #[pyo3(signature = (query, depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true))]
         fn diagnose(
             &self,
             py: Python<'_>,
@@ -579,9 +615,9 @@ mod _sparql_relax {
         }
 
         #[pyo3(signature = (
-            query, ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
+            query, ablation_depth=3, max_depth=None, sample_limit=500, result_limit=50_000,
             allowed_namespaces=default_connect_namespaces(), timeout=default_connect_timeout(),
-            diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
+            diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=true, find_all_paths=false
         ))]
         #[allow(clippy::too_many_arguments)]
         fn diagnose_and_connect(
@@ -596,6 +632,7 @@ mod _sparql_relax {
             timeout: Option<f64>,
             diagnose_timeout: Option<f64>,
             ignore_cartesian_risk: bool,
+            find_all_paths: bool,
         ) -> PyResult<ConnectTuples> {
             let scope = namespace_scope(allowed_namespaces);
             let timeout = parse_timeout_seconds(timeout)?;
@@ -613,6 +650,7 @@ mod _sparql_relax {
                     timeout,
                     diagnose_timeout,
                     ignore_cartesian_risk,
+                    find_all_paths,
                 )
             })
             .map_err(to_py_err)

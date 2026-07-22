@@ -300,7 +300,7 @@ def list_datasets() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_risk: bool = False) -> dict[str, Any]:
+def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_risk: bool = True) -> dict[str, Any]:
     """Run a SPARQL SELECT query against `dataset` and diagnose it. ALWAYS call this before
     `query` -- even when you expect the query to succeed.
 
@@ -323,12 +323,13 @@ def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_r
     those namespaces won't be found, though the diagnosis of *which* triple is broken
     is unaffected.
 
-    Some triple combinations are skipped rather than checked at all, because checking them would
-    force the query engine to materialize a full N x M cross product before yielding a single row
-    -- see `cartesian_risks_skipped` in the result. These are the plausible reason no culprit was
-    isolated, not proof one way or the other. Pass `ignore_cartesian_risk=True` to force those
-    combinations to actually be checked instead; only do this if the query is small enough that a
-    stuck evaluation is an acceptable risk, since nothing can force a stuck check to give up early.
+    Some triple combinations would force the query engine to materialize a full N x M cross
+    product before yielding a single row if checked -- by default (`ignore_cartesian_risk=True`)
+    they're checked anyway, since nothing can force a stuck check to give up early and this is
+    usually worth the (small, measured) risk to actually isolate the culprit rather than miss it.
+    Pass `ignore_cartesian_risk=False` to skip those combinations instead (reported separately in
+    `cartesian_risks_skipped`, not proof either way) if the query is large/untrusted enough that a
+    stuck evaluation isn't an acceptable risk here.
     """
     _require_dataset(dataset)  # fail fast with a clear error before involving the watchdog worker at all
     worker = _get_diagnose_worker()
@@ -389,8 +390,9 @@ def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_r
         message = (
             "Query returned 0 rows and no broken triple/filter could be isolated, but "
             f"{len(cartesian_risks_skipped)} combination(s) were skipped rather than checked (see "
-            "`cartesian_risks_skipped`) -- the real culprit may be among them. Call again with "
-            "`ignore_cartesian_risk=true` to force those combinations to actually be checked."
+            "`cartesian_risks_skipped`) because `ignore_cartesian_risk=false` was passed -- the real "
+            "culprit may be among them. Call again without `ignore_cartesian_risk=false` (it defaults "
+            "to `true`) to force those combinations to actually be checked."
         )
     else:
         message = (

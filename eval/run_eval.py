@@ -542,7 +542,15 @@ def _diagnose_only_row(
     cartesian_risk_culprit_triples = ""
     candidates: list = []
     try:
-        diagnosis = connect_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
+        # ignore_cartesian_risk=False explicitly: sparql_relax.diagnose()'s
+        # own default flipped to True (always evaluate), but this specific
+        # two-tier retry needs its first pass to actually be the *safe* one
+        # -- relying on the library default here would make it identical to
+        # the unguarded retry below, silently turning that retry into a
+        # no-op duplicate rather than the "only pay for the risk once the
+        # safe search has nothing left to offer" escalation this function
+        # exists to do.
+        diagnosis = connect_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout, ignore_cartesian_risk=False)
         num_culprits = len(diagnosis.culprits)
         num_filter_culprits = len(diagnosis.filter_culprits)
         num_cartesian_risks = len(diagnosis.cartesian_risks)

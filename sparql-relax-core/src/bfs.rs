@@ -73,7 +73,37 @@ pub fn find_path(
     fanout_index: Option<&FanoutIndex>,
     deadline: Option<Instant>,
 ) -> Option<Vec<Hop>> {
-    if start == goal {
+    find_path_to_any(store, start, &HashSet::from([goal.clone()]), max_depth, allowed_namespaces, fanout_index, deadline)
+}
+
+/// Same search as [`find_path`], but against a whole set of acceptable
+/// goals at once rather than a single one — one BFS expansion out of
+/// `start` serves every goal in `goals` simultaneously, rather than paying
+/// to re-fetch and re-filter `start`'s own edges once per goal the way a
+/// loop of separate [`find_path`] calls (one per goal) would. Returns the
+/// hop sequence to whichever goal is reached first (ties broken by
+/// [`neighbors`]' iteration order — no particular goal is preferred over
+/// another), or `None` under the same conditions as [`find_path`] (nothing
+/// in `goals` reachable within `max_depth` hops, or `deadline` passed
+/// first).
+///
+/// Built for [`crate::connect::search_candidates_grouped`]: a cartesian-risk
+/// combination's bound endpoints are arbitrary cross-joined pairs, and
+/// grouping them by subject — searching each sampled subject against
+/// *every* object it was paired with, in one call — is both the fix for
+/// that (a subject's real match can't be missed just because a flat sample
+/// happened to truncate before reaching it) and cheaper than the
+/// equivalent loop of single-goal searches.
+pub fn find_path_to_any(
+    store: &Store,
+    start: &Term,
+    goals: &HashSet<Term>,
+    max_depth: usize,
+    allowed_namespaces: Option<&[String]>,
+    fanout_index: Option<&FanoutIndex>,
+    deadline: Option<Instant>,
+) -> Option<Vec<Hop>> {
+    if goals.contains(start) {
         return Some(Vec::new());
     }
 
@@ -100,7 +130,7 @@ pub fn find_path(
                         return None;
                     }
                 }
-                if &neighbor == goal {
+                if goals.contains(&neighbor) {
                     let mut full = path.clone();
                     full.push(hop);
                     return Some(full);

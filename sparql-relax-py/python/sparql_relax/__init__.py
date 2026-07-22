@@ -137,8 +137,10 @@ class ConnectedTriple:
 
     triple: str
     path_text: Optional[str]
-    """The discovered path(s) rendered as a SPARQL property path, e.g. `<p1>/<p2>` or
-    `(<p1>/<p2>)|<p3>` when more than one distinct connecting path was found. `None` if no path
+    """The discovered path(s) rendered as a SPARQL property path, e.g. `<p1>/<p2>`. By default
+    (`find_all_paths=False` on `diagnose_and_connect`) this is the single shortest connecting path
+    found; with `find_all_paths=True` it can instead be an alternation like `(<p1>/<p2>)|<p3>` when
+    more than one distinct connecting path was found across sampled endpoints. `None` if no path
     was found within `max_depth` hops."""
 
 
@@ -338,7 +340,7 @@ class Store:
         query: str,
         depth: int = 3,
         timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
-        ignore_cartesian_risk: bool = False,
+        ignore_cartesian_risk: bool = True,
     ) -> Diagnosis:
         """See the module-level `diagnose` for what this does and what its parameters control."""
         original_row_count, culprits, filter_culprits, cartesian_risks = self._store.diagnose(
@@ -351,12 +353,13 @@ class Store:
         query: str,
         ablation_depth: int = 3,
         max_depth: Optional[int] = None,
-        sample_limit: Optional[int] = 5,
+        sample_limit: Optional[int] = 500,
         result_limit: Optional[int] = 50_000,
         allowed_namespaces: Optional[Sequence[str]] = DEFAULT_CONNECT_NAMESPACES,
         timeout: Optional[float] = DEFAULT_CONNECT_TIMEOUT,
         diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
-        ignore_cartesian_risk: bool = False,
+        ignore_cartesian_risk: bool = True,
+        find_all_paths: bool = False,
     ) -> ConnectReport:
         """See the module-level `diagnose_and_connect` for what this does and what its parameters
         control."""
@@ -370,6 +373,7 @@ class Store:
             timeout=timeout,
             diagnose_timeout=diagnose_timeout,
             ignore_cartesian_risk=ignore_cartesian_risk,
+            find_all_paths=find_all_paths,
         )
         return _connect_report_from_tuples(original_row_count, results, filter_results, cartesian_risks)
 
@@ -387,7 +391,7 @@ def diagnose(
     format: str = "turtle",
     depth: int = 3,
     timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
-    ignore_cartesian_risk: bool = False,
+    ignore_cartesian_risk: bool = True,
 ) -> Diagnosis:
     """Diagnoses which BGP triple(s)/FILTER(s) in `query` are likely broken against `data`.
 
@@ -435,14 +439,18 @@ def diagnose(
     `ignore_cartesian_risk` disables that guard entirely: every combination is actually evaluated
     against `data`, so `Diagnosis.cartesian_risks` always comes back empty, and a combination that
     would otherwise have been skipped can be confirmed a genuine `Culprit` instead. Defaults to
-    `False`, preserving the guard. Passing `True` means opting out of the protection it applies — a
-    disconnected BGP can make the query engine materialize a full N×M cross product before
-    yielding a single row, regardless of `timeout` — a measured case elsewhere in this project sat
-    for over 200 seconds and permanently occupied a shared worker thread until the whole process
-    was killed (see `eval/run_eval.py`'s process-level watchdog for why that backstop lives at the
-    process level, not inside this call). Only set this once you've independently judged the risk
-    worth taking for this specific query/graph, ideally from a process you can afford to kill
-    outright if a check gets stuck.
+    `True` — opting out of the protection the guard applies by default, since a disconnected BGP
+    can make the query engine materialize a full N×M cross product before yielding a single row,
+    regardless of `timeout` (a measured case elsewhere in this project sat for over 200 seconds and
+    permanently occupied a shared worker thread until the whole process was killed — see
+    `eval/run_eval.py`'s process-level watchdog for why that backstop lives at the process level,
+    not inside this call), is a deliberate default rather than a blind one: measured against this
+    project's own building-automation eval set, always evaluating recovers a genuine culprit on
+    ~12% of the rows the guarded search alone couldn't explain (a ~14% relative increase in average
+    value-set F1 dataset-wide), at the cost of a handful of extra hard-timeout watchdog kills (up
+    to ~1% of rows) — a trade worth taking for a caller that already has, or can afford to add, a
+    process-level backstop for a wedged worker thread. Pass `False` to restore the guard for a
+    caller that can't tolerate that risk.
 
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
     same graph, build a `Store` once instead and call its `diagnose` method.
@@ -456,12 +464,13 @@ def diagnose_and_connect(
     format: str = "turtle",
     ablation_depth: int = 3,
     max_depth: Optional[int] = None,
-    sample_limit: Optional[int] = 5,
+    sample_limit: Optional[int] = 500,
     result_limit: Optional[int] = 50_000,
     allowed_namespaces: Optional[Sequence[str]] = DEFAULT_CONNECT_NAMESPACES,
     timeout: Optional[float] = DEFAULT_CONNECT_TIMEOUT,
     diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
-    ignore_cartesian_risk: bool = False,
+    ignore_cartesian_risk: bool = True,
+    find_all_paths: bool = False,
 ) -> ConnectReport:
     """Diagnoses `query` and searches for a real forward/inverse graph path fixing each culprit
     combination found.
@@ -470,10 +479,13 @@ def diagnose_and_connect(
     every triple in it, re-runs the rest of the query, and resolves each triple's subject/object
     against the resulting rows. For each triple, this gives a bounded breadth-first search over the
     graph's real edges between its bound endpoints, trying both a forward (`<p>`) and inverse
-    (`^<p>`) step at each hop. Different bound pairs can need genuinely different real paths (one
-    entity reached via a 2-hop path, another via an unrelated 1-hop path); rather than picking just
-    one, every distinct path found for that triple is combined into a single SPARQL alternation
-    (`|`) so the fix recovers all of them.
+    (`^<p>`) step at each hop. By default (`find_all_paths=False`), search stops as soon as it finds
+    a connecting path — the shortest one reachable within `max_depth` across all sampled endpoints —
+    rather than searching every sampled endpoint for every distinct path it might individually need.
+    Different bound pairs can genuinely need different real paths, though (one entity reached via a
+    2-hop path, another via an unrelated 1-hop path); pass `find_all_paths=True` to search
+    exhaustively instead, combining every distinct path found for that triple into a single SPARQL
+    alternation (`|`) so the fix recovers all of them, not just the first found.
 
     Sometimes a broken triple's other side isn't bound anywhere else in the query at all (e.g.
     `?sensor` in `building hasSensor ?sensor` if nothing else constrains `?sensor`) — there's no
@@ -498,10 +510,13 @@ def diagnose_and_connect(
 
     `max_depth` bounds the path search itself; defaults to 2 (`None`).
 
-    `sample_limit` caps how many distinct bound pairs are considered per triple; defaults to 5 (a
-    representative sample rather than every row). Pass `None` to consider every distinct pair
-    instead of stopping early (only worth doing for small graphs/result sets, since it means
-    examining every row the reduced query returns).
+    `sample_limit` caps how many distinct bound pairs are considered per triple; defaults to 500.
+    A cartesian-risk combination evaluated with `ignore_cartesian_risk` cross-joins its bound
+    endpoints, and the reduced query's row order tends to exhaust every match for one side before
+    advancing to the next, so a small sample can land entirely on mismatched pairings and never
+    reach the one that actually connects. Pass `None` to consider every distinct pair instead of
+    stopping early (only worth doing for small graphs/result sets, since it means examining every
+    row the reduced query returns).
 
     `result_limit` caps how many rows a connected query's `LIMIT` allows; defaults to 50,000, since a
     connected path (especially an alternation of several distinct paths) can match far more broadly
@@ -532,13 +547,19 @@ def diagnose_and_connect(
     culprit combination whose reduced pattern (with it removed) is disconnected is normally never
     evaluated at all — it's reported in `cartesian_risks` and never connected (see `diagnose`'s docs
     on why: a disconnected BGP can make the query engine materialize a full N×M cross product
-    before yielding a single row, regardless of `timeout`). Passing `True` means every combination
-    is actually evaluated instead, and one confirmed a genuine culprit gets a real connection
-    attempt like any other, so `cartesian_risks` always comes back empty. Defaults to `False`,
-    preserving the guard. Only set this once you've independently judged the risk worth taking for
-    this specific query/graph, ideally from a process you can afford to kill outright if a check
-    gets stuck — see `diagnose`'s docs for a measured case where an unguarded evaluation of exactly
-    this shape ran for over 200 seconds and permanently occupied a worker thread.
+    before yielding a single row, regardless of `timeout`). Defaults to `True`: every combination is
+    actually evaluated, and one confirmed a genuine culprit gets a real connection attempt like any
+    other, so `cartesian_risks` always comes back empty by default. That default is deliberate, not
+    blind — see `diagnose`'s docs for the measured tradeoff that justifies it (a real fix recovered
+    on ~12% of otherwise-unexplained rows, at the cost of a handful of extra watchdog kills) and for
+    a measured case where an unguarded evaluation of exactly this shape ran for over 200 seconds and
+    permanently occupied a worker thread. Pass `False` to restore the guard for a caller that can't
+    tolerate that risk.
+
+    `find_all_paths` controls how many distinct paths are searched for per broken triple; defaults
+    to `False`, meaning search stops at the first (shortest) connecting path found. Pass `True` to
+    search every sampled bound endpoint and keep every distinct path found instead, in case
+    different endpoints genuinely need different ones (see `ConnectedTriple.path_text`'s docs).
 
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
     same graph, build a `Store` once instead and call its `diagnose_and_connect` method.
@@ -553,6 +574,7 @@ def diagnose_and_connect(
         timeout=timeout,
         diagnose_timeout=diagnose_timeout,
         ignore_cartesian_risk=ignore_cartesian_risk,
+        find_all_paths=find_all_paths,
     )
 
 
