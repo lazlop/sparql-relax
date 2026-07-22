@@ -101,6 +101,23 @@ pub const DEFAULT_ABLATION_DEPTH: usize = 3;
 /// (see the `timeout` docs on [`diagnose`]).
 pub const DEFAULT_ABLATION_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Default for `ignore_cartesian_risk`: `true`, meaning a combination whose
+/// reduced pattern is disconnected is actually evaluated rather than
+/// skipped and reported as a [`CartesianRiskCombo`] — see the full tradeoff
+/// on [`diagnose`]'s `ignore_cartesian_risk` docs. Measured against this
+/// project's own building-automation eval set (`eval/run_eval.py`), always
+/// evaluating recovers a genuine culprit on ~12% of the rows the guarded
+/// search alone couldn't explain (a ~14% relative increase in average
+/// value-set F1 dataset-wide), at the cost of a handful of extra
+/// hard-timeout watchdog kills (up to ~1% of rows) — a trade worth taking
+/// by default for a caller that already has (or can afford to add) a
+/// process-level backstop for a wedged worker thread, which is the common
+/// case for anything beyond a one-off interactive query. Pass `false` to
+/// restore the guard for a caller that can't tolerate that risk (no
+/// watchdog of its own, or graphs/queries where a stuck disconnected join
+/// is unacceptable).
+pub const DEFAULT_IGNORE_CARTESIAN_RISK: bool = true;
+
 /// `rdf:type`'s IRI — checked against every candidate triple's predicate to
 /// prioritize the combination search below. Measured across this tool's
 /// building-automation eval set, roughly two-thirds of confirmed culprits
@@ -113,12 +130,12 @@ fn is_rdf_type_triple(triple: &TriplePattern) -> bool {
     matches!(&triple.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == RDF_TYPE_IRI)
 }
 
-/// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`]
-/// and [`DEFAULT_ABLATION_TIMEOUT`], with the cartesian-risk guard left on
-/// (see `ignore_cartesian_risk` on [`diagnose`]). A convenient default for
+/// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`],
+/// [`DEFAULT_ABLATION_TIMEOUT`], and [`DEFAULT_IGNORE_CARTESIAN_RISK`] (see
+/// `ignore_cartesian_risk` on [`diagnose`]). A convenient default for
 /// callers who don't need to tune the search.
 pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
-    diagnose(query_text, store, DEFAULT_ABLATION_DEPTH, Some(DEFAULT_ABLATION_TIMEOUT), false)
+    diagnose(query_text, store, DEFAULT_ABLATION_DEPTH, Some(DEFAULT_ABLATION_TIMEOUT), DEFAULT_IGNORE_CARTESIAN_RISK)
 }
 
 /// Diagnoses `query_text` against `store`. Only `SELECT` queries are
@@ -168,18 +185,20 @@ pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
 /// `ignore_cartesian_risk` disables that guard entirely: every combination
 /// is actually evaluated against `store`, so [`Diagnosis::cartesian_risks`]
 /// always comes back empty, and a combination that would otherwise have
-/// been skipped can be confirmed a genuine [`Culprit`] instead. `false` (the
-/// default via [`diagnose_default`]) preserves the guard. Passing `true`
-/// means opting out of the protection it applies: a disconnected BGP can
+/// been skipped can be confirmed a genuine [`Culprit`] instead. `true` (see
+/// [`DEFAULT_IGNORE_CARTESIAN_RISK`], the default via [`diagnose_default`])
+/// opts out of the protection the guard applies: a disconnected BGP can
 /// make the query engine materialize a full N×M cross product before
 /// yielding a single row, regardless of how tightly `timeout` is set — a
 /// measured case elsewhere in this project sat for over 200 seconds and
 /// permanently occupied a shared worker thread until the whole process was
 /// killed (see `eval/run_eval.py`'s process-level watchdog for why that
-/// backstop lives at the process level, not inside this call). Only set
-/// this once you've independently judged the risk worth taking for this
-/// specific query/graph, ideally from a process you can afford to kill
-/// outright if a check gets stuck.
+/// backstop lives at the process level, not inside this call). That's a
+/// deliberate default, not a blind one — see
+/// [`DEFAULT_IGNORE_CARTESIAN_RISK`]'s docs for the measured tradeoff that
+/// justifies it. Pass `false` to restore the guard for a caller that can't
+/// tolerate the risk (no watchdog of its own to kill and restart a wedged
+/// worker).
 pub fn diagnose(query_text: &str, store: &Store, depth: usize, timeout: Option<Duration>, ignore_cartesian_risk: bool) -> Result<Diagnosis> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;

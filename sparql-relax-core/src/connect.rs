@@ -52,8 +52,8 @@ use crate::algebra::{
 };
 use crate::bfs::{Hop, find_path, find_path_to_any, path_holds, path_to_property_path};
 use crate::diagnose::{
-    CartesianRiskCombo, Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, diagnose_parsed, ensure_select, resolve_term_pattern,
-    run_select_query_with_deadline,
+    CartesianRiskCombo, Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, DEFAULT_IGNORE_CARTESIAN_RISK, diagnose_parsed,
+    ensure_select, resolve_term_pattern, run_select_query_with_deadline,
 };
 use crate::error::{RelaxError, Result};
 use crate::fanout::FanoutIndex;
@@ -244,10 +244,12 @@ pub struct ConnectReport {
 /// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`],
 /// [`DEFAULT_SAMPLE_LIMIT`], [`DEFAULT_PAIR_SEARCH_DEPTH`],
 /// [`NamespaceScope::default`] (restricted to [`DEFAULT_CONNECT_NAMESPACES`]),
-/// [`DEFAULT_CONNECT_TIMEOUT`], and
+/// [`DEFAULT_CONNECT_TIMEOUT`],
 /// [`DEFAULT_ABLATION_TIMEOUT`](crate::diagnose::DEFAULT_ABLATION_TIMEOUT),
-/// and attempts to connect each broken culprit combination found. A
-/// convenient default for callers who don't need to tune the search.
+/// [`DEFAULT_IGNORE_CARTESIAN_RISK`](crate::diagnose::DEFAULT_IGNORE_CARTESIAN_RISK),
+/// and [`DEFAULT_FIND_ALL_PATHS`], and attempts to connect each broken
+/// culprit combination found. A convenient default for callers who don't
+/// need to tune the search.
 pub fn diagnose_and_connect_default(query_text: &str, store: &Store) -> Result<ConnectReport> {
     diagnose_and_connect(
         query_text,
@@ -259,7 +261,7 @@ pub fn diagnose_and_connect_default(query_text: &str, store: &Store) -> Result<C
         NamespaceScope::default(),
         Some(DEFAULT_CONNECT_TIMEOUT),
         Some(DEFAULT_ABLATION_TIMEOUT),
-        false,
+        DEFAULT_IGNORE_CARTESIAN_RISK,
         DEFAULT_FIND_ALL_PATHS,
     )
 }
@@ -312,18 +314,19 @@ pub fn diagnose_and_connect_default(query_text: &str, store: &Store) -> Result<C
 /// disconnected is actually evaluated against `store` instead of being
 /// skipped and reported as a [`crate::diagnose::CartesianRiskCombo`], and if
 /// confirmed genuine, connection attempts to fix it exactly like any other
-/// culprit. `false` (the default via [`diagnose_and_connect_default`])
-/// preserves the guard, same as a plain [`crate::diagnose::diagnose`] call.
-/// Passing `true` means opting out of the protection that guard applies: a
-/// disconnected BGP can make the query engine materialize a full N×M cross
-/// product before yielding a single row, regardless of how tightly `timeout`
-/// is set — a measured case elsewhere in this project sat for over 200
-/// seconds and permanently occupied a shared worker thread until the whole
-/// process was killed (see `eval/run_eval.py`'s process-level watchdog for
-/// why that backstop lives at the process level, not inside this call).
-/// Only set this once you've independently judged the risk worth taking for
-/// this specific query/graph, ideally from a process you can afford to kill
-/// outright if a check gets stuck.
+/// culprit. `true` (see [`crate::diagnose::DEFAULT_IGNORE_CARTESIAN_RISK`],
+/// the default via [`diagnose_and_connect_default`]) opts out of the
+/// protection the guard applies: a disconnected BGP can make the query
+/// engine materialize a full N×M cross product before yielding a single
+/// row, regardless of how tightly `timeout` is set — a measured case
+/// elsewhere in this project sat for over 200 seconds and permanently
+/// occupied a shared worker thread until the whole process was killed (see
+/// `eval/run_eval.py`'s process-level watchdog for why that backstop lives
+/// at the process level, not inside this call). That's a deliberate
+/// default, not a blind one — see `DEFAULT_IGNORE_CARTESIAN_RISK`'s docs
+/// for the measured tradeoff that justifies it. Pass `false` to restore the
+/// guard for a caller that can't tolerate the risk (no watchdog of its own
+/// to kill and restart a wedged worker).
 ///
 /// `find_all_paths` controls how many distinct paths are searched for per
 /// broken triple — see [`DEFAULT_FIND_ALL_PATHS`] and
