@@ -1,7 +1,7 @@
 //! Direct execution of an arbitrary SPARQL query (any form — `SELECT`,
 //! `ASK`, `CONSTRUCT`, `DESCRIBE`).
 //!
-//! [`crate::diagnose`] and [`crate::relax`] exist to explain and fix a query
+//! [`crate::diagnose`] and [`crate::connect`] exist to explain and fix a query
 //! that returns nothing (or wrongly); this module is the ordinary case of
 //! running one that already works and wanting its actual results. It has no
 //! knowledge of ablation or path search — just parse, run, convert.

@@ -6,12 +6,12 @@ store. Based on the ideas in `sparql_prune.py`/`sparql_relax.py`, but:
 - **Diagnosis** is ablation-style (like `sparql_prune`): for each BGP triple with a concrete
   predicate, remove it, re-run the rest of the query, and check whether the triple's predicate
   actually holds for any of the resulting bindings. If not, that triple is flagged as the culprit.
-- **Relaxation** (experimental) searches the graph's *actual* edges: a bounded breadth-first
+- **Connection** (experimental) searches the graph's *actual* edges: a bounded breadth-first
   search from the culprit's bound endpoints, trying both a forward (`<p>`) and inverse (`^<p>`)
   step at each hop, to find a real connecting path — rather than substituting predicates from a
   fixed/frequent candidate list. The discovered path is spliced into the query as a SPARQL
-  property path and the fix is verified by re-running the modified query. Treat a `relaxed_query`
-  as a candidate to review, not a guaranteed correct fix — `diagnose` alone (no relaxation) is the
+  property path and the fix is verified by re-running the modified query. Treat a `connected_query`
+  as a candidate to review, not a guaranteed correct fix — `diagnose` alone (no connection) is the
   more reliable, battle-tested part of this library.
 
 The query is rewritten as a typed algebra tree (via `spargebra`, the same parser Oxigraph itself
@@ -22,7 +22,7 @@ uses) and re-serialized to text, rather than via regex text substitution.
 For a detailed walkthrough, see the [tutorial.ipynb](../tutorial.ipynb).
 
 ```python
-from sparql_relax import diagnose, diagnose_and_relax
+from sparql_relax import diagnose, diagnose_and_connect
 
 data = open("model.ttl").read()
 query = """
@@ -37,14 +37,14 @@ diagnosis = diagnose(data, query)
 for culprit in diagnosis.culprits:
     print("broken triple:", culprit.triple)
 
-report = diagnose_and_relax(data, query)
+report = diagnose_and_connect(data, query)
 for result in report.results:
     if result.fixed:
         print(result.triple, "->", result.path_text)
-        print(result.relaxed_query)
+        print(result.connected_query)
 ```
 
-Once a query is confirmed working (`diagnose`/`diagnose_and_relax` report no culprits), fetch its
+Once a query is confirmed working (`diagnose`/`diagnose_and_connect` report no culprits), fetch its
 actual results with `query`, which supports any SPARQL form — `SELECT`, `ASK`, `CONSTRUCT`,
 `DESCRIBE` — rather than the row counts and samples diagnosis reports:
 
@@ -57,7 +57,7 @@ for row in result.bindings:
 ```
 
 For repeated queries against the same graph, build a `Store` once and call its `diagnose`/
-`diagnose_and_relax`/`query` methods instead of the module-level functions, which each reparse
+`diagnose_and_connect`/`query` methods instead of the module-level functions, which each reparse
 `data` from scratch on every call.
 
 ## Development

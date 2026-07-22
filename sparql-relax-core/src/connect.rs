@@ -1,4 +1,4 @@
-//! Orchestrates diagnosis and relaxation: for each culprit combination the
+//! Orchestrates diagnosis and connection: for each culprit combination the
 //! ablation diagnosis in [`crate::diagnose`] flags as broken (a single
 //! triple at `ablation_depth` 1, or several triples jointly responsible at
 //! a higher depth), resolves what its variables are actually bound to —
@@ -7,12 +7,12 @@
 //! a real forward/inverse path (via [`crate::bfs`]), splices every triple
 //! that found one into the pattern in its place and simply drops whichever
 //! didn't, and confirms the result by actually re-running the modified
-//! query. A combination only goes unrelaxed (falling back to
-//! [`RelaxedCulprit::pruned_query`]) when *none* of its triples found a
+//! query. A combination only goes unconnected (falling back to
+//! [`ConnectedCulprit::pruned_query`]) when *none* of its triples found a
 //! path — as soon as at least one does, the rest are dropped rather than
-//! left broken, since a partially-relaxed query is still a strictly better
+//! left broken, since a partially-connected query is still a strictly better
 //! candidate than dropping the whole combination, and it's re-verified
-//! against the graph exactly like a fully-relaxed one, so a bad partial fix
+//! against the graph exactly like a fully-connected one, so a bad partial fix
 //! still scores as empty instead of being trusted blindly.
 //!
 //! A broken triple's other side is sometimes not bound anywhere else in the
@@ -29,19 +29,19 @@
 //! predicate falls outside every listed namespace are simply invisible to
 //! the search, even if they'd otherwise connect the two endpoints.
 //!
-//! Relaxing one culprit combination can itself be expensive: resolving
+//! Connecting one culprit combination can itself be expensive: resolving
 //! endpoints or verifying a candidate fix both re-run a SPARQL query that,
 //! with the broken triple(s) out of the way, can turn into a much larger
 //! join than the original ever was, and the path search in between can run
 //! long too on a real graph with a high-fan-out hub node. Each combination
 //! gets its own `timeout` budget covering all three; if it can't finish in
 //! time, that combination falls back to its
-//! [`RelaxedCulprit::pruned_query`] (the broken triple(s) simply dropped,
+//! [`ConnectedCulprit::pruned_query`] (the broken triple(s) simply dropped,
 //! already known cheap and non-empty from diagnosis) rather than hanging or
-//! failing the whole [`diagnose_and_relax`] call over one slow combination.
+//! failing the whole [`diagnose_and_connect`] call over one slow combination.
 //!
 //! Diagnosis has the same kind of internally-enforced budget, independent
-//! of `timeout` above (see `diagnose_timeout` on [`diagnose_and_relax`] and
+//! of `timeout` above (see `diagnose_timeout` on [`diagnose_and_connect`] and
 //! the `timeout` docs on [`crate::diagnose::diagnose`]) — it matters just as
 //! much there: a caller that gives up waiting on a slow diagnosis call (a
 //! Python `future.result(timeout=...)`, say) doesn't make the call actually
@@ -76,24 +76,24 @@ pub const DEFAULT_SAMPLE_LIMIT: usize = 5;
 /// a concrete point-to-point search bounded by its target.
 pub const DEFAULT_PAIR_SEARCH_DEPTH: usize = 2;
 
-/// Default for `result_limit`: a relaxed query (especially one whose paths
+/// Default for `result_limit`: a connected query (especially one whose paths
 /// were combined via `|` alternation) can match far more broadly than the
 /// original, so its row count is capped by default rather than left
 /// unbounded.
 pub const DEFAULT_RESULT_LIMIT: usize = 50_000;
 
-/// Default for `timeout`: the query work needed to relax one culprit
+/// Default for `timeout`: the query work needed to connect one culprit
 /// combination (resolving endpoints, verifying a candidate fix) is normally
 /// well under this; five seconds is enough headroom for that while still
 /// bounding the rare combination whose reduced query turns into a much
 /// larger join than the original.
-pub const DEFAULT_RELAX_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Namespace prefixes [`NamespaceScope::default`] restricts path search to:
 /// the building-automation ontologies (Brick, ASHRAE 223P, RDFS, QUDT) this
 /// tool is normally used against. Ported from the Python implementation's
 /// `_RELAX_NAMESPACES`.
-pub const DEFAULT_RELAX_NAMESPACES: &[&str] = &[
+pub const DEFAULT_CONNECT_NAMESPACES: &[&str] = &[
     "https://brickschema.org/schema/Brick#", // brick:
     "https://brickschema.org/schema/Brick/", // ref: (covers both ref# and bare Brick/)
     "http://data.ashrae.org/standard223#",   // s223:
@@ -117,12 +117,12 @@ pub enum NamespaceScope {
 }
 
 impl Default for NamespaceScope {
-    /// Restricts to [`DEFAULT_RELAX_NAMESPACES`] — the common case for this
+    /// Restricts to [`DEFAULT_CONNECT_NAMESPACES`] — the common case for this
     /// tool's building-automation use case, where a real but out-of-domain
     /// predicate (e.g. an ad hoc `ex:` edge in a hand-authored graph) is
     /// rarely a fix anyone actually wants suggested.
     fn default() -> Self {
-        NamespaceScope::Only(DEFAULT_RELAX_NAMESPACES.iter().map(|ns| ns.to_string()).collect())
+        NamespaceScope::Only(DEFAULT_CONNECT_NAMESPACES.iter().map(|ns| ns.to_string()).collect())
     }
 }
 
@@ -140,9 +140,9 @@ impl NamespaceScope {
 /// runs between.
 type BoundEndpoint = (Term, Term);
 
-/// One triple within a relaxed culprit combination, and what path search
+/// One triple within a connected culprit combination, and what path search
 /// found for it specifically.
-pub struct RelaxedTriple {
+pub struct ConnectedTriple {
     /// The broken triple pattern, as SPARQL text (e.g. `?s <p> ?o`).
     pub triple_text: String,
     /// Every distinct forward/inverse hop sequence found (one per sampled
@@ -158,30 +158,30 @@ pub struct RelaxedTriple {
     pub path_text: Option<String>,
 }
 
-pub struct RelaxedCulprit {
+pub struct ConnectedCulprit {
     /// The ablation combination size at which this culprit was found (see
-    /// `ablation_depth` on [`diagnose_and_relax`]); 1 unless it was only
+    /// `ablation_depth` on [`diagnose_and_connect`]); 1 unless it was only
     /// found jointly responsible alongside other triples.
     pub found_at_depth: usize,
     /// Every triple in the culprit combination, each with its own path
     /// search result, in the same order they appear in the query.
-    pub triples: Vec<RelaxedTriple>,
+    pub triples: Vec<ConnectedTriple>,
     /// The full query with every triple above that found a path replaced by
     /// it, and every triple that didn't simply dropped. `None` only when
     /// *none* of the combination's triples found a path — as soon as one
     /// does, the rest are dropped rather than leaving the whole combination
-    /// unrelaxed.
-    pub relaxed_query: Option<String>,
-    /// Row count of `relaxed_query` when re-executed. Zero if no
-    /// relaxation was built at all, or it still returns nothing.
+    /// unconnected.
+    pub connected_query: Option<String>,
+    /// Row count of `connected_query` when re-executed. Zero if no
+    /// connection was built at all, or it still returns nothing.
     pub row_count: usize,
     /// The original query with every triple in this combination simply
     /// removed — no path substitution, so it isn't a real fix (it silently
-    /// drops a constraint rather than relaxing it) and its rows shouldn't
+    /// drops a constraint rather than connecting it) and its rows shouldn't
     /// be trusted as answers. Always present, and its text alone needs no
     /// store access to build, so it's there even if `timeout` cuts off
     /// everything else for this combination. Useful as a fallback when
-    /// `relaxed_query` is `None` or still returns nothing, so the caller
+    /// `connected_query` is `None` or still returns nothing, so the caller
     /// isn't left with no query at all.
     pub pruned_query: String,
     /// Row count of `pruned_query` when re-executed. Guaranteed non-empty
@@ -193,7 +193,7 @@ pub struct RelaxedCulprit {
     pub pruned_row_count: usize,
 }
 
-/// A `FILTER` flagged by ablation as excluding rows. Reported, not relaxed:
+/// A `FILTER` flagged by ablation as excluding rows. Reported, not connected:
 /// there's no graph-path search that applies to an arbitrary expression.
 pub struct FilterReport {
     /// The filter expression, as SPARQL text (e.g. `?o > 5`).
@@ -202,9 +202,9 @@ pub struct FilterReport {
     pub row_count_without_filter: usize,
 }
 
-pub struct RelaxReport {
+pub struct ConnectReport {
     pub original_row_count: usize,
-    pub results: Vec<RelaxedCulprit>,
+    pub results: Vec<ConnectedCulprit>,
     pub filter_results: Vec<FilterReport>,
     /// Combinations diagnosis flagged as cartesian risks — skipped entirely
     /// (never evaluated, and so never attempted here) because their reduced
@@ -218,13 +218,13 @@ pub struct RelaxReport {
 
 /// Diagnoses `query_text` against `store` with [`DEFAULT_ABLATION_DEPTH`],
 /// [`DEFAULT_SAMPLE_LIMIT`], [`DEFAULT_PAIR_SEARCH_DEPTH`],
-/// [`NamespaceScope::default`] (restricted to [`DEFAULT_RELAX_NAMESPACES`]),
-/// [`DEFAULT_RELAX_TIMEOUT`], and
+/// [`NamespaceScope::default`] (restricted to [`DEFAULT_CONNECT_NAMESPACES`]),
+/// [`DEFAULT_CONNECT_TIMEOUT`], and
 /// [`DEFAULT_ABLATION_TIMEOUT`](crate::diagnose::DEFAULT_ABLATION_TIMEOUT),
-/// and attempts to relax each broken culprit combination found. A
+/// and attempts to connect each broken culprit combination found. A
 /// convenient default for callers who don't need to tune the search.
-pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<RelaxReport> {
-    diagnose_and_relax(
+pub fn diagnose_and_connect_default(query_text: &str, store: &Store) -> Result<ConnectReport> {
+    diagnose_and_connect(
         query_text,
         store,
         DEFAULT_ABLATION_DEPTH,
@@ -232,13 +232,13 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
         Some(DEFAULT_SAMPLE_LIMIT),
         Some(DEFAULT_RESULT_LIMIT),
         NamespaceScope::default(),
-        Some(DEFAULT_RELAX_TIMEOUT),
+        Some(DEFAULT_CONNECT_TIMEOUT),
         Some(DEFAULT_ABLATION_TIMEOUT),
         false,
     )
 }
 
-/// Diagnoses `query_text` against `store` and attempts to relax each broken
+/// Diagnoses `query_text` against `store` and attempts to connect each broken
 /// culprit combination found.
 ///
 /// `ablation_depth` is passed through to [`crate::diagnose::diagnose`]:
@@ -247,17 +247,17 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
 /// three, and so on up to `ablation_depth`.
 ///
 /// `max_depth` bounds the forward/inverse graph-path search itself. `None`
-/// (the default, see [`diagnose_and_relax_default`]) uses
+/// (the default, see [`diagnose_and_connect_default`]) uses
 /// [`DEFAULT_PAIR_SEARCH_DEPTH`]; passing `Some(n)` overrides it.
 ///
 /// `sample_limit` caps how many of a culprit's bound endpoints are searched
 /// for a path, or `None` to search every distinct endpoint found. Filters
-/// flagged by diagnosis are reported as-is, with no relaxation attempted.
+/// flagged by diagnosis are reported as-is, with no connection attempted.
 ///
-/// `result_limit` caps how many rows a relaxed query's `LIMIT` allows (only
+/// `result_limit` caps how many rows a connected query's `LIMIT` allows (only
 /// tightening one already present in the original query, never loosening
 /// it); `None` leaves it unbounded. Defaults to [`DEFAULT_RESULT_LIMIT`] via
-/// [`diagnose_and_relax_default`], since a relaxed path (especially an
+/// [`diagnose_and_connect_default`], since a connected path (especially an
 /// alternation of several distinct paths) can match far more broadly than
 /// the original triple did.
 ///
@@ -265,28 +265,28 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
 /// traverse (see [`NamespaceScope`]); pass [`NamespaceScope::Unrestricted`]
 /// to search any real predicate found in the store, with no restriction.
 ///
-/// `timeout` bounds all the work needed to relax *each* culprit combination:
+/// `timeout` bounds all the work needed to connect *each* culprit combination:
 /// resolving endpoints, the path search itself (bounded by hand rather than
 /// via query cancellation — see the `bfs` module docs), and verifying a
 /// candidate fix — not diagnosis, which has its own separate budget (see
 /// `diagnose_timeout`). A combination that can't finish within its budget
-/// falls back to [`RelaxedCulprit::pruned_query`] rather than hanging or
-/// failing the whole call. Defaults to [`DEFAULT_RELAX_TIMEOUT`] via
-/// [`diagnose_and_relax_default`]; pass `None` to leave it unbounded.
+/// falls back to [`ConnectedCulprit::pruned_query`] rather than hanging or
+/// failing the whole call. Defaults to [`DEFAULT_CONNECT_TIMEOUT`] via
+/// [`diagnose_and_connect_default`]; pass `None` to leave it unbounded.
 ///
 /// `diagnose_timeout` is passed straight through to
 /// [`crate::diagnose::diagnose`] — see its docs for what it bounds and why
 /// an internally-enforced timeout (rather than relying on the caller to
 /// abandon a slow call) matters. Independent of `timeout` above: diagnosis
-/// runs once, before any relaxation work starts, so the two phases'
+/// runs once, before any connection work starts, so the two phases'
 /// budgets don't interact.
 ///
 /// `ignore_cartesian_risk` disables diagnosis's [`crate::algebra::has_cartesian_join`]
 /// guard for this call: a culprit combination whose reduced pattern is
 /// disconnected is actually evaluated against `store` instead of being
 /// skipped and reported as a [`crate::diagnose::CartesianRiskCombo`], and if
-/// confirmed genuine, relaxation attempts to fix it exactly like any other
-/// culprit. `false` (the default via [`diagnose_and_relax_default`])
+/// confirmed genuine, connection attempts to fix it exactly like any other
+/// culprit. `false` (the default via [`diagnose_and_connect_default`])
 /// preserves the guard, same as a plain [`crate::diagnose::diagnose`] call.
 /// Passing `true` means opting out of the protection that guard applies: a
 /// disconnected BGP can make the query engine materialize a full N×M cross
@@ -300,15 +300,15 @@ pub fn diagnose_and_relax_default(query_text: &str, store: &Store) -> Result<Rel
 /// outright if a check gets stuck.
 ///
 /// Builds a fresh [`FanoutIndex`] from `store` on every call — see
-/// [`diagnose_and_relax_with_fanout_index`], which this delegates to, for
-/// what that's for. Fine for a one-off query; a caller relaxing many
+/// [`diagnose_and_connect_with_fanout_index`], which this delegates to, for
+/// what that's for. Fine for a one-off query; a caller connecting many
 /// queries against the same `store` should build the index once with
-/// [`FanoutIndex::build`] and call [`diagnose_and_relax_with_fanout_index`]
+/// [`FanoutIndex::build`] and call [`diagnose_and_connect_with_fanout_index`]
 /// directly instead, the same way a repeated caller should prefer building
 /// one `Store` over passing raw text here repeatedly (see this module's own
 /// docs and `sparql-relax-py`'s `Store` docstring).
 #[allow(clippy::too_many_arguments)]
-pub fn diagnose_and_relax(
+pub fn diagnose_and_connect(
     query_text: &str,
     store: &Store,
     ablation_depth: usize,
@@ -319,9 +319,9 @@ pub fn diagnose_and_relax(
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
-) -> Result<RelaxReport> {
+) -> Result<ConnectReport> {
     let fanout_index = FanoutIndex::build(store);
-    diagnose_and_relax_with_fanout_index(
+    diagnose_and_connect_with_fanout_index(
         query_text,
         store,
         &fanout_index,
@@ -336,15 +336,15 @@ pub fn diagnose_and_relax(
     )
 }
 
-/// Same as [`diagnose_and_relax`], but takes an already-built
+/// Same as [`diagnose_and_connect`], but takes an already-built
 /// [`FanoutIndex`] instead of building one fresh — for a caller (like
-/// `sparql-relax-py`'s `Store`) that relaxes many queries against the same
+/// `sparql-relax-py`'s `Store`) that connects many queries against the same
 /// `store` and wants to build the index once, up front, rather than
 /// re-scanning the whole graph on every call. The index only matters for
 /// path search's candidate filtering (see [`crate::bfs::find_path`] and
 /// [`crate::fanout`]'s module docs); it plays no role in diagnosis itself.
 #[allow(clippy::too_many_arguments)]
-pub fn diagnose_and_relax_with_fanout_index(
+pub fn diagnose_and_connect_with_fanout_index(
     query_text: &str,
     store: &Store,
     fanout_index: &FanoutIndex,
@@ -356,23 +356,23 @@ pub fn diagnose_and_relax_with_fanout_index(
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
-) -> Result<RelaxReport> {
+) -> Result<ConnectReport> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
     let diagnosis = diagnose_parsed(&query, &pattern, store, ablation_depth, diagnose_timeout, ignore_cartesian_risk)?;
     let allowed_namespaces = namespace_scope.as_filter();
 
-    // Every culprit combination is relaxed independently against the same
+    // Every culprit combination is connected independently against the same
     // read-only `store`, so search them all in parallel. Each gets its own
-    // fresh `timeout` budget, computed from the moment its own relaxation
+    // fresh `timeout` budget, computed from the moment its own connection
     // work starts rather than shared off one call-wide clock — a slow
     // combination's budget shouldn't eat into a different combination's.
     let results = diagnosis
         .culprits
         .par_iter()
         .map(|culprit| {
-            relax_combo(&query, &pattern, culprit, store, max_depth, sample_limit, result_limit, allowed_namespaces, fanout_index, timeout)
+            connect_combo(&query, &pattern, culprit, store, max_depth, sample_limit, result_limit, allowed_namespaces, fanout_index, timeout)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -385,7 +385,7 @@ pub fn diagnose_and_relax_with_fanout_index(
         })
         .collect();
 
-    Ok(RelaxReport {
+    Ok(ConnectReport {
         original_row_count: diagnosis.original_row_count,
         results,
         filter_results,
@@ -395,7 +395,7 @@ pub fn diagnose_and_relax_with_fanout_index(
 
 /// Every triple in a culprit combination removed together, the endpoints
 /// that resolves for each, and the pruned fallback built from the same
-/// reduced pattern (see [`RelaxedCulprit::pruned_query`]).
+/// reduced pattern (see [`ConnectedCulprit::pruned_query`]).
 struct BoundEndpoints {
     per_triple: Vec<Vec<BoundEndpoint>>,
     pruned_query: String,
@@ -511,7 +511,7 @@ fn candidates_for(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn relax_combo(
+fn connect_combo(
     query: &Query,
     pattern: &GraphPattern,
     culprit: &Culprit,
@@ -522,7 +522,7 @@ fn relax_combo(
     allowed_namespaces: Option<&[String]>,
     fanout_index: &FanoutIndex,
     timeout: Option<Duration>,
-) -> Result<RelaxedCulprit> {
+) -> Result<ConnectedCulprit> {
     // One budget for all of this combination's query work — resolving
     // endpoints and (later) verifying the candidate fix both draw from it,
     // rather than each getting its own fresh `timeout`.
@@ -536,7 +536,7 @@ fn relax_combo(
     // level runs in parallel — each is just reads against the same `store`.
     // Within a single triple's sampled endpoints, the search is sequential
     // instead (see the comment below on why).
-    let per_triple: Vec<(RelaxedTriple, Option<PropertyPathExpression>)> = culprit
+    let per_triple: Vec<(ConnectedTriple, Option<PropertyPathExpression>)> = culprit
         .triples
         .par_iter()
         .zip(bound.per_triple.par_iter())
@@ -571,16 +571,16 @@ fn relax_combo(
             candidates.sort_by_key(Vec::len);
 
             let path_expr = combine_as_alternatives(&candidates);
-            let relaxed_triple = RelaxedTriple {
+            let connected_triple = ConnectedTriple {
                 triple_text: triple.to_string(),
                 hop_alternatives: candidates,
                 path_text: path_expr.as_ref().map(PropertyPathExpression::to_string),
             };
-            (relaxed_triple, path_expr)
+            (connected_triple, path_expr)
         })
         .collect();
 
-    let (relaxed_triples, paths): (Vec<_>, Vec<_>) = per_triple.into_iter().unzip();
+    let (connected_triples, paths): (Vec<_>, Vec<_>) = per_triple.into_iter().unzip();
 
     // Splice in a path for every triple that found one, and simply drop
     // (prune) whichever ones didn't — rather than requiring the whole
@@ -588,73 +588,73 @@ fn relax_combo(
     // A pair where one triple gets a real path substitution and the other
     // just gets dropped is still a strictly better candidate than dropping
     // both, and it's re-verified against the graph below exactly like a
-    // fully-relaxed query is, so a bad partial fix still scores as empty
+    // fully-connected query is, so a bad partial fix still scores as empty
     // rather than being trusted blindly. Only when *none* of the
     // combination's triples found a path is there nothing to splice in, so
     // that case alone falls back to `pruned_query` (identical to it, so
-    // building a redundant `relaxed_query` would add nothing).
+    // building a redundant `connected_query` would add nothing).
     let any_found = paths.iter().any(Option::is_some);
     if !any_found {
-        return Ok(RelaxedCulprit {
+        return Ok(ConnectedCulprit {
             found_at_depth: culprit.depth,
-            triples: relaxed_triples,
-            relaxed_query: None,
+            triples: connected_triples,
+            connected_query: None,
             row_count: 0,
             pruned_query,
             pruned_row_count,
         });
     }
 
-    let mut relaxed_pattern = pattern.clone();
+    let mut connected_pattern = pattern.clone();
     for (triple, path_expr) in culprit.triples.iter().zip(paths.into_iter()) {
         let next = match path_expr {
-            Some(path_expr) => replace_triple_with_path(&relaxed_pattern, triple, path_expr),
-            None => remove_triple(&relaxed_pattern, triple),
+            Some(path_expr) => replace_triple_with_path(&connected_pattern, triple, path_expr),
+            None => remove_triple(&connected_pattern, triple),
         };
         let Some(next) = next else {
-            return Ok(RelaxedCulprit {
+            return Ok(ConnectedCulprit {
                 found_at_depth: culprit.depth,
-                triples: relaxed_triples,
-                relaxed_query: None,
+                triples: connected_triples,
+                connected_query: None,
                 row_count: 0,
                 pruned_query,
                 pruned_row_count,
             });
         };
-        relaxed_pattern = next;
+        connected_pattern = next;
     }
 
     if let Some(limit) = result_limit {
-        relaxed_pattern = with_limit(relaxed_pattern, limit);
+        connected_pattern = with_limit(connected_pattern, limit);
     }
-    let relaxed_query_obj = with_pattern(query, relaxed_pattern);
-    let relaxed_text = relaxed_query_obj.to_string();
+    let connected_query_obj = with_pattern(query, connected_pattern);
+    let connected_text = connected_query_obj.to_string();
 
     // A candidate fix found in time but too expensive to *verify* in what's
     // left of the budget falls back the same way an unfound path does:
-    // `relaxed_query: None`, so the caller looks at `pruned_query` instead
+    // `connected_query: None`, so the caller looks at `pruned_query` instead
     // of trusting an unconfirmed `row_count`.
-    match run_select_query_with_deadline(relaxed_query_obj, store, deadline) {
-        Ok(Some(rows)) => Ok(RelaxedCulprit {
+    match run_select_query_with_deadline(connected_query_obj, store, deadline) {
+        Ok(Some(rows)) => Ok(ConnectedCulprit {
             found_at_depth: culprit.depth,
-            triples: relaxed_triples,
-            relaxed_query: Some(relaxed_text),
+            triples: connected_triples,
+            connected_query: Some(connected_text),
             row_count: rows.len(),
             pruned_query,
             pruned_row_count,
         }),
-        Ok(None) => Ok(RelaxedCulprit {
+        Ok(None) => Ok(ConnectedCulprit {
             found_at_depth: culprit.depth,
-            triples: relaxed_triples,
-            relaxed_query: None,
+            triples: connected_triples,
+            connected_query: None,
             row_count: 0,
             pruned_query,
             pruned_row_count,
         }),
-        Err(_) => Ok(RelaxedCulprit {
+        Err(_) => Ok(ConnectedCulprit {
             found_at_depth: culprit.depth,
-            triples: relaxed_triples,
-            relaxed_query: Some(relaxed_text),
+            triples: connected_triples,
+            connected_query: Some(connected_text),
             row_count: 0,
             pruned_query,
             pruned_row_count,
@@ -663,7 +663,7 @@ fn relax_combo(
 }
 
 /// Folds every candidate hop sequence into one `PropertyPathExpression`,
-/// joined with SPARQL's `|` alternation, so the relaxed query can match
+/// joined with SPARQL's `|` alternation, so the connected query can match
 /// through any of them rather than only the one path search happened to
 /// prefer.
 fn combine_as_alternatives(candidates: &[Vec<Hop>]) -> Option<PropertyPathExpression> {

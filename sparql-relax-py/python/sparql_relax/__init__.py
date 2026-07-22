@@ -6,12 +6,12 @@ against a given RDF graph (ablation-style, like `sparql_prune.py`), then
 searches for a real forward/inverse path over the graph's actual edges to
 fix each broken triple (replacing the frequency-based predicate-path search
 in `sparql_relax.py` with an actual BFS over Oxigraph's triples). Filters are
-only ever reported, never relaxed.
+only ever reported, never connected.
 
 Diagnosis can also look for *combinations* of jointly-broken triples, not
-just single ones: pass `depth > 1` to `diagnose`/`diagnose_and_relax`.
+just single ones: pass `depth > 1` to `diagnose`/`diagnose_and_connect`.
 
-The module-level `diagnose`/`diagnose_and_relax` functions each parse `data`
+The module-level `diagnose`/`diagnose_and_connect` functions each parse `data`
 into a fresh in-memory graph on every call. For more than one query against
 the same graph, build a `Store` once and call its methods instead — see its
 docstring.
@@ -30,47 +30,47 @@ __all__ = [
     "FilterCulprit",
     "CartesianRiskCombo",
     "Diagnosis",
-    "RelaxedTriple",
-    "RelaxedCulprit",
+    "ConnectedTriple",
+    "ConnectedCulprit",
     "FilterReport",
-    "RelaxReport",
+    "ConnectReport",
     "Term",
     "QueryResult",
     "Store",
     "diagnose",
-    "diagnose_and_relax",
+    "diagnose_and_connect",
     "query",
     "pruned_query",
-    "DEFAULT_RELAX_NAMESPACES",
-    "DEFAULT_RELAX_TIMEOUT",
+    "DEFAULT_CONNECT_NAMESPACES",
+    "DEFAULT_CONNECT_TIMEOUT",
     "DEFAULT_ABLATION_TIMEOUT",
     "DEFAULT_QUERY_TIMEOUT",
 ]
 
-DEFAULT_RELAX_NAMESPACES: tuple[str, ...] = (
+DEFAULT_CONNECT_NAMESPACES: tuple[str, ...] = (
     "https://brickschema.org/schema/Brick#",  # brick:
     "https://brickschema.org/schema/Brick/",  # ref: (covers both ref# and bare Brick/)
     "http://data.ashrae.org/standard223#",  # s223:
     "http://www.w3.org/2000/01/rdf-schema#",  # rdfs:
     "http://qudt.org/schema/qudt/",  # qudt:
 )
-"""Namespace prefixes `diagnose_and_relax` restricts path search to by default: the
+"""Namespace prefixes `diagnose_and_connect` restricts path search to by default: the
 building-automation ontologies (Brick, ASHRAE 223P, RDFS, QUDT) this tool is normally used
 against. Pass a different sequence via `allowed_namespaces`, or `None` for no restriction."""
 
-DEFAULT_RELAX_TIMEOUT: float = 5.0
-"""Default `timeout` (seconds) for `diagnose_and_relax`: the SPARQL query work needed to relax
+DEFAULT_CONNECT_TIMEOUT: float = 5.0
+"""Default `timeout` (seconds) for `diagnose_and_connect`: the SPARQL query work needed to connect
 each culprit combination is normally well under this. Pass `None` to leave it unbounded."""
 
 DEFAULT_ABLATION_TIMEOUT: float = 5.0
-"""Default `timeout` for `diagnose`, and default `diagnose_timeout` for `diagnose_and_relax`
+"""Default `timeout` for `diagnose`, and default `diagnose_timeout` for `diagnose_and_connect`
 (seconds): a single ablation check is normally well under this. Pass `None` to leave it unbounded
 — but see `diagnose`'s docs for why an internally-enforced timeout matters even when the caller
 has its own external one."""
 
 DEFAULT_QUERY_TIMEOUT: float = 10.0
 """Default `timeout` for `query` (seconds): more generous than `DEFAULT_ABLATION_TIMEOUT`, since a
-query run through this path is normally one `diagnose`/`diagnose_and_relax` has already confirmed
+query run through this path is normally one `diagnose`/`diagnose_and_connect` has already confirmed
 works, and the caller now wants full results for rather than a cheap yes/no check. Pass `None` to
 leave it unbounded."""
 
@@ -83,7 +83,7 @@ class Culprit:
     Has one triple in `triples` unless a single-triple removal wasn't enough to unblock the query
     and a larger combination (see `depth` on `diagnose`) was needed to find it. This only
     identifies *which* triple(s) are broken — no variable binding is done here (that only happens,
-    for culprits diagnosis already found, in `diagnose_and_relax`), so a plain `diagnose` call
+    for culprits diagnosis already found, in `diagnose_and_connect`), so a plain `diagnose` call
     doesn't pay for resolution work it won't use.
     """
 
@@ -132,8 +132,8 @@ class Diagnosis:
 
 
 @dataclass
-class RelaxedTriple:
-    """One triple within a relaxed culprit combination, and what path search found for it."""
+class ConnectedTriple:
+    """One triple within a connected culprit combination, and what path search found for it."""
 
     triple: str
     path_text: Optional[str]
@@ -143,29 +143,29 @@ class RelaxedTriple:
 
 
 @dataclass
-class RelaxedCulprit:
+class ConnectedCulprit:
     found_at_depth: int
     """The combination size at which this culprit was found (see `Culprit.depth`)."""
 
-    triples: List[RelaxedTriple]
+    triples: List[ConnectedTriple]
     """Every triple in the culprit combination, each with its own path search result."""
 
-    relaxed_query: Optional[str]
+    connected_query: Optional[str]
     """The full query with every triple above that found a path replaced by it, and every triple
     that didn't simply dropped. `None` only when *none* of the combination's triples found a path
     — as soon as one does, the rest are dropped rather than leaving the whole combination
-    unrelaxed."""
+    unconnected."""
 
     row_count: int
-    """Row count of `relaxed_query` when re-executed. Zero if no combined relaxation was built, or
+    """Row count of `connected_query` when re-executed. Zero if no combined connection was built, or
     it still returns nothing."""
 
     pruned_query: str
     """The original query with every triple in this combination simply removed (no path
-    substitution). Not a real fix — it silently drops a constraint rather than relaxing it, so its
+    substitution). Not a real fix — it silently drops a constraint rather than connecting it, so its
     rows shouldn't be trusted as answers — but always present (its text needs no store access to
     build, so it's there even if `timeout` cuts off everything else for this combination), so it's
-    a fallback when `relaxed_query` is `None` or still returns nothing."""
+    a fallback when `connected_query` is `None` or still returns nothing."""
 
     pruned_row_count: int
     """Row count of `pruned_query` when re-executed. Guaranteed non-empty under normal operation —
@@ -175,22 +175,22 @@ class RelaxedCulprit:
 
     @property
     def fixed(self) -> bool:
-        """Whether a relaxed query was found that returns at least one row."""
+        """Whether a connected query was found that returns at least one row."""
         return self.row_count > 0
 
 
 @dataclass
 class FilterReport:
-    """A FILTER flagged by diagnosis, reported as-is (never relaxed)."""
+    """A FILTER flagged by diagnosis, reported as-is (never connected)."""
 
     expression: str
     row_count_without_filter: int
 
 
 @dataclass
-class RelaxReport:
+class ConnectReport:
     original_row_count: int
-    results: List[RelaxedCulprit]
+    results: List[ConnectedCulprit]
     filter_results: List[FilterReport]
     cartesian_risks: List[CartesianRiskCombo]
     """Combinations diagnosis flagged as cartesian risks — skipped entirely (never evaluated, and
@@ -288,19 +288,19 @@ def _diagnosis_from_tuples(original_row_count: int, culprits, filter_culprits, c
     )
 
 
-def _relax_report_from_tuples(original_row_count: int, results, filter_results, cartesian_risks) -> RelaxReport:
-    return RelaxReport(
+def _connect_report_from_tuples(original_row_count: int, results, filter_results, cartesian_risks) -> ConnectReport:
+    return ConnectReport(
         original_row_count=original_row_count,
         results=[
-            RelaxedCulprit(
+            ConnectedCulprit(
                 found_at_depth=found_at_depth,
-                triples=[RelaxedTriple(triple=t, path_text=p) for t, p in triples],
-                relaxed_query=relaxed_query,
+                triples=[ConnectedTriple(triple=t, path_text=p) for t, p in triples],
+                connected_query=connected_query,
                 row_count=row_count,
                 pruned_query=pruned_query,
                 pruned_row_count=pruned_row_count,
             )
-            for found_at_depth, triples, relaxed_query, row_count, pruned_query, pruned_row_count in results
+            for found_at_depth, triples, connected_query, row_count, pruned_query, pruned_row_count in results
         ],
         filter_results=[
             FilterReport(expression=e, row_count_without_filter=n) for e, n in filter_results
@@ -310,10 +310,10 @@ def _relax_report_from_tuples(original_row_count: int, results, filter_results, 
 
 
 class Store:
-    """An RDF graph loaded once and held for repeated `diagnose`/`diagnose_and_relax` calls
+    """An RDF graph loaded once and held for repeated `diagnose`/`diagnose_and_connect` calls
     against it.
 
-    The module-level `diagnose`/`diagnose_and_relax` functions each parse `data` and build a fresh
+    The module-level `diagnose`/`diagnose_and_connect` functions each parse `data` and build a fresh
     in-memory store from scratch on every call — fine for a one-off query, but wasteful for the
     common case of running many queries against the same graph (e.g. evaluating a batch of
     generated queries against one building's data), where that parse-and-index work is identical
@@ -322,7 +322,7 @@ class Store:
     ```python
     store = Store(building_ttl_text)
     for query in generated_queries:
-        report = store.diagnose_and_relax(query)
+        report = store.diagnose_and_connect(query)
     ```
 
     Each method carries the same parameters as its module-level counterpart of the same name,
@@ -346,21 +346,21 @@ class Store:
         )
         return _diagnosis_from_tuples(original_row_count, culprits, filter_culprits, cartesian_risks)
 
-    def diagnose_and_relax(
+    def diagnose_and_connect(
         self,
         query: str,
         ablation_depth: int = 3,
         max_depth: Optional[int] = None,
         sample_limit: Optional[int] = 5,
         result_limit: Optional[int] = 50_000,
-        allowed_namespaces: Optional[Sequence[str]] = DEFAULT_RELAX_NAMESPACES,
-        timeout: Optional[float] = DEFAULT_RELAX_TIMEOUT,
+        allowed_namespaces: Optional[Sequence[str]] = DEFAULT_CONNECT_NAMESPACES,
+        timeout: Optional[float] = DEFAULT_CONNECT_TIMEOUT,
         diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
         ignore_cartesian_risk: bool = False,
-    ) -> RelaxReport:
-        """See the module-level `diagnose_and_relax` for what this does and what its parameters
+    ) -> ConnectReport:
+        """See the module-level `diagnose_and_connect` for what this does and what its parameters
         control."""
-        original_row_count, results, filter_results, cartesian_risks = self._store.diagnose_and_relax(
+        original_row_count, results, filter_results, cartesian_risks = self._store.diagnose_and_connect(
             query,
             ablation_depth=ablation_depth,
             max_depth=max_depth,
@@ -371,7 +371,7 @@ class Store:
             diagnose_timeout=diagnose_timeout,
             ignore_cartesian_risk=ignore_cartesian_risk,
         )
-        return _relax_report_from_tuples(original_row_count, results, filter_results, cartesian_risks)
+        return _connect_report_from_tuples(original_row_count, results, filter_results, cartesian_risks)
 
     def query(
         self, query: str, row_limit: Optional[int] = None, timeout: Optional[float] = DEFAULT_QUERY_TIMEOUT
@@ -408,7 +408,7 @@ def diagnose(
     tried one at a time).
 
     This only identifies *which* triple(s)/filter(s) are broken — it does no variable-binding
-    work, so it's cheap even on large result sets. Use `diagnose_and_relax` to also resolve what a
+    work, so it's cheap even on large result sets. Use `diagnose_and_connect` to also resolve what a
     culprit's variables are bound to and search for a fix.
 
     `timeout` (seconds) bounds every SPARQL query this call runs — the original query itself, and
@@ -450,7 +450,7 @@ def diagnose(
     return Store(data, format).diagnose(query, depth=depth, timeout=timeout, ignore_cartesian_risk=ignore_cartesian_risk)
 
 
-def diagnose_and_relax(
+def diagnose_and_connect(
     data: str,
     query: str,
     format: str = "turtle",
@@ -458,11 +458,11 @@ def diagnose_and_relax(
     max_depth: Optional[int] = None,
     sample_limit: Optional[int] = 5,
     result_limit: Optional[int] = 50_000,
-    allowed_namespaces: Optional[Sequence[str]] = DEFAULT_RELAX_NAMESPACES,
-    timeout: Optional[float] = DEFAULT_RELAX_TIMEOUT,
+    allowed_namespaces: Optional[Sequence[str]] = DEFAULT_CONNECT_NAMESPACES,
+    timeout: Optional[float] = DEFAULT_CONNECT_TIMEOUT,
     diagnose_timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
     ignore_cartesian_risk: bool = False,
-) -> RelaxReport:
+) -> ConnectReport:
     """Diagnoses `query` and searches for a real forward/inverse graph path fixing each culprit
     combination found.
 
@@ -482,15 +482,15 @@ def diagnose_and_relax(
     undirected exploration with nothing to verify a suggestion against except re-running the whole
     query, which isn't worth the cost of searching for.
 
-    A combination is only relaxed as a whole: if any one of its triples has no discoverable path,
-    no combined relaxed query is built (the others being fixable wouldn't help, since they were
+    A combination is only connected as a whole: if any one of its triples has no discoverable path,
+    no combined connected query is built (the others being fixable wouldn't help, since they were
     only broken *together*). Filters flagged by diagnosis are included in `filter_results` as-is;
-    no relaxation is attempted for them.
+    no connection is attempted for them.
 
     Every result also carries `pruned_query`: the original query with every triple in the
     combination simply removed, no path substitution. It isn't a real fix (it silently drops a
-    constraint instead of relaxing it), but it's always present and guaranteed non-empty — useful
-    as a fallback when `relaxed_query` is `None` or still returns nothing, so you're never left with
+    constraint instead of connecting it), but it's always present and guaranteed non-empty — useful
+    as a fallback when `connected_query` is `None` or still returns nothing, so you're never left with
     no query at all.
 
     `ablation_depth` is passed through to `diagnose` to control how many triples may be jointly
@@ -503,37 +503,37 @@ def diagnose_and_relax(
     instead of stopping early (only worth doing for small graphs/result sets, since it means
     examining every row the reduced query returns).
 
-    `result_limit` caps how many rows a relaxed query's `LIMIT` allows; defaults to 50,000, since a
-    relaxed path (especially an alternation of several distinct paths) can match far more broadly
+    `result_limit` caps how many rows a connected query's `LIMIT` allows; defaults to 50,000, since a
+    connected path (especially an alternation of several distinct paths) can match far more broadly
     than the original triple did. Only ever tightens a `LIMIT` already present in the original
     query, never loosens it. Pass `None` to leave it unbounded.
 
     `allowed_namespaces` restricts path search to predicates whose IRI starts with one of these
     prefixes; a real edge outside every listed namespace is invisible to the search even if it
-    would otherwise connect the two endpoints. Defaults to `DEFAULT_RELAX_NAMESPACES` (Brick,
+    would otherwise connect the two endpoints. Defaults to `DEFAULT_CONNECT_NAMESPACES` (Brick,
     ASHRAE 223P, RDFS, QUDT) — the common case for this tool's building-automation use case, where
     a real but out-of-domain predicate is rarely a fix anyone actually wants suggested. Pass `None`
     explicitly for no restriction (any real predicate found in the graph is fair game), or your own
     sequence of namespace prefixes to restrict to something else.
 
-    `timeout` (seconds) bounds all the work needed to relax *each* culprit combination — resolving
+    `timeout` (seconds) bounds all the work needed to connect *each* culprit combination — resolving
     endpoints, the path search itself, and verifying a candidate fix — not diagnosis, which has its
     own separate budget (see `diagnose_timeout`). A combination that can't finish within its budget
     falls back to `pruned_query` rather than hanging or failing the whole call. Defaults to
-    `DEFAULT_RELAX_TIMEOUT` (5 seconds); pass `None` to leave it unbounded.
+    `DEFAULT_CONNECT_TIMEOUT` (5 seconds); pass `None` to leave it unbounded.
 
     `diagnose_timeout` (seconds) is passed straight through to `diagnose`'s own `timeout` — see its
     docs for what it bounds and why an internally-enforced timeout matters even when the caller has
     its own external one. Independent of `timeout` above: diagnosis runs once, before any
-    relaxation work starts, so the two budgets don't interact. Also defaults to
+    connection work starts, so the two budgets don't interact. Also defaults to
     `DEFAULT_ABLATION_TIMEOUT` (5 seconds).
 
     `ignore_cartesian_risk` disables diagnosis's disconnected-pattern guard for this call: a
     culprit combination whose reduced pattern (with it removed) is disconnected is normally never
-    evaluated at all — it's reported in `cartesian_risks` and never relaxed (see `diagnose`'s docs
+    evaluated at all — it's reported in `cartesian_risks` and never connected (see `diagnose`'s docs
     on why: a disconnected BGP can make the query engine materialize a full N×M cross product
     before yielding a single row, regardless of `timeout`). Passing `True` means every combination
-    is actually evaluated instead, and one confirmed a genuine culprit gets a real relaxation
+    is actually evaluated instead, and one confirmed a genuine culprit gets a real connection
     attempt like any other, so `cartesian_risks` always comes back empty. Defaults to `False`,
     preserving the guard. Only set this once you've independently judged the risk worth taking for
     this specific query/graph, ideally from a process you can afford to kill outright if a check
@@ -541,9 +541,9 @@ def diagnose_and_relax(
     this shape ran for over 200 seconds and permanently occupied a worker thread.
 
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
-    same graph, build a `Store` once instead and call its `diagnose_and_relax` method.
+    same graph, build a `Store` once instead and call its `diagnose_and_connect` method.
     """
-    return Store(data, format).diagnose_and_relax(
+    return Store(data, format).diagnose_and_connect(
         query,
         ablation_depth=ablation_depth,
         max_depth=max_depth,
@@ -566,9 +566,9 @@ def query(
     """Runs `query` (any SPARQL query form — SELECT, ASK, CONSTRUCT, DESCRIBE) against the RDF
     graph in `data` and returns its actual results.
 
-    Unlike `diagnose`/`diagnose_and_relax`, which exist to explain and fix a query that returns
+    Unlike `diagnose`/`diagnose_and_connect`, which exist to explain and fix a query that returns
     nothing (or wrongly), this is the ordinary case of running one that already works. The
-    intended workflow is: call `diagnose` (or `diagnose_and_relax`) first — it's cheap even when
+    intended workflow is: call `diagnose` (or `diagnose_and_connect`) first — it's cheap even when
     the query succeeds, and if it doesn't, it tells you exactly which triple or filter is at fault
     instead of just an empty result — then call `query` once you're getting rows back, to fetch
     the full result set rather than diagnosis's row counts and samples.

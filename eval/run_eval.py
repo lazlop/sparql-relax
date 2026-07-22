@@ -2,7 +2,7 @@
 """
 run_eval.py
 
-Evaluates sparql-relax-rs's `diagnose`/`diagnose_and_relax` against the
+Evaluates sparql-relax-rs's `diagnose`/`diagnose_and_connect` against the
 LLM-generated SPARQL queries in Experiment_Results/*.csv that *originally*
 returned zero rows (per that CSV's own `gen_num_rows`/`returns_results`
 columns, recorded when those queries were first generated) — the queries
@@ -29,8 +29,8 @@ For every such row, this:
      result set trivially covers nothing and produces no excess, and its F1
      is 0.0 against any non-empty ground truth (1.0 in the one edge case
      where the ground truth is *also* empty, `calculate_f1`'s convention).
-  4. Runs `diagnose_and_relax` on the generated query (`ablation_depth=3` by
-     default), scores every culprit combination's `relaxed_query` (if one
+  4. Runs `diagnose_and_connect` on the generated query (`ablation_depth=3` by
+     default), scores every culprit combination's `connected_query` (if one
      was built) the same way, and records the best-scoring one as the
      `relax_*` columns.
 
@@ -47,7 +47,7 @@ plain sequential loop, one row at a time, with no query-level concurrency.
 
 It does still run inside a single persistent worker subprocess, though —
 see `RowWorker`/`_worker_loop` below — not for throughput, but because
-`diagnose_and_relax`'s Rust-side `timeout` isn't always enough on its own:
+`diagnose_and_connect`'s Rust-side `timeout` isn't always enough on its own:
 Oxigraph's query engine can go a long time between checking its
 cancellation token (a cartesian-join BGP or a `*`/`+` property path can
 make it materialize a large intermediate result before yielding control
@@ -61,7 +61,7 @@ lifetime, so this costs nothing extra in the common case; only a row that
 actually trips the watchdog pays for a fresh worker (and everything it
 needs to reload).
 
-`sparql_relax.diagnose`/`diagnose_and_relax` each reparse and reindex
+`sparql_relax.diagnose`/`diagnose_and_connect` each reparse and reindex
 their RDF graph from scratch on every call if you pass them raw text — on
 a ~1-2MB building graph, that alone costs roughly as much as the search
 itself. `BuildingCache` below avoids paying that per row: it builds one
@@ -80,7 +80,7 @@ Usage:
   python3 run_eval.py --csv "Experiment_Results/DA-KGQA/o3-mini.csv" \\
       --sample-per-csv 100 --output my_eval.csv
 
-  # Diagnose-only: skip relaxation (path search + candidate scoring)
+  # Diagnose-only: skip connection (path search + candidate scoring)
   # entirely, just report which triples/filters are flagged as culprits.
   # Much cheaper per row than the full pass. By default, once the safe
   # search alone finds nothing, this also tries any combinations diagnose()
@@ -191,11 +191,11 @@ def value_set_f1(query_text: str, gt_values: set, store: pyoxigraph.Store, limit
 
 class BuildingCache:
     """Loads each building's TTL once — as a `pyoxigraph.Store` for fast scoring queries, and a
-    `sparql_relax.Store` for `diagnose`/`diagnose_and_relax` — and reuses both for every row
+    `sparql_relax.Store` for `diagnose`/`diagnose_and_connect` — and reuses both for every row
     referencing that building.
 
     Building the `sparql_relax.Store` here (once) rather than passing raw text to
-    `diagnose`/`diagnose_and_relax` on every row (which would each reparse and reindex the whole
+    `diagnose`/`diagnose_and_connect` on every row (which would each reparse and reindex the whole
     graph from scratch) is the single biggest lever available for a batch like this one, worth far
     more than any of the search-side tuning knobs below: on `b59.ttl` (46k triples, ~1.5MB), a
     throwaway per-call parse costs roughly 100ms *before* any diagnosis work even starts, and this
@@ -205,7 +205,7 @@ class BuildingCache:
     def __init__(self, buildings_dir: Path):
         self.buildings_dir = buildings_dir
         self._stores: dict[str, Optional[pyoxigraph.Store]] = {}
-        self._relax_stores: dict[str, Optional[sparql_relax.Store]] = {}
+        self._connect_stores: dict[str, Optional[sparql_relax.Store]] = {}
 
     def _ensure_loaded(self, building: str) -> None:
         if building not in self._stores:
@@ -216,24 +216,24 @@ class BuildingCache:
         if not path.exists():
             print(f"  warning: building graph not found: {path}", file=sys.stderr, flush=True)
             self._stores[building] = None
-            self._relax_stores[building] = None
+            self._connect_stores[building] = None
             return
         t0 = time.monotonic()
         text = path.read_text()
         store = pyoxigraph.Store()
         store.load(text.encode("utf-8"), format=pyoxigraph.RdfFormat.TURTLE)
-        relax_store = sparql_relax.Store(text)
+        connect_store = sparql_relax.Store(text)
         print(f"  loaded {path.name} ({len(store)} triples) in {round(time.monotonic() - t0, 3)}s", flush=True)
         self._stores[building] = store
-        self._relax_stores[building] = relax_store
+        self._connect_stores[building] = connect_store
 
     def store(self, building: str) -> Optional[pyoxigraph.Store]:
         self._ensure_loaded(building)
         return self._stores[building]
 
-    def relax_store(self, building: str) -> Optional[sparql_relax.Store]:
+    def connect_store(self, building: str) -> Optional[sparql_relax.Store]:
         self._ensure_loaded(building)
-        return self._relax_stores[building]
+        return self._connect_stores[building]
 
 
 # ==============================================================================
@@ -307,7 +307,7 @@ def _int_or_zero(value) -> int:
 
 
 def _blank_relax_fields() -> dict:
-    """Default values for the relax-stage columns when nothing was found (or relaxation wasn't
+    """Default values for the relax-stage columns when nothing was found (or connection wasn't
     attempted at all — see `--diagnose-only`)."""
     return {
         "relax_stmt_index": -1, "relax_stmt_type": "baseline",
@@ -351,8 +351,8 @@ def _is_timeout_message(message: str) -> bool:
 def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig) -> Optional[dict]:
     building = str(row.get("building", ""))
     store = cache.store(building)
-    relax_store = cache.relax_store(building)
-    if store is None or relax_store is None:
+    connect_store = cache.connect_store(building)
+    if store is None or connect_store is None:
         return None
 
     base = _base_fields(row, csv_path)
@@ -390,7 +390,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     }
 
     if cfg.diagnose_only:
-        return _diagnose_only_row(relax_store, gen_query, cfg, common, base["query_id"], building, t_gt, store, gt_values, gt_sets)
+        return _diagnose_only_row(connect_store, gen_query, cfg, common, base["query_id"], building, t_gt, store, gt_values, gt_sets)
 
     if cfg.verbose:
         print(f"  [{base['query_id']}] {building}  diagnose_f1={diagnose_f1:.3f} -> relaxing...", flush=True)
@@ -402,7 +402,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     best_diagnose_culprit = None
     relax_error = ""
 
-    # Relaxation phase. diagnose_and_relax runs diagnosis internally (so
+    # Connection phase. diagnose_and_connect runs diagnosis internally (so
     # there's no separate diagnose() call here) and enforces its own
     # timeout/diagnose_timeout deadlines via a real Rust-side cancellation
     # token — see sparql-relax-core/src/diagnose.rs — so it's called
@@ -413,7 +413,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
     # runs under (see `RowWorker`), not a per-call wrapper here.
     t_relax_start = time.monotonic()
     try:
-        report = relax_store.diagnose_and_relax(
+        report = connect_store.diagnose_and_connect(
             gen_query,
             ablation_depth=cfg.ablation_depth,
             max_depth=cfg.max_depth,
@@ -425,7 +425,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
             # Diagnose's own signal: what removing this culprit combination
             # gets you with no path substitution at all. `pruned_query` is
             # always present whenever diagnose flags a combination as a
-            # genuine culprit (see `RelaxedCulprit.pruned_query`'s docs —
+            # genuine culprit (see `ConnectedCulprit.pruned_query`'s docs —
             # "guaranteed non-empty under normal operation"), so this is
             # scored for every combination diagnose found, independent of
             # whether relax's path search separately confirms a real
@@ -438,8 +438,8 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
                     best_diagnose_f1 = f1
                     best_diagnose_culprit = culprit
             # Relax's own signal: a real, graph-verified path substitution.
-            if culprit.relaxed_query:
-                f1, _ = value_set_f1(culprit.relaxed_query, gt_values, store, cfg.limit)
+            if culprit.connected_query:
+                f1, _ = value_set_f1(culprit.connected_query, gt_values, store, cfg.limit)
                 if f1 > best_f1:
                     best_f1 = f1
                     best = culprit
@@ -469,7 +469,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
             "elapsed_sec": total_elapsed_sec,
         }
 
-    rel_values, rel_rows, rel_cols, rel_sets, _ = _get_full_query_stats(best.relaxed_query, store, cfg.limit)
+    rel_values, rel_rows, rel_cols, rel_sets, _ = _get_full_query_stats(best.connected_query, store, cfg.limit)
     if rel_values is None:
         rel_values, rel_rows, rel_cols, rel_sets = set(), 0, 0, []
     rel_cov, rel_exc = _row_coverage_stats(rel_sets, gt_sets)
@@ -480,7 +480,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
         "relax_stmt_type": "relaxed",
         "relax_stmt_text": " | ".join(t.triple for t in best.triples),
         "relax_removed_statements": str([t.triple for t in best.triples]),
-        "relax_sparql": best.relaxed_query,
+        "relax_sparql": best.connected_query,
         "relax_value_set_f1": round(best_f1, 6),
         "relax_rows_covered": rel_cov,
         "relax_excess_rows": rel_exc,
@@ -492,7 +492,7 @@ def process_row(row: dict, csv_path: str, cache: BuildingCache, cfg: EvalConfig)
 
 
 def _diagnose_only_row(
-    relax_store: sparql_relax.Store,
+    connect_store: sparql_relax.Store,
     gen_query: str,
     cfg: EvalConfig,
     common: dict,
@@ -542,7 +542,7 @@ def _diagnose_only_row(
     cartesian_risk_culprit_triples = ""
     candidates: list = []
     try:
-        diagnosis = relax_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
+        diagnosis = connect_store.diagnose(gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout)
         num_culprits = len(diagnosis.culprits)
         num_filter_culprits = len(diagnosis.filter_culprits)
         num_cartesian_risks = len(diagnosis.cartesian_risks)
@@ -554,7 +554,7 @@ def _diagnose_only_row(
             cartesian_risk_attempted = True
             if cfg.verbose:
                 print(f"    -> safe search empty, retrying with ignore_cartesian_risk ({num_cartesian_risks} combo(s) skipped)...", flush=True)
-            unguarded = relax_store.diagnose(
+            unguarded = connect_store.diagnose(
                 gen_query, depth=cfg.ablation_depth, timeout=cfg.timeout, ignore_cartesian_risk=True
             )
             confirmed = unguarded.culprits
@@ -617,7 +617,7 @@ def _diagnose_only_row(
 #  PROCESS-LEVEL WATCHDOG
 # ==============================================================================
 #
-# diagnose_and_relax's `timeout`/`diagnose_timeout` are real, Rust-side
+# diagnose_and_connect's `timeout`/`diagnose_timeout` are real, Rust-side
 # deadlines (see sparql-relax-core/src/diagnose.rs) — but they only bound the
 # work *if* Oxigraph's query engine actually checks its CancellationToken
 # often enough to notice. In practice it doesn't always: a BGP with
@@ -631,14 +631,14 @@ def _diagnose_only_row(
 # killed by hand, never once returning control to Python.
 #
 # Because that stuck evaluation runs inside `rayon`'s shared global thread
-# pool (every `diagnose_parsed`/`relax_combo` combination is dispatched via
+# pool (every `diagnose_parsed`/`connect_combo` combination is dispatched via
 # `.into_par_iter()`), one such row doesn't just run long — it permanently
 # occupies a worker thread for the rest of the process's life, since nothing
 # on the Python side can force a native thread to stop. Each subsequent row
 # submits more combinations onto that same, increasingly saturated pool, so
 # a single pathological query early in a run degrades every row after it,
 # which is what actually produces the "run_eval hangs" symptom on a long
-# batch even though any individual diagnose_and_relax call is nominally
+# batch even though any individual diagnose_and_connect call is nominally
 # bounded.
 #
 # The raw `pyoxigraph.Store.query()` calls this script makes directly for
@@ -648,7 +648,7 @@ def _diagnose_only_row(
 # to the exact same failure mode with no protection whatsoever.
 #
 # A Python-side `future.result(timeout=...)` around any of this would not
-# help (see the module docstring on `diagnose_and_relax` above): abandoning a
+# help (see the module docstring on `diagnose_and_connect` above): abandoning a
 # thread-based call doesn't stop the underlying native work, which keeps
 # running and keeps holding its rayon thread hostage. Only killing the whole
 # OS process actually reclaims a wedged native thread. So each row here runs
@@ -790,10 +790,10 @@ def main() -> None:
     parser.add_argument("--sample-limit", type=int, default=5, metavar="N")
     parser.add_argument(
         "--diagnose-only", action="store_true",
-        help="Skip relaxation entirely: run diagnose() instead of diagnose_and_relax(), reporting "
+        help="Skip connection entirely: run diagnose() instead of diagnose_and_connect(), reporting "
              "which triples/filters are flagged as culprits with no endpoint resolution, path "
              "search, or candidate scoring. Cheaper per row and useful for iterating on ablation "
-             "diagnosis on its own. --sample-limit and --max-depth (relaxation-only knobs) are "
+             "diagnosis on its own. --sample-limit and --max-depth (connection-only knobs) are "
              "ignored in this mode.",
     )
     parser.add_argument(
@@ -817,7 +817,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--timeout", type=float, default=20.0, metavar="SECONDS",
-        help="Per-row cap on diagnose_and_relax (or diagnose, with --diagnose-only); a handful of "
+        help="Per-row cap on diagnose_and_connect (or diagnose, with --diagnose-only); a handful of "
              "queries need a genuinely expensive reduced-query evaluation that no search-ordering "
              "fix avoids, so this bounds worst-case latency instead of letting one row stall the "
              "whole batch (default: 20s)",

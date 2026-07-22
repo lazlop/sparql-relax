@@ -1,6 +1,6 @@
 """Compares sparql-relax-rs's current-results.csv against previous-results.csv, a prior
 evaluation from BuildingQA's old Python ablation (batch_ablation.py — the pure-Python
-predicate-substitution search sparql-relax-rs's Rust `diagnose_and_relax` replaced).
+predicate-substitution search sparql-relax-rs's Rust `diagnose_and_connect` replaced).
 
 current-results.csv (via run_eval.py) now only covers rows whose *original* generated query
 returned zero results — the population diagnosis exists for. previous-results.csv predates that

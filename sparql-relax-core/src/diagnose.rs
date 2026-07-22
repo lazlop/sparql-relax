@@ -8,7 +8,7 @@
 //! it does no variable binding/resolution beyond the `Yes`/`No` truth check
 //! needed to confirm a combination is a genuine culprit. Resolving what a
 //! culprit's variables are actually bound to (needed to search for a
-//! relaxed path) is [`crate::relax`]'s job, done only for culprits that
+//! connecting path) is [`crate::connect`]'s job, done only for culprits that
 //! diagnosis has already found — so a plain diagnosis-only call never pays
 //! for binding work it won't use.
 //!
@@ -26,7 +26,7 @@
 //! without the extra graph-truth check triples get: there's no way to ask
 //! Oxigraph "does this arbitrary expression hold" short of evaluating SPARQL
 //! expressions ourselves, so a strict row-count increase after removal is
-//! the signal. Filters are only ever reported, never relaxed, and `depth`
+//! the signal. Filters are only ever reported, never connected, and `depth`
 //! does not apply to them (queries rarely have enough interacting filters
 //! for combining removals to matter, unlike triples).
 
@@ -196,18 +196,18 @@ pub(crate) fn ensure_select(query: &Query) -> Result<()> {
 
 /// Same as [`diagnose`], but takes an already-parsed `query`/`pattern`
 /// instead of re-parsing query text itself.
-/// [`crate::relax::diagnose_and_relax`] uses this — rather than calling
+/// [`crate::connect::diagnose_and_connect`] uses this — rather than calling
 /// [`diagnose`] and then separately re-parsing the same text a second time
 /// for its own use — so the culprit triples it gets back are guaranteed to
 /// be the exact same values it can later find and remove from its own copy
 /// of the pattern. Two independent parses of identical text are not
 /// guaranteed to produce identical `TriplePattern` values in every case,
-/// which would otherwise make a culprit "disappear" when relaxation tries
+/// which would otherwise make a culprit "disappear" when connection tries
 /// to remove it.
 ///
 /// `ignore_cartesian_risk` is passed straight through from whichever public
 /// entry point called this — see its docs on [`diagnose`] (and on
-/// [`crate::relax::diagnose_and_relax`], which shares this same guard).
+/// [`crate::connect::diagnose_and_connect`], which shares this same guard).
 pub(crate) fn diagnose_parsed(
     query: &Query,
     pattern: &GraphPattern,
@@ -473,10 +473,10 @@ fn match_triples_by_text(available: &[TriplePattern], texts: &[String]) -> Resul
 /// Used to score what a confirmed culprit combination's removal alone gets
 /// you (e.g. via value-set F1 against ground truth), independent of whether
 /// a real path fix was also found for it — the same "diagnose's own signal"
-/// [`crate::relax::RelaxedCulprit::pruned_query`] already provides for
-/// combinations `diagnose_and_relax` confirms, but usable here for any
+/// [`crate::connect::ConnectedCulprit::pruned_query`] already provides for
+/// combinations `diagnose_and_connect` confirms, but usable here for any
 /// [`Culprit`] a plain [`diagnose`] call confirmed, which never had a
-/// `RelaxedCulprit` (or any query text) built for it at all.
+/// `ConnectedCulprit` (or any query text) built for it at all.
 pub fn pruned_query_text(query_text: &str, triples: &[String]) -> Result<String> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
@@ -664,7 +664,7 @@ fn deadline_token(deadline: Instant) -> Option<CancellationToken> {
 /// instead of treating a slow query as a real error — a single expensive
 /// reduced-query evaluation (e.g. removing a triple leaves the rest of the
 /// query essentially unconstrained, forcing a large join) shouldn't be able
-/// to hang or fail a caller that's relaxing many culprits at once.
+/// to hang or fail a caller that's connecting many culprits at once.
 pub(crate) fn run_select_query_with_deadline(query: Query, store: &Store, deadline: Option<Instant>) -> Result<Option<Vec<QuerySolution>>> {
     run_select_query_with_guard(query, store, &SharedDeadline::new(deadline))
 }

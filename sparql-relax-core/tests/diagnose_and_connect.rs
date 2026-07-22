@@ -2,7 +2,7 @@ use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::store::Store;
 use sparql_relax_core::bfs::Hop;
 use sparql_relax_core::{
-    NamespaceScope, RelaxError, diagnose, diagnose_and_relax, diagnose_and_relax_default, diagnose_default, pruned_query_text,
+    NamespaceScope, RelaxError, diagnose, diagnose_and_connect, diagnose_and_connect_default, diagnose_default, pruned_query_text,
 };
 use std::time::{Duration, Instant};
 
@@ -62,7 +62,7 @@ fn diagnose_errors_with_timeout_when_even_the_original_query_cant_run_in_time() 
 #[test]
 fn find_path_respects_a_past_deadline_even_when_a_real_path_exists() {
     // Isolates the BFS-specific deadline check (as opposed to the SPARQL
-    // query timeouts diagnose_and_relax's own tests exercise): the *only*
+    // query timeouts diagnose_and_connect's own tests exercise): the *only*
     // thing that differs between these two calls is `deadline`, so a
     // real, existing path being missed proves the search itself is what's
     // being cut off, not some unrelated query.
@@ -148,13 +148,13 @@ fn fanout_index_rejects_a_hop_through_a_shared_hub_value_but_not_a_normal_one() 
 }
 
 #[test]
-fn diagnose_and_relax_propagates_a_timeout_error_when_diagnose_timeout_is_exceeded() {
-    // diagnose_timeout is independent of the relax-phase `timeout` param —
+fn diagnose_and_connect_propagates_a_timeout_error_when_diagnose_timeout_is_exceeded() {
+    // diagnose_timeout is independent of the connect-phase `timeout` param —
     // an effectively-zero diagnose_timeout should fail the whole call the
     // same way a standalone `diagnose` call would, regardless of what the
-    // relax-phase timeout is set to.
+    // connect-phase timeout is set to.
     let store = test_store();
-    let result = diagnose_and_relax(
+    let result = diagnose_and_connect(
         BROKEN_QUERY,
         &store,
         1,
@@ -172,25 +172,25 @@ fn diagnose_and_relax_propagates_a_timeout_error_when_diagnose_timeout_is_exceed
 #[test]
 fn finds_a_real_forward_forward_path_and_fixes_the_query() {
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
 
     assert_eq!(report.original_row_count, 0);
     assert_eq!(report.results.len(), 1);
 
     let result = &report.results[0];
     assert_eq!(result.triples.len(), 1);
-    let relaxed_triple = &result.triples[0];
-    assert_eq!(relaxed_triple.hop_alternatives.len(), 1);
-    assert_eq!(relaxed_triple.hop_alternatives[0].len(), 2);
-    assert_eq!(relaxed_triple.path_text.as_deref(), Some("(<urn:example#hasPart> / <urn:example#hasSensor>)"));
+    let connected_triple = &result.triples[0];
+    assert_eq!(connected_triple.hop_alternatives.len(), 1);
+    assert_eq!(connected_triple.hop_alternatives[0].len(), 2);
+    assert_eq!(connected_triple.path_text.as_deref(), Some("(<urn:example#hasPart> / <urn:example#hasSensor>)"));
     assert_eq!(result.row_count, 1);
 
-    let relaxed = result.relaxed_query.as_ref().unwrap();
-    assert!(relaxed.contains("hasPart"));
+    let connected = result.connected_query.as_ref().unwrap();
+    assert!(connected.contains("hasPart"));
 }
 
 #[test]
-fn relaxes_a_culprit_triple_whose_variable_is_not_in_the_select_list() {
+fn connects_a_culprit_triple_whose_variable_is_not_in_the_select_list() {
     // `?sensor` is a plain WHERE-clause bridge variable — it's never listed
     // in `SELECT ?reading` — but it's still what the broken `hasSensor`
     // triple's endpoint search needs to resolve. Regression test for a bug
@@ -221,15 +221,15 @@ fn relaxes_a_culprit_triple_whose_variable_is_not_in_the_select_list() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.original_row_count, 0);
     assert_eq!(report.results.len(), 1);
 
     let result = &report.results[0];
-    let relaxed_triple = &result.triples[0];
-    assert!(!relaxed_triple.hop_alternatives.is_empty(), "the hasPart/hasSensor path should be found even though ?sensor isn't selected");
-    assert_eq!(relaxed_triple.path_text.as_deref(), Some("(<urn:example#hasPart> / <urn:example#hasSensor>)"));
-    assert!(result.relaxed_query.is_some());
+    let connected_triple = &result.triples[0];
+    assert!(!connected_triple.hop_alternatives.is_empty(), "the hasPart/hasSensor path should be found even though ?sensor isn't selected");
+    assert_eq!(connected_triple.path_text.as_deref(), Some("(<urn:example#hasPart> / <urn:example#hasSensor>)"));
+    assert!(result.connected_query.is_some());
     assert_eq!(result.row_count, 1);
 }
 
@@ -250,7 +250,7 @@ fn query_with_no_broken_triples_reports_no_culprits() {
 
 #[test]
 fn finds_an_inverse_hop_path() {
-    // sensor1 --partOf--> zone1: to relax "zone1 hasSensor ?sensor" via the
+    // sensor1 --partOf--> zone1: to connect "zone1 hasSensor ?sensor" via the
     // *inverse* of partOf, the search has to try incoming edges too.
     let store = Store::new().unwrap();
     store
@@ -272,42 +272,42 @@ fn finds_an_inverse_hop_path() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
-    let relaxed_triple = &report.results[0].triples[0];
+    let connected_triple = &report.results[0].triples[0];
     assert_eq!(
-        relaxed_triple.hop_alternatives,
+        connected_triple.hop_alternatives,
         vec![vec![Hop::Inverse(oxigraph::model::NamedNode::new("urn:example#partOf").unwrap())]]
     );
-    assert_eq!(relaxed_triple.path_text.as_deref(), Some("^(<urn:example#partOf>)"));
+    assert_eq!(connected_triple.path_text.as_deref(), Some("^(<urn:example#partOf>)"));
     assert_eq!(report.results[0].row_count, 1);
 }
 
 #[test]
-fn reports_no_relaxation_when_depth_is_too_small() {
+fn reports_no_connection_when_depth_is_too_small() {
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(1), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(BROKEN_QUERY, &store, 1, Some(1), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
     assert!(result.triples[0].hop_alternatives.is_empty());
-    assert!(result.relaxed_query.is_none());
+    assert!(result.connected_query.is_none());
     assert_eq!(result.row_count, 0);
 
-    // No real relaxation was found, but the pruned fallback (culprit triple
+    // No real connection was found, but the pruned fallback (culprit triple
     // just dropped, no path substitution) is still there and non-empty.
     assert!(!result.pruned_query.contains("hasSensor"), "the culprit triple should be dropped, not replaced");
     assert_eq!(result.pruned_row_count, 1, "sensor1 still matches once the broken triple is just dropped");
 }
 
 #[test]
-fn pruned_query_is_present_even_when_a_real_relaxation_is_found() {
+fn pruned_query_is_present_even_when_a_real_connection_is_found() {
     // pruned_query isn't only emitted on failure — it's always populated,
-    // even alongside a successful relaxed_query, so callers can compare
+    // even alongside a successful connected_query, so callers can compare
     // the two or fall back later without a second call.
     let store = test_store();
-    let report = diagnose_and_relax(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(BROKEN_QUERY, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     let result = &report.results[0];
-    assert!(result.relaxed_query.is_some(), "sanity check: a real relaxation was found here");
+    assert!(result.connected_query.is_some(), "sanity check: a real connection was found here");
     assert!(!result.pruned_query.contains("hasSensor"), "the culprit triple should be dropped, not replaced");
     assert_eq!(result.pruned_row_count, 1, "sensor1 is still reachable once the broken triple is just dropped");
 }
@@ -316,7 +316,7 @@ fn pruned_query_is_present_even_when_a_real_relaxation_is_found() {
 fn pruned_row_count_respects_result_limit() {
     // Dropping the culprit's hasSensor triple leaves both sensor1 and
     // sensor2 matching `?sensor a ex:TempSensor`, so pruned_row_count
-    // should be tightened by result_limit the same way a real relaxed
+    // should be tightened by result_limit the same way a real connected
     // query's row count is.
     let store = Store::new().unwrap();
     store
@@ -341,22 +341,22 @@ fn pruned_row_count_respects_result_limit() {
         }
     "#;
 
-    let unbounded = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let unbounded = diagnose_and_connect(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(unbounded.results[0].pruned_row_count, 2);
 
-    let capped = diagnose_and_relax(query, &store, 1, Some(4), Some(5), Some(1), NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let capped = diagnose_and_connect(query, &store, 1, Some(4), Some(5), Some(1), NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(capped.results[0].pruned_row_count, 1, "result_limit tightens pruned_row_count too");
 }
 
 #[test]
-fn falls_back_to_pruned_query_when_the_relaxation_timeout_is_exceeded() {
+fn falls_back_to_pruned_query_when_the_connect_timeout_is_exceeded() {
     // An effectively-zero timeout means the deadline is already passed by
-    // the time relax_combo's first query would run, so every SPARQL
+    // the time connect_combo's first query would run, so every SPARQL
     // execution inside it degrades the same way a genuinely slow query
-    // would: `relaxed_query: None`, empty hop_alternatives, no error and no
-    // hang for the whole `diagnose_and_relax` call.
+    // would: `connected_query: None`, empty hop_alternatives, no error and no
+    // hang for the whole `diagnose_and_connect` call.
     let store = test_store();
-    let report = diagnose_and_relax(
+    let report = diagnose_and_connect(
         BROKEN_QUERY,
         &store,
         1,
@@ -371,7 +371,7 @@ fn falls_back_to_pruned_query_when_the_relaxation_timeout_is_exceeded() {
     .unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
-    assert!(result.relaxed_query.is_none(), "no query work could complete within the timeout");
+    assert!(result.connected_query.is_none(), "no query work could complete within the timeout");
     assert!(result.triples[0].hop_alternatives.is_empty());
     assert!(!result.pruned_query.is_empty(), "the pruned fallback's text needs no store access, so it's still there");
     assert!(!result.pruned_query.contains("hasSensor"));
@@ -429,7 +429,7 @@ fn does_not_flag_a_filter_that_is_not_excluding_anything() {
 }
 
 #[test]
-fn diagnose_and_relax_reports_filters_without_attempting_a_relaxation() {
+fn diagnose_and_connect_reports_filters_without_attempting_a_connection() {
     let store = value_store();
     let query = r#"
         PREFIX ex: <urn:example#>
@@ -440,7 +440,7 @@ fn diagnose_and_relax_reports_filters_without_attempting_a_relaxation() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert!(report.results.is_empty());
     assert_eq!(report.filter_results.len(), 1);
     assert_eq!(report.filter_results[0].row_count_without_filter, 1);
@@ -480,7 +480,7 @@ fn combines_distinct_paths_from_different_bound_pairs_as_alternatives() {
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1);
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
 
@@ -491,7 +491,7 @@ fn combines_distinct_paths_from_different_bound_pairs_as_alternatives() {
     );
     assert_eq!(
         result.row_count, 2,
-        "the relaxed query should recover both sensor1 (via hasPart/hasSensor) and sensor2 (via hasDevice)"
+        "the connected query should recover both sensor1 (via hasPart/hasSensor) and sensor2 (via hasDevice)"
     );
 }
 
@@ -501,7 +501,7 @@ fn reuses_one_path_across_endpoints_that_share_its_shape() {
     // (through different intermediate zones), so the hop sequence found for
     // the first sampled endpoint should generalize to the second via
     // `path_holds` rather than needing its own independent BFS — and either
-    // way, both sensors must still come back in the relaxed query's rows.
+    // way, both sensors must still come back in the connected query's rows.
     let store = Store::new().unwrap();
     store
         .load_from_slice(
@@ -526,7 +526,7 @@ fn reuses_one_path_across_endpoints_that_share_its_shape() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(query, &store, 1, Some(4), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
 
@@ -557,16 +557,16 @@ fn sample_limit_none_samples_every_distinct_bound_pair() {
         }
     "#;
 
-    let capped = diagnose_and_relax(query, &store, 1, Some(2), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let capped = diagnose_and_connect(query, &store, 1, Some(2), Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(capped.results[0].triples[0].hop_alternatives.len(), 5, "capped sampling stops at the limit");
 
-    let uncapped = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let uncapped = diagnose_and_connect(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(
         uncapped.results[0].triples[0].hop_alternatives.len(),
         6,
         "None samples every distinct pair"
     );
-    assert_eq!(uncapped.results[0].row_count, 6, "the relaxed query recovers all six sensors");
+    assert_eq!(uncapped.results[0].row_count, 6, "the connected query recovers all six sensors");
 }
 
 #[test]
@@ -612,13 +612,13 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
     assert!(predicates.contains(&"<urn:example#hasSensor>".to_string()));
     assert!(predicates.contains(&"<urn:example#hasUnit>".to_string()));
 
-    // Relaxation: the hasSensor triple has a real path (hasZone/hasSensor),
+    // Connecting: the hasSensor triple has a real path (hasZone/hasSensor),
     // but the hasUnit triple genuinely has none (nothing connects sensor1
     // to Fahrenheit). Since at least one triple in the pair found a path,
-    // the combination should still be relaxed as a whole: hasSensor spliced
+    // the combination should still be connected as a whole: hasSensor spliced
     // in with its discovered path, hasUnit simply dropped — recovering
     // sensor1 rather than giving up on the pair entirely.
-    let report = diagnose_and_relax(query, &store, 3, Some(4), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(query, &store, 3, Some(4), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
     let result = &report.results[0];
     assert_eq!(result.triples.len(), 2);
@@ -628,21 +628,21 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
     assert!(!has_sensor_result.hop_alternatives.is_empty(), "hasSensor has a real 2-hop path");
     assert!(has_unit_result.hop_alternatives.is_empty(), "nothing connects sensor1 to Fahrenheit");
     assert!(
-        result.relaxed_query.is_some(),
-        "hasSensor's path was found, so the pair is still relaxed with hasUnit simply dropped"
+        result.connected_query.is_some(),
+        "hasSensor's path was found, so the pair is still connected with hasUnit simply dropped"
     );
-    assert!(!result.relaxed_query.as_ref().unwrap().contains("hasUnit"), "hasUnit should be dropped, not just left broken");
+    assert!(!result.connected_query.as_ref().unwrap().contains("hasUnit"), "hasUnit should be dropped, not just left broken");
     assert_eq!(result.row_count, 1, "sensor1 matches once hasSensor is path-substituted and hasUnit is dropped");
 }
 
 #[test]
-fn does_not_relax_when_the_object_is_unconstrained_elsewhere() {
+fn does_not_connect_when_the_object_is_unconstrained_elsewhere() {
     // `?sensor` appears *only* in the broken triple below, so once it's
     // removed to check ablation, nothing else binds it — there's no
     // specific target to search for, only the subject (a concrete IRI).
     // A real 1-hop path (hasZone) does exist from `building`, but a
     // one-sided endpoint isn't searched at all (see the module docs), so no
-    // relaxation should be attempted despite that real path existing.
+    // connection should be attempted despite that real path existing.
     let store = Store::new().unwrap();
     store
         .load_from_slice(
@@ -665,17 +665,17 @@ fn does_not_relax_when_the_object_is_unconstrained_elsewhere() {
     let diagnosis = diagnose(query, &store, 1, None, false).unwrap();
     assert_eq!(diagnosis.culprits.len(), 1, "building has no direct hasSensor edge");
 
-    let report = diagnose_and_relax(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
-    let relaxed_triple = &report.results[0].triples[0];
-    assert!(relaxed_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
-    assert!(relaxed_triple.path_text.is_none());
-    assert!(report.results[0].relaxed_query.is_none());
+    let connected_triple = &report.results[0].triples[0];
+    assert!(connected_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
+    assert!(connected_triple.path_text.is_none());
+    assert!(report.results[0].connected_query.is_none());
     assert_eq!(report.results[0].row_count, 0);
 }
 
 #[test]
-fn does_not_relax_when_the_subject_is_unconstrained_elsewhere() {
+fn does_not_connect_when_the_subject_is_unconstrained_elsewhere() {
     // `?x` appears only in the broken triple, and this time it's the
     // *subject* that's unconstrained, not the object. A real path
     // (partOf) does exist, but again, a one-sided endpoint isn't searched.
@@ -697,11 +697,11 @@ fn does_not_relax_when_the_subject_is_unconstrained_elsewhere() {
         }
     "#;
 
-    let report = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(report.results.len(), 1);
-    let relaxed_triple = &report.results[0].triples[0];
-    assert!(relaxed_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
-    assert!(report.results[0].relaxed_query.is_none());
+    let connected_triple = &report.results[0].triples[0];
+    assert!(connected_triple.hop_alternatives.is_empty(), "one-sided endpoints aren't searched");
+    assert!(report.results[0].connected_query.is_none());
     assert_eq!(report.results[0].row_count, 0);
 }
 
@@ -734,7 +734,7 @@ fn default_ablation_depth_escalates_on_its_own_to_find_a_joint_culprit() {
         }
     "#;
 
-    let report = diagnose_and_relax_default(query, &store).unwrap();
+    let report = diagnose_and_connect_default(query, &store).unwrap();
     assert_eq!(report.results.len(), 1, "default ablation_depth=3 should escalate to find the joint culprit");
     assert_eq!(report.results[0].found_at_depth, 2);
 }
@@ -763,7 +763,7 @@ fn default_max_depth_is_2_for_pair_search() {
             ?sensor a ex:TempSensor .
         }
     "#;
-    let pair_report = diagnose_and_relax(pair_query, &store, 1, None, Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let pair_report = diagnose_and_connect(pair_query, &store, 1, None, Some(5), None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(pair_report.results[0].row_count, 1, "default pair-search depth (2) finds the 2-hop path");
 }
 
@@ -793,18 +793,18 @@ fn namespace_scope_restricts_path_search_to_allowed_prefixes() {
         }
     "#;
 
-    let unrestricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let unrestricted = diagnose_and_connect(query, &store, 1, Some(1), None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     assert_eq!(unrestricted.results[0].triples[0].hop_alternatives.len(), 1, "the real altPath edge should be found");
     assert_eq!(unrestricted.results[0].row_count, 1);
 
-    let brick_restricted = diagnose_and_relax(query, &store, 1, Some(1), None, None, NamespaceScope::default(), None, None, false).unwrap();
+    let brick_restricted = diagnose_and_connect(query, &store, 1, Some(1), None, None, NamespaceScope::default(), None, None, false).unwrap();
     assert!(
         brick_restricted.results[0].triples[0].hop_alternatives.is_empty(),
         "ex:altPath isn't in any allowed namespace, so it shouldn't be found"
     );
-    assert!(brick_restricted.results[0].relaxed_query.is_none());
+    assert!(brick_restricted.results[0].connected_query.is_none());
 
-    let custom_restricted = diagnose_and_relax(
+    let custom_restricted = diagnose_and_connect(
         query,
         &store,
         1,
@@ -880,33 +880,33 @@ fn a_disconnected_reduced_pattern_is_reported_as_a_cartesian_risk_not_silently_r
 }
 
 #[test]
-fn diagnose_and_relax_does_not_hang_or_error_on_a_disconnected_query() {
+fn diagnose_and_connect_does_not_hang_or_error_on_a_disconnected_query() {
     let store = disconnected_store();
-    let report = diagnose_and_relax(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    let report = diagnose_and_connect(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
     // No culprit was ever confirmed (see the diagnosis-only test above), so
-    // there's nothing for the relax phase to even attempt.
+    // there's nothing for the connect phase to even attempt.
     assert!(report.results.is_empty());
 }
 
 /// `ignore_cartesian_risk: true` (see
 /// `ignore_cartesian_risk_recovers_the_real_culprit_diagnose_skipped` below,
 /// which exercises the same flag on plain `diagnose`) works the same way on
-/// `diagnose_and_relax`: the disconnected `{T2, T3}` combo left
+/// `diagnose_and_connect`: the disconnected `{T2, T3}` combo left
 /// by removing the real culprit (T1, `hasBrokenLink`) is actually evaluated
-/// instead of skipped, confirms T1 as a genuine culprit, and relaxation then
+/// instead of skipped, confirms T1 as a genuine culprit, and connection then
 /// gets a real shot at fixing it — here, no path connects
 /// `ex:building223`/`?sensor` other than the missing `hasBrokenLink` edge
 /// itself, so the pair falls back to `pruned_query` rather than a spliced-in
 /// path, but it's no longer silently absent from `report.results` the way it
 /// is with the guard left on.
 #[test]
-fn ignore_cartesian_risk_lets_relax_attempt_a_combo_diagnose_would_otherwise_skip() {
+fn ignore_cartesian_risk_lets_connect_attempt_a_combo_diagnose_would_otherwise_skip() {
     let store = disconnected_store();
 
-    let guarded = diagnose_and_relax(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
-    assert!(guarded.results.is_empty(), "sanity check: the guard leaves nothing to relax");
+    let guarded = diagnose_and_connect(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None, false).unwrap();
+    assert!(guarded.results.is_empty(), "sanity check: the guard leaves nothing to connect");
 
-    let unguarded = diagnose_and_relax(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None, true).unwrap();
+    let unguarded = diagnose_and_connect(DISCONNECTED_QUERY, &store, 1, None, None, None, NamespaceScope::Unrestricted, None, None, true).unwrap();
     assert_eq!(unguarded.results.len(), 1, "the real culprit should now be confirmed and attempted");
     let result = &unguarded.results[0];
     assert!(result.triples[0].triple_text.contains("hasBrokenLink"));

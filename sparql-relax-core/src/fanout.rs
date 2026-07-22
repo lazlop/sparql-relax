@@ -11,7 +11,7 @@
 //! share a QUDT quantity kind — can "connect" almost any two entities of a
 //! given kind, which is indistinguishable from noise even though every
 //! individual edge involved is real. A single global cutoff on fan-out
-//! doesn't separate this from genuinely useful relaxations, though: a
+//! doesn't separate this from genuinely useful connections, though: a
 //! predicate like `feeds`/`isFedBy` (a near-bijective supply-chain
 //! hierarchy) can have the *same* raw fan-out as a dangerous hop through
 //! `hasAssociatedTag`, yet tracing a real supply chain is exactly the kind
@@ -29,7 +29,7 @@
 //! Built once per [`Store`] (like the store itself) rather than recomputed
 //! per search: it's a single pass over every triple, and the resulting
 //! index is read-only for the lifetime of the store, so every
-//! `diagnose_and_relax`/`find_path` call against it reuses the same one
+//! `diagnose_and_connect`/`find_path` call against it reuses the same one
 //! rather than re-scanning the whole graph per query.
 
 use oxigraph::model::{GraphNameRef, NamedNode, Term};

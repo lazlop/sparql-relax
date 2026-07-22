@@ -11,7 +11,7 @@ pub enum RelaxError {
     UnsupportedQueryForm(&'static str),
     #[error("query has no basic graph pattern triples to diagnose")]
     NoTriples,
-    #[error("culprit triple {0:?} could not be located while relaxing the query it was diagnosed from")]
+    #[error("culprit triple {0:?} could not be located while connecting the query it was diagnosed from")]
     CulpritNotFound(String),
     #[error("diagnosis timed out before the original query could even be evaluated")]
     Timeout,

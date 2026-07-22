@@ -20,7 +20,7 @@
 //!
 //! This never touches the SPARQL query engine (it's direct `Store` quad
 //! lookups), so it can't use Oxigraph's `CancellationToken` the way
-//! [`crate::diagnose`]/[`crate::relax`]'s query executions do. A `deadline`
+//! [`crate::diagnose`]/[`crate::connect`]'s query executions do. A `deadline`
 //! is checked by hand instead — every [`DEADLINE_CHECK_INTERVAL`] edges
 //! examined, not just once per frontier node — cheap relative to the quad
 //! lookups themselves, but frequent enough that even a single high-fan-out

@@ -6,7 +6,7 @@ before trusting its result. Diagnosis is nearly free when the query already work
 just confirms the row count) and, when the query returns nothing or looks wrong, it
 explains *why* -- which triple or FILTER is broken -- instead of leaving the agent with
 just an empty result to guess at. This is the reliable, repeatable core of the tool, and
-the one most agents should reach for. `diagnose`'s `relax=True` option additionally
+the one most agents should reach for. `diagnose`'s `connect=True` option additionally
 searches the graph's real edges for a corrected query, but that search is experimental
 (slower, namespace-restricted, and not guaranteed to find or verify a real fix) -- most
 agents are better served by the default diagnosis and fixing the query themselves from
@@ -31,9 +31,9 @@ mcp = FastMCP(
         "load_dataset, then ALWAYS call diagnose on a query before trusting its result -- it's "
         "cheap even when the query already works, and when it doesn't it explains exactly which "
         "triple or FILTER is broken. This default diagnosis is the reliable part of this tool; "
-        "diagnose's relax=True option additionally tries to search the graph for a corrected "
+        "diagnose's connect=True option additionally tries to search the graph for a corrected "
         "query, but that search is experimental and its suggestions should be verified, not "
-        "trusted outright -- leave relax off unless you specifically want to try it. Only call "
+        "trusted outright -- leave connect off unless you specifically want to try it. Only call "
         "query, which returns the full result set, once diagnose has confirmed rows come back."
     ),
 )
@@ -62,7 +62,7 @@ def _require_dataset(name: str) -> Store:
 #  WATCHDOG
 # ==============================================================================
 #
-# `Store.diagnose`/`diagnose_and_relax` run a Rust-side ablation search that,
+# `Store.diagnose`/`diagnose_and_connect` run a Rust-side ablation search that,
 # for a disconnected BGP, can make Oxigraph's query engine materialize a full
 # N x M cross product without ever checking its own cancellation token --
 # see sparql-relax-core/src/diagnose.rs's module docs, and eval/run_eval.py's
@@ -79,7 +79,7 @@ def _require_dataset(name: str) -> Store:
 # holding every dataset an agent has loaded for the whole session in
 # `_datasets`. Losing that on every diagnose call the way run_eval.py's
 # per-row workers do would be far more disruptive than losing one row's
-# result. So diagnose/diagnose_and_relax calls are routed through one
+# result. So diagnose/diagnose_and_connect calls are routed through one
 # persistent forked worker instead, only replaced -- killed and re-forked --
 # when `load_dataset` changes what's loaded, or when a call times out;
 # datasets are expected to change rarely within a session (often just
@@ -111,9 +111,9 @@ def _require_dataset(name: str) -> Store:
 # against it.
 
 DIAGNOSE_HARD_TIMEOUT_SECONDS = 30.0
-"""Wall-clock cap per diagnose/diagnose_and_relax call, enforced by killing and
+"""Wall-clock cap per diagnose/diagnose_and_connect call, enforced by killing and
 replacing the worker process if exceeded. Well above DEFAULT_ABLATION_TIMEOUT's/
-DEFAULT_RELAX_TIMEOUT's own 5-second (soft, Rust-side) budgets -- this is only
+DEFAULT_CONNECT_TIMEOUT's own 5-second (soft, Rust-side) budgets -- this is only
 meant to catch the rare case where that Rust-side deadline itself isn't honored
 (see the module docs above), not to second-guess an ordinary, successful search."""
 
@@ -153,7 +153,7 @@ def _diagnose_worker_loop(conn: "mp.connection.Connection") -> None:
 
 class DiagnoseWorker:
     """A persistent forked worker plus the hard-timeout watchdog around it, for
-    `diagnose`/`diagnose_and_relax` specifically -- see the module docs above
+    `diagnose`/`diagnose_and_connect` specifically -- see the module docs above
     for why. `call()` looks like a plain function call from the caller's
     side, but under the hood: send the request, wait up to `hard_timeout`
     seconds for a reply, and if that expires -- or the worker dies outright --
@@ -198,7 +198,7 @@ class DiagnoseWorker:
         """Replaces the worker with a fresh fork, so it picks up whatever
         `_datasets` looks like right now. Call this whenever `load_dataset`
         loads or replaces a dataset -- otherwise the worker would keep
-        serving diagnose/diagnose_and_relax calls against its stale,
+        serving diagnose/diagnose_and_connect calls against its stale,
         fork-time copy."""
         self._kill_and_respawn()
 
@@ -300,25 +300,25 @@ def list_datasets() -> list[dict[str, Any]]:
 
 
 @mcp.tool()
-def diagnose(dataset: str, query: str, relax: bool = False, ignore_cartesian_risk: bool = False) -> dict[str, Any]:
+def diagnose(dataset: str, query: str, connect: bool = False, ignore_cartesian_risk: bool = False) -> dict[str, Any]:
     """Run a SPARQL SELECT query against `dataset` and diagnose it. ALWAYS call this before
     `query` -- even when you expect the query to succeed.
 
     On a working query this is nearly free: it just confirms the row count (`ok: true`). On a
     query that returns nothing, or fewer rows than expected, it explains *why* -- which BGP
-    triple(s) or FILTER(s) are responsible. If `relax=True`, it also searches the graph's
+    triple(s) or FILTER(s) are responsible. If `connect=True`, it also searches the graph's
     actual edges for a real connecting path, often finding a corrected query that actually
-    returns rows (see `relaxed_query` on each culprit).
+    returns rows (see `connected_query` on each culprit).
 
-    Note: Relaxation is experimental. For AI agents, it is often more effective to use
-    diagnose with `relax=False`, then allow the agent to correct the query itself based
+    Note: Connection is experimental. For AI agents, it is often more effective to use
+    diagnose with `connect=False`, then allow the agent to correct the query itself based
     on the diagnosis.
 
     Only SELECT queries can be diagnosed (ASK/CONSTRUCT/DESCRIBE aren't supported here -- use
     `query` directly for those). Once this reports `ok: true`, call `query` to fetch the full
     result set: this tool's `row_count` fields are counts, not the actual rows.
 
-    When `relax=True`, path search defaults to predicates in the Brick, ASHRAE 223P, RDFS,
+    When `connect=True`, path search defaults to predicates in the Brick, ASHRAE 223P, RDFS,
     and QUDT namespaces (this tool's usual building-automation domain) -- a real fix outside
     those namespaces won't be found, though the diagnosis of *which* triple is broken
     is unaffected.
@@ -332,14 +332,14 @@ def diagnose(dataset: str, query: str, relax: bool = False, ignore_cartesian_ris
     """
     _require_dataset(dataset)  # fail fast with a clear error before involving the watchdog worker at all
     worker = _get_diagnose_worker()
-    if relax:
-        report = worker.call(dataset, "diagnose_and_relax", query, ignore_cartesian_risk=ignore_cartesian_risk)
+    if connect:
+        report = worker.call(dataset, "diagnose_and_connect", query, ignore_cartesian_risk=ignore_cartesian_risk)
         culprits = [
             {
                 "depth": result.found_at_depth,
                 "triples": [{"triple": t.triple, "discovered_path": t.path_text} for t in result.triples],
                 "fixed": result.fixed,
-                "relaxed_query": result.relaxed_query,
+                "connected_query": result.connected_query,
                 "row_count_with_fix": result.row_count,
                 "fallback_query_with_broken_triples_removed": result.pruned_query,
                 "fallback_row_count": result.pruned_row_count,
@@ -357,7 +357,7 @@ def diagnose(dataset: str, query: str, relax: bool = False, ignore_cartesian_ris
                 "depth": c.depth,
                 "triples": [{"triple": t, "discovered_path": None} for t in c.triples],
                 "fixed": False,
-                "relaxed_query": None,
+                "connected_query": None,
                 "row_count_with_fix": None,
                 "fallback_query_with_broken_triples_removed": None,
                 "fallback_row_count": None,
@@ -375,15 +375,15 @@ def diagnose(dataset: str, query: str, relax: bool = False, ignore_cartesian_ris
     if ok:
         message = f"Query returned {report.original_row_count} row(s) with no issues found. Call `query` to fetch the full results."
     elif culprits or filter_issues:
-        if relax:
+        if connect:
             message = (
-                "Query is broken. See `culprits`/`filter_issues` for what's wrong, and `relaxed_query` "
+                "Query is broken. See `culprits`/`filter_issues` for what's wrong, and `connected_query` "
                 "on any culprit where a fix was found."
             )
         else:
             message = (
                 "Query is broken. See `culprits`/`filter_issues` for what's wrong. Call again with "
-                "`relax=true` to search for a corrected query."
+                "`connect=true` to search for a corrected query."
             )
     elif cartesian_risks_skipped:
         message = (

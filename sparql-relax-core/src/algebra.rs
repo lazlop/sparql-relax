@@ -412,7 +412,7 @@ pub fn variables_of_triples(triples: &[TriplePattern]) -> Vec<Variable> {
 /// in addition to whatever it already exposes, every variable in `extra` is
 /// also visible in the resulting solutions.
 ///
-/// Needed because [`crate::diagnose`]/[`crate::relax`] re-run a *reduced*
+/// Needed because [`crate::diagnose`]/[`crate::connect`] re-run a *reduced*
 /// copy of the original query (some BGP triples removed) and then inspect
 /// its rows via [`crate::diagnose::resolve_term_pattern`] to see what a
 /// removed triple's subject/object were bound to. That reduced query is
@@ -423,7 +423,7 @@ pub fn variables_of_triples(triples: &[TriplePattern]) -> Vec<Variable> {
 /// WHERE-clause bridge variable) would otherwise be invisible in every row,
 /// silently defeating both culprit detection and endpoint resolution for
 /// it. Widening only changes what's visible internally to these checks —
-/// the actual `relaxed_query`/`pruned_query` text shown to the caller is
+/// the actual `connected_query`/`pruned_query` text shown to the caller is
 /// still built with the original, unwidened projection.
 ///
 /// Leaves `pattern` unchanged if no `Project` is found (e.g. a `CONSTRUCT`
@@ -506,7 +506,7 @@ fn triple_join_keys(triple: &TriplePattern) -> impl Iterator<Item = String> {
 /// join keys never overlap, even transitively through a chain of other
 /// triples, with another's. This is exactly the shape that can make a query
 /// engine materialize a full N×M cross product before yielding a single row
-/// (see the `diagnose`/`relax` module docs on why an internally-enforced
+/// (see the `diagnose`/`connect` module docs on why an internally-enforced
 /// timeout doesn't reliably bound that).
 ///
 /// A triple with no variables or blank nodes at all (every side concrete)

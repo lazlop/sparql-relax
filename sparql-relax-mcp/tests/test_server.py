@@ -11,8 +11,8 @@ from mcp.shared.memory import create_connected_server_and_client_session
 from sparql_relax_mcp.server import _datasets, mcp
 
 # Uses the Brick namespace (rather than an arbitrary made-up one) because diagnose's
-# relaxation path search defaults to Brick/223P/RDFS/QUDT predicates only (see
-# DEFAULT_RELAX_NAMESPACES) -- a fix outside those namespaces would never be found,
+# connection path search defaults to Brick/223P/RDFS/QUDT predicates only (see
+# DEFAULT_CONNECT_NAMESPACES) -- a fix outside those namespaces would never be found,
 # which would make test_diagnose_explains_a_broken_query_and_suggests_a_fix below
 # fail for a reason unrelated to what it's actually checking.
 TTL = """
@@ -102,9 +102,9 @@ async def test_diagnose_reports_ok_on_a_working_query_then_query_fetches_full_re
 
 @pytest.mark.asyncio
 async def test_diagnose_reports_a_culprit_but_no_fix_by_default():
-    # `relax` defaults to False: diagnosis is nearly free and always run, but the
-    # (comparatively expensive, experimental) relaxation search only runs when asked
-    # for explicitly -- see the `relax` docs on the `diagnose` tool.
+    # `connect` defaults to False: diagnosis is nearly free and always run, but the
+    # (comparatively expensive, experimental) connection search only runs when asked
+    # for explicitly -- see the `connect` docs on the `diagnose` tool.
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
 
@@ -116,16 +116,16 @@ async def test_diagnose_reports_a_culprit_but_no_fix_by_default():
         culprit = diagnosis["culprits"][0]
         assert culprit["triples"][0]["triple"] == "<https://brickschema.org/schema/Brick#building223> <https://brickschema.org/schema/Brick#hasSensor> ?sensor"
         assert culprit["fixed"] is False
-        assert culprit["relaxed_query"] is None
+        assert culprit["connected_query"] is None
         assert culprit["row_count_with_fix"] is None
 
 
 @pytest.mark.asyncio
-async def test_diagnose_with_relax_true_suggests_a_fix():
+async def test_diagnose_with_connect_true_suggests_a_fix():
     async with create_connected_server_and_client_session(mcp) as client:
         await client.call_tool("load_dataset", {"name": "b223", "data": TTL})
 
-        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": BROKEN_QUERY, "relax": True}))
+        diagnosis = _result_json(await client.call_tool("diagnose", {"dataset": "b223", "query": BROKEN_QUERY, "connect": True}))
         assert diagnosis["ok"] is False
         assert diagnosis["row_count"] == 0
         assert len(diagnosis["culprits"]) == 1
@@ -133,11 +133,11 @@ async def test_diagnose_with_relax_true_suggests_a_fix():
         culprit = diagnosis["culprits"][0]
         assert culprit["triples"][0]["triple"] == "<https://brickschema.org/schema/Brick#building223> <https://brickschema.org/schema/Brick#hasSensor> ?sensor"
         assert culprit["fixed"] is True
-        assert culprit["relaxed_query"] is not None
+        assert culprit["connected_query"] is not None
         assert culprit["row_count_with_fix"] > 0
 
-        # The suggested relaxed_query should itself actually work via `query`.
-        fixed = _result_json(await client.call_tool("query", {"dataset": "b223", "query": culprit["relaxed_query"]}))
+        # The suggested connected_query should itself actually work via `query`.
+        fixed = _result_json(await client.call_tool("query", {"dataset": "b223", "query": culprit["connected_query"]}))
         assert fixed["form"] == "solutions"
         assert len(fixed["rows"]) == culprit["row_count_with_fix"]
 

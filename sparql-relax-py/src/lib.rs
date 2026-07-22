@@ -4,7 +4,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use sparql_relax_core::{
     FanoutIndex, NamespaceScope, QueryOutcome, RdfTerm, diagnose as core_diagnose,
-    diagnose_and_relax_with_fanout_index as core_relax, pruned_query_text as core_pruned_query_text, query as core_query,
+    diagnose_and_connect_with_fanout_index as core_connect, pruned_query_text as core_pruned_query_text, query as core_query,
 };
 use std::fmt::Display;
 use std::time::Duration;
@@ -14,11 +14,11 @@ fn to_py_err(err: impl Display) -> PyErr {
 }
 
 /// Default value for `allowed_namespaces` when the Python caller doesn't
-/// pass one: restricted to `DEFAULT_RELAX_NAMESPACES`. Passing `None`
+/// pass one: restricted to `DEFAULT_CONNECT_NAMESPACES`. Passing `None`
 /// explicitly (rather than omitting the argument) opts out to unrestricted
 /// search instead.
-fn default_relax_namespaces() -> Option<Vec<String>> {
-    Some(sparql_relax_core::DEFAULT_RELAX_NAMESPACES.iter().map(|ns| ns.to_string()).collect())
+fn default_connect_namespaces() -> Option<Vec<String>> {
+    Some(sparql_relax_core::DEFAULT_CONNECT_NAMESPACES.iter().map(|ns| ns.to_string()).collect())
 }
 
 fn namespace_scope(allowed_namespaces: Option<Vec<String>>) -> NamespaceScope {
@@ -29,13 +29,13 @@ fn namespace_scope(allowed_namespaces: Option<Vec<String>>) -> NamespaceScope {
 }
 
 /// Default value for `timeout` when the Python caller doesn't pass one:
-/// `DEFAULT_RELAX_TIMEOUT`, in seconds. Passing `None` explicitly opts out
-/// to unbounded relaxation instead.
-fn default_relax_timeout() -> Option<f64> {
-    Some(sparql_relax_core::DEFAULT_RELAX_TIMEOUT.as_secs_f64())
+/// `DEFAULT_CONNECT_TIMEOUT`, in seconds. Passing `None` explicitly opts out
+/// to unbounded connection instead.
+fn default_connect_timeout() -> Option<f64> {
+    Some(sparql_relax_core::DEFAULT_CONNECT_TIMEOUT.as_secs_f64())
 }
 
-/// Default value for `diagnose_timeout`/`timeout` (on `diagnose_and_relax`
+/// Default value for `diagnose_timeout`/`timeout` (on `diagnose_and_connect`
 /// and `diagnose` respectively) when the Python caller doesn't pass one:
 /// `DEFAULT_ABLATION_TIMEOUT`, in seconds. Passing `None` explicitly opts
 /// out to unbounded diagnosis instead.
@@ -81,13 +81,13 @@ fn load_store(data: &str, format: &str) -> PyResult<Store> {
 
 type CulpritTuple = (Vec<String>, usize);
 type FilterCulpritTuple = (String, usize);
-type RelaxedTripleTuple = (String, Option<String>);
-type RelaxResultTuple = (usize, Vec<RelaxedTripleTuple>, Option<String>, usize, String, usize);
+type ConnectedTripleTuple = (String, Option<String>);
+type ConnectResultTuple = (usize, Vec<ConnectedTripleTuple>, Option<String>, usize, String, usize);
 // `CartesianRiskCombo` has the exact same (triples, depth) shape as `Culprit`,
 // so it reuses `CulpritTuple` rather than a duplicate type — the two are
 // kept apart at the Python layer by which list they end up in, not by shape.
 type DiagnoseTuples = (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>);
-type RelaxTuples = (usize, Vec<RelaxResultTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>);
+type ConnectTuples = (usize, Vec<ConnectResultTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>);
 
 /// An RDF term as `(kind, value, datatype, language)`, where `kind` is
 /// `"uri"`, `"bnode"`, or `"literal"` — the same three-way split as the
@@ -162,18 +162,18 @@ fn diagnose_tuples(
     Ok((diagnosis.original_row_count, culprits, filter_culprits, cartesian_risks))
 }
 
-/// Same as [`diagnose_tuples`], but for `diagnose_and_relax` — shared by the
-/// free `diagnose_and_relax` pyfunction and `RdfStore::diagnose_and_relax`.
+/// Same as [`diagnose_tuples`], but for `diagnose_and_connect` — shared by the
+/// free `diagnose_and_connect` pyfunction and `RdfStore::diagnose_and_connect`.
 ///
 /// `fanout_index` is [`FanoutIndex`]'s one-time, whole-graph index of each
 /// predicate's typical fan-out, used by path search to reject a candidate
 /// hop whose specific endpoint is an unusually shared "hub" value for its
 /// predicate (see `sparql-relax-core::fanout`'s module docs). The free
-/// `diagnose_and_relax` pyfunction builds one fresh per call (it already
+/// `diagnose_and_connect` pyfunction builds one fresh per call (it already
 /// builds a throwaway `Store` per call too); `RdfStore` builds it once
 /// alongside its `inner` store and reuses it for every call.
 #[allow(clippy::too_many_arguments)]
-fn diagnose_and_relax_tuples(
+fn diagnose_and_connect_tuples(
     store: &Store,
     fanout_index: &FanoutIndex,
     query: &str,
@@ -185,15 +185,15 @@ fn diagnose_and_relax_tuples(
     timeout: Option<Duration>,
     diagnose_timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
-) -> Result<RelaxTuples, sparql_relax_core::RelaxError> {
+) -> Result<ConnectTuples, sparql_relax_core::RelaxError> {
     let report =
-        core_relax(query, store, fanout_index, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout, ignore_cartesian_risk)?;
+        core_connect(query, store, fanout_index, ablation_depth, max_depth, sample_limit, result_limit, scope, timeout, diagnose_timeout, ignore_cartesian_risk)?;
     let results = report
         .results
         .into_iter()
         .map(|r| {
             let triples = r.triples.into_iter().map(|t| (t.triple_text, t.path_text)).collect();
-            (r.found_at_depth, triples, r.relaxed_query, r.row_count, r.pruned_query, r.pruned_row_count)
+            (r.found_at_depth, triples, r.connected_query, r.row_count, r.pruned_query, r.pruned_row_count)
         })
         .collect();
     let filter_results = report
@@ -234,11 +234,11 @@ mod _sparql_relax {
     /// expressions (both plain `FILTER(...)` and the condition on an
     /// `OPTIONAL`): remove one, re-run the rest, and flag it if that
     /// strictly grows the result set. Filters are only ever reported, never
-    /// relaxed, and `depth` does not apply to them.
+    /// connected, and `depth` does not apply to them.
     ///
     /// This only identifies *which* triple(s)/filter(s) are broken — it
     /// does no variable-binding work, so it's cheap even on large result
-    /// sets. Use `diagnose_and_relax` to also resolve what a culprit's
+    /// sets. Use `diagnose_and_connect` to also resolve what a culprit's
     /// variables are bound to and search for a fix.
     ///
     /// `timeout` (seconds) bounds every SPARQL query this call runs — the
@@ -294,7 +294,7 @@ mod _sparql_relax {
     ///
     /// Runs `query` (any SPARQL query form — `SELECT`, `ASK`, `CONSTRUCT`,
     /// `DESCRIBE`) against the RDF graph in `data` (parsed as `format`) and
-    /// returns its actual results — unlike `diagnose`/`diagnose_and_relax`,
+    /// returns its actual results — unlike `diagnose`/`diagnose_and_connect`,
     /// which only explain and fix a query that returns nothing, this is the
     /// ordinary case of running one that already works.
     ///
@@ -387,8 +387,8 @@ mod _sparql_relax {
     /// for a real forward/inverse path (over the graph's actual edges)
     /// connecting each of its triples' bound endpoints, then splices *all*
     /// of them into the query at once and re-runs it to confirm the fix. A
-    /// combination is only relaxed as a whole: if any one of its triples has
-    /// no discoverable path, no relaxed query is built for it (the others
+    /// combination is only connected as a whole: if any one of its triples has
+    /// no discoverable path, no connected query is built for it (the others
     /// being fixable wouldn't help, since they were only broken *together*).
     ///
     /// `ablation_depth` is passed through to `diagnose` to control how many
@@ -396,7 +396,7 @@ mod _sparql_relax {
     /// (default 3, same as `diagnose`'s `depth`).
     ///
     /// `FILTER` culprits found during diagnosis are included as-is (no
-    /// relaxation is attempted for them).
+    /// connection is attempted for them).
     ///
     /// Different sampled bound pairs for the same triple can need genuinely
     /// different real paths (e.g. one entity reached via a 2-hop path,
@@ -415,8 +415,8 @@ mod _sparql_relax {
     /// goal — not worth searching for a suggestion with nothing to verify
     /// it against).
     ///
-    /// `result_limit` caps how many rows a relaxed query's `LIMIT` allows
-    /// (default 50,000 — a relaxed path, especially an alternation of
+    /// `result_limit` caps how many rows a connected query's `LIMIT` allows
+    /// (default 50,000 — a connected path, especially an alternation of
     /// several distinct paths, can match far more broadly than the original
     /// triple did); only ever tightens a `LIMIT` already present in the
     /// original query, never loosens it. Pass `None` to leave it unbounded.
@@ -424,11 +424,11 @@ mod _sparql_relax {
     /// `allowed_namespaces` restricts path search to predicates whose IRI
     /// starts with one of these prefixes; a real edge outside every listed
     /// namespace is invisible to the search even if it would otherwise
-    /// connect the two endpoints. Defaults to `DEFAULT_RELAX_NAMESPACES`
+    /// connect the two endpoints. Defaults to `DEFAULT_CONNECT_NAMESPACES`
     /// (Brick, ASHRAE 223P, RDFS, QUDT). Pass `None` explicitly for no
     /// restriction (any real predicate found in the graph is fair game).
     ///
-    /// `timeout` (seconds) bounds all the work needed to relax *each*
+    /// `timeout` (seconds) bounds all the work needed to connect *each*
     /// culprit combination — resolving endpoints, the path search itself,
     /// and verifying a candidate fix — not diagnosis, which has its own
     /// separate budget (see `diagnose_timeout`). A combination that can't
@@ -440,13 +440,13 @@ mod _sparql_relax {
     /// `diagnose`'s own `timeout` — see its docs for what it bounds and why
     /// an internally-enforced timeout matters even when the caller has its
     /// own external one. Independent of `timeout` above: diagnosis runs
-    /// once, before any relaxation work starts, so the two budgets don't
+    /// once, before any connection work starts, so the two budgets don't
     /// interact. Also defaults to 5.0 seconds.
     ///
     /// `ignore_cartesian_risk` disables diagnosis's disconnected-pattern
     /// guard for this call: a combination that would otherwise be reported
-    /// as a `cartesian_risks` entry and never relaxed is instead actually
-    /// evaluated against `data`, and relaxed like any other culprit if
+    /// as a `cartesian_risks` entry and never connected is instead actually
+    /// evaluated against `data`, and connected like any other culprit if
     /// confirmed. Defaults to `False`, preserving the guard. Passing `True`
     /// means opting out of the protection that guard applies — a
     /// disconnected BGP can make the query engine materialize a full N×M
@@ -461,10 +461,10 @@ mod _sparql_relax {
     ///
     /// Returns `(original_row_count, results, filter_results,
     /// cartesian_risks)`. Each result is `(found_at_depth, triples,
-    /// relaxed_query, row_count, pruned_query, pruned_row_count)`: `triples`
+    /// connected_query, row_count, pruned_query, pruned_row_count)`: `triples`
     /// is a list of `(triple_text, path_text)` for every triple in the
     /// combination (`path_text` is `None` when no connecting path was found
-    /// within `max_depth` hops); `relaxed_query` is the combined fix — every
+    /// within `max_depth` hops); `connected_query` is the combined fix — every
     /// triple that found a path spliced in, every triple that didn't simply
     /// dropped — or `None` only if *no* triple in the combination had a path
     /// (including one abandoned because `timeout` was exceeded).
@@ -472,25 +472,25 @@ mod _sparql_relax {
     /// combination simply removed (no path substitution) — not a real fix,
     /// but always present and (outside the rare case where `timeout` cuts
     /// off even its own verification) guaranteed non-empty, so it's there
-    /// as a fallback when `relaxed_query` is `None` or still returns
+    /// as a fallback when `connected_query` is `None` or still returns
     /// nothing. Each filter result is `(expression_text,
     /// row_count_without_filter)`. `cartesian_risks` is shaped exactly like
     /// `diagnose`'s own (`(triples, depth)`) and means the same thing:
-    /// combinations skipped rather than relaxed because their reduced
+    /// combinations skipped rather than connected because their reduced
     /// pattern was disconnected — always empty when `ignore_cartesian_risk`
     /// was set.
     ///
     /// Builds a throwaway store from `data` on every call — for more than
     /// one query against the same graph, build a `Store` once instead and
-    /// call its `diagnose_and_relax` method, which reuses it.
+    /// call its `diagnose_and_connect` method, which reuses it.
     #[pyfunction]
     #[pyo3(signature = (
         data, query, format="turtle", ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
-        allowed_namespaces=default_relax_namespaces(), timeout=default_relax_timeout(),
+        allowed_namespaces=default_connect_namespaces(), timeout=default_connect_timeout(),
         diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
     ))]
     #[allow(clippy::too_many_arguments)]
-    fn diagnose_and_relax(
+    fn diagnose_and_connect(
         py: Python<'_>,
         data: &str,
         query: &str,
@@ -503,7 +503,7 @@ mod _sparql_relax {
         timeout: Option<f64>,
         diagnose_timeout: Option<f64>,
         ignore_cartesian_risk: bool,
-    ) -> PyResult<RelaxTuples> {
+    ) -> PyResult<ConnectTuples> {
         let store = load_store(data, format)?;
         let scope = namespace_scope(allowed_namespaces);
         let timeout = parse_timeout_seconds(timeout)?;
@@ -515,7 +515,7 @@ mod _sparql_relax {
         // unconstrained).
         py.detach(|| {
             let fanout_index = FanoutIndex::build(&store);
-            diagnose_and_relax_tuples(
+            diagnose_and_connect_tuples(
                 &store,
                 &fanout_index,
                 query,
@@ -533,9 +533,9 @@ mod _sparql_relax {
     }
 
     /// An RDF graph loaded once and held for repeated `diagnose`/
-    /// `diagnose_and_relax` calls against it.
+    /// `diagnose_and_connect` calls against it.
     ///
-    /// The free `diagnose`/`diagnose_and_relax` functions each parse `data`
+    /// The free `diagnose`/`diagnose_and_connect` functions each parse `data`
     /// and build a fresh in-memory store from scratch on every call — fine
     /// for a one-off query, but wasteful for the common case of running many
     /// queries against the same graph (e.g. evaluating a batch of generated
@@ -547,7 +547,7 @@ mod _sparql_relax {
     ///
     /// Also builds its `FanoutIndex` (see `sparql-relax-core::fanout`) once
     /// here, for the same reason: it's a one-time, whole-graph scan, and
-    /// `diagnose_and_relax`'s path search reuses it on every call rather
+    /// `diagnose_and_connect`'s path search reuses it on every call rather
     /// than re-scanning the graph per query.
     #[pyclass(name = "Store")]
     struct RdfStore {
@@ -580,11 +580,11 @@ mod _sparql_relax {
 
         #[pyo3(signature = (
             query, ablation_depth=3, max_depth=None, sample_limit=5, result_limit=50_000,
-            allowed_namespaces=default_relax_namespaces(), timeout=default_relax_timeout(),
+            allowed_namespaces=default_connect_namespaces(), timeout=default_connect_timeout(),
             diagnose_timeout=default_ablation_timeout(), ignore_cartesian_risk=false
         ))]
         #[allow(clippy::too_many_arguments)]
-        fn diagnose_and_relax(
+        fn diagnose_and_connect(
             &self,
             py: Python<'_>,
             query: &str,
@@ -596,12 +596,12 @@ mod _sparql_relax {
             timeout: Option<f64>,
             diagnose_timeout: Option<f64>,
             ignore_cartesian_risk: bool,
-        ) -> PyResult<RelaxTuples> {
+        ) -> PyResult<ConnectTuples> {
             let scope = namespace_scope(allowed_namespaces);
             let timeout = parse_timeout_seconds(timeout)?;
             let diagnose_timeout = parse_timeout_seconds(diagnose_timeout)?;
             py.detach(|| {
-                diagnose_and_relax_tuples(
+                diagnose_and_connect_tuples(
                     &self.inner,
                     &self.fanout_index,
                     query,
