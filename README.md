@@ -43,7 +43,7 @@ uv add sparql-relax-rs
 if you've cloned the codebase and are working on the code
 
 ```bash
-uv sync --reinstall-package sparql-relax-rs.
+uv sync --reinstall-package sparql-relax-rs
 ```
 ### Use with AI Agents (MCP)
 To use SPARQL-Relax as a tool for an AI agent (e.g., Claude), see the [MCP Server README](./sparql-relax-mcp/README.md).
