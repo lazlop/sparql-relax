@@ -42,7 +42,7 @@
 //! rather than re-scanning the whole graph per query.
 
 use crate::bfs::predicate_allowed;
-use oxigraph::model::{GraphNameRef, NamedNode, Term};
+use oxigraph::model::{NamedNode, Term};
 use oxigraph::store::Store;
 use std::collections::{HashMap, HashSet};
 
@@ -68,8 +68,10 @@ pub struct FanoutIndex {
 }
 
 impl FanoutIndex {
-    /// Scans every default-graph triple in `store` once (skipping any whose
-    /// predicate `allowed_namespaces` excludes — see
+    /// Scans every triple in `store` once — every graph, not just the
+    /// default one (matching [`crate::bfs::neighbors`], which this index is
+    /// built to be checked against; see that module's docs for why) —
+    /// skipping any whose predicate `allowed_namespaces` excludes (see
     /// [`crate::bfs::predicate_allowed`], the same filter path search itself
     /// applies, so a predicate invisible to the search never contributes to
     /// what "typical connectivity" means for it either) and computes each
@@ -95,7 +97,7 @@ impl FanoutIndex {
         let mut out_neighbors: HashMap<Term, HashSet<(NamedNode, Term)>> = HashMap::new();
         let mut in_neighbors: HashMap<Term, HashSet<(NamedNode, Term)>> = HashMap::new();
 
-        for quad in store.quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph)).flatten() {
+        for quad in store.quads_for_pattern(None, None, None, None).flatten() {
             if !predicate_allowed(&quad.predicate, allowed_namespaces) {
                 continue;
             }

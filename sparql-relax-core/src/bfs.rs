@@ -8,6 +8,20 @@
 //! predicate outside every listed namespace is invisible to the search,
 //! even if it would otherwise connect the two nodes.
 //!
+//! Edges are read from every graph in the store, not just the default graph
+//! — `quads_for_pattern`'s graph argument is always `None` here. This tool
+//! is meant to find any real edge that could plausibly connect two bound
+//! nodes; silently restricting that to the default graph would mean a store
+//! whose data happens to live in named graphs (e.g. loaded from N-Quads/TriG
+//! with explicit graph names) gets no path search at all, with nothing to
+//! indicate why. There's no correctness risk in searching more broadly than
+//! the original query's own graph scope might imply: a candidate path is
+//! always re-verified by actually re-running the modified query (see
+//! [`crate::connect::connect_combo`]) before it's trusted, so a hop that
+//! only holds in a graph the final query can't actually see just fails that
+//! verification and falls back to the pruned query, the same as if no path
+//! had been found at all.
+//!
 //! An optional [`FanoutIndex`] further restricts which edges are eligible
 //! to *expand through* (not just which predicates are allowed at all): a
 //! hop whose specific endpoint has unusually many neighbors via that
@@ -30,7 +44,7 @@
 //! one node's (potentially huge) edge set was walked.
 
 use crate::fanout::FanoutIndex;
-use oxigraph::model::{GraphNameRef, NamedNode, NamedOrBlankNode, Term};
+use oxigraph::model::{NamedNode, NamedOrBlankNode, Term};
 use oxigraph::store::Store;
 use spargebra::algebra::PropertyPathExpression;
 use std::collections::{HashMap, HashSet};
@@ -64,6 +78,10 @@ const DEADLINE_CHECK_INTERVAL: usize = 256;
 /// module docs and [`crate::fanout`]. `None` disables this filtering
 /// entirely (every real, namespace-allowed edge is eligible, matching this
 /// function's behavior before the filter existed).
+///
+/// A single one-shot call, internally just a [`FrontierSearch`] advanced to
+/// completion — see that type's docs for a caller that instead needs to
+/// sweep through increasing depths without redoing shallower work each time.
 pub fn find_path(
     store: &Store,
     start: &Term,
@@ -94,6 +112,10 @@ pub fn find_path(
 /// that (a subject's real match can't be missed just because a flat sample
 /// happened to truncate before reaching it) and cheaper than the
 /// equivalent loop of single-goal searches.
+///
+/// A single one-shot call — see [`FrontierSearch`] for a caller that instead
+/// needs to sweep through increasing depths without redoing shallower work
+/// each time.
 pub fn find_path_to_any(
     store: &Store,
     start: &Term,
@@ -106,27 +128,100 @@ pub fn find_path_to_any(
     if goals.contains(start) {
         return Some(Vec::new());
     }
-
-    let mut visited: HashSet<Term> = HashSet::from([start.clone()]);
-    let mut frontier: Vec<(Term, Vec<Hop>)> = vec![(start.clone(), Vec::new())];
-    let mut edges_since_check = 0usize;
-
+    let mut search = FrontierSearch::new(start);
     for _ in 0..max_depth {
+        if let Some(hops) = search.advance(store, goals, allowed_namespaces, fanout_index, deadline) {
+            return Some(hops);
+        }
+        if search.is_exhausted() {
+            return None;
+        }
+    }
+    None
+}
+
+/// A breadth-first search from a fixed `start`, advanced one hop-level at a
+/// time rather than run to a fixed depth in one call. [`find_path`]/
+/// [`find_path_to_any`] build one of these internally and drive it to
+/// completion for a single, fixed `max_depth` — this type exists for a
+/// caller that instead needs to *sweep* through several depths for the same
+/// `start` (see [`crate::connect::search_candidates`] and
+/// [`crate::connect::search_candidates_grouped`], which try every sampled
+/// endpoint at 1 hop before any is tried at 2, and so on): calling
+/// [`find_path_to_any`] fresh at each depth would re-fetch and re-filter
+/// every shallower level's edges again on every sweep step (e.g. redoing
+/// all of depth 1's work when checking depth 2). Reusing one `FrontierSearch`
+/// across the sweep instead means each depth level's edges are only ever
+/// examined once, no matter how many deeper levels are then tried.
+///
+/// Not exposed outside this crate: it's an internal optimization over
+/// [`find_path_to_any`], not a new capability a caller couldn't already get
+/// (at higher cost) by calling that function fresh at each depth.
+pub(crate) struct FrontierSearch {
+    frontier: Vec<(Term, Vec<Hop>)>,
+    visited: HashSet<Term>,
+    edges_since_check: usize,
+    /// Set once the frontier has run dry (no more nodes to expand) or a
+    /// `deadline` has passed — either way, further [`advance`](Self::advance)
+    /// calls would do nothing, so callers sweeping through depths can check
+    /// this to stop retrying a search that has nothing left to give.
+    exhausted: bool,
+}
+
+impl FrontierSearch {
+    /// A fresh search rooted at `start`, not yet expanded at all (depth 0).
+    pub(crate) fn new(start: &Term) -> Self {
+        Self { frontier: vec![(start.clone(), Vec::new())], visited: HashSet::from([start.clone()]), edges_since_check: 0, exhausted: false }
+    }
+
+    /// Whether this search has nothing left to expand — either its frontier
+    /// ran dry, or a `deadline` passed mid-expansion. Once `true`, every
+    /// future [`advance`](Self::advance) call is a no-op that immediately
+    /// returns `None`; a caller sweeping through depths should stop
+    /// retrying a search once this is `true` rather than calling `advance`
+    /// again for nothing.
+    pub(crate) fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// Expands the frontier by exactly one more hop, returning the hop
+    /// sequence to the first node in `goals` reached at this new depth (if
+    /// any) — the same per-level logic [`find_path_to_any`] runs internally,
+    /// just callable one level at a time so the frontier/visited state from
+    /// a shallower call can be reused rather than rebuilt from `start`.
+    ///
+    /// `None` doesn't mean no path exists at all — only that none was found
+    /// *at this specific new depth*; call `advance` again for the next
+    /// depth (checking [`is_exhausted`](Self::is_exhausted) first, since a
+    /// search that's already run dry has nothing more to offer).
+    pub(crate) fn advance(
+        &mut self,
+        store: &Store,
+        goals: &HashSet<Term>,
+        allowed_namespaces: Option<&[String]>,
+        fanout_index: Option<&FanoutIndex>,
+        deadline: Option<Instant>,
+    ) -> Option<Vec<Hop>> {
+        if self.exhausted {
+            return None;
+        }
         let mut next_frontier = Vec::new();
-        for (node, path) in &frontier {
+        for (node, path) in &self.frontier {
             // Checked once before expanding *this* node too (not just
             // periodically inside its edge loop below) — otherwise an
             // already-past deadline could go unnoticed on a graph small
             // enough that no single node's edges ever reach
             // `DEADLINE_CHECK_INTERVAL`.
             if deadline.is_some_and(|d| Instant::now() >= d) {
+                self.exhausted = true;
                 return None;
             }
             for (hop, neighbor) in neighbors(store, node, allowed_namespaces, fanout_index) {
-                edges_since_check += 1;
-                if edges_since_check >= DEADLINE_CHECK_INTERVAL {
-                    edges_since_check = 0;
+                self.edges_since_check += 1;
+                if self.edges_since_check >= DEADLINE_CHECK_INTERVAL {
+                    self.edges_since_check = 0;
                     if deadline.is_some_and(|d| Instant::now() >= d) {
+                        self.exhausted = true;
                         return None;
                     }
                 }
@@ -135,19 +230,19 @@ pub fn find_path_to_any(
                     full.push(hop);
                     return Some(full);
                 }
-                if visited.insert(neighbor.clone()) {
+                if self.visited.insert(neighbor.clone()) {
                     let mut full = path.clone();
                     full.push(hop);
                     next_frontier.push((neighbor, full));
                 }
             }
         }
-        if next_frontier.is_empty() {
-            return None;
+        self.frontier = next_frontier;
+        if self.frontier.is_empty() {
+            self.exhausted = true;
         }
-        frontier = next_frontier;
+        None
     }
-    None
 }
 
 /// Verifies that following `hops` from `start` (step by step, over the
@@ -183,6 +278,9 @@ pub fn path_holds(store: &Store, start: &Term, goal: &Term, hops: &[Hop]) -> boo
 /// percentile, see [`crate::fanout::FANOUT_PERCENTILE`]) is excluded, `None`
 /// allows any fan-out.
 ///
+/// Reads from every graph in the store (see the module docs on why this
+/// isn't restricted to the default graph).
+///
 /// Each distinct predicate encountered is only checked against
 /// `fanout_index` once per call (memoized in `admitted`/`admitted_inv`
 /// below), not once per edge — a hub predicate might contribute hundreds
@@ -208,16 +306,13 @@ fn neighbors<'a>(
     let forward = as_subject(node).into_iter().flat_map(move |subject| {
         let mut admitted: HashMap<NamedNode, bool> = HashMap::new();
         store
-            .quads_for_pattern(Some(subject.as_ref()), None, None, Some(GraphNameRef::DefaultGraph))
+            .quads_for_pattern(Some(subject.as_ref()), None, None, None)
             .flatten()
             .filter(move |quad| predicate_allowed(&quad.predicate, allowed_namespaces))
             .filter(move |quad| {
                 let Some(index) = fanout_index else { return true };
                 *admitted.entry(quad.predicate.clone()).or_insert_with(|| {
-                    let count = store
-                        .quads_for_pattern(Some(subject.as_ref()), Some(quad.predicate.as_ref()), None, Some(GraphNameRef::DefaultGraph))
-                        .flatten()
-                        .count();
+                    let count = store.quads_for_pattern(Some(subject.as_ref()), Some(quad.predicate.as_ref()), None, None).flatten().count();
                     !index.exceeds_threshold(count)
                 })
             })
@@ -226,16 +321,13 @@ fn neighbors<'a>(
 
     let mut admitted_inv: HashMap<NamedNode, bool> = HashMap::new();
     let inverse = store
-        .quads_for_pattern(None, None, Some(node.as_ref()), Some(GraphNameRef::DefaultGraph))
+        .quads_for_pattern(None, None, Some(node.as_ref()), None)
         .flatten()
         .filter(move |quad| predicate_allowed(&quad.predicate, allowed_namespaces))
         .filter(move |quad| {
             let Some(index) = fanout_index else { return true };
             *admitted_inv.entry(quad.predicate.clone()).or_insert_with(|| {
-                let count = store
-                    .quads_for_pattern(None, Some(quad.predicate.as_ref()), Some(node.as_ref()), Some(GraphNameRef::DefaultGraph))
-                    .flatten()
-                    .count();
+                let count = store.quads_for_pattern(None, Some(quad.predicate.as_ref()), Some(node.as_ref()), None).flatten().count();
                 !index.exceeds_threshold(count)
             })
         })

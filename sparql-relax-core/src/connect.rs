@@ -50,7 +50,7 @@
 use crate::algebra::{
     pattern_of, remove_triple, replace_triple_with_path, variables_of_triples, widen_projection, with_limit, with_pattern,
 };
-use crate::bfs::{Hop, find_path, find_path_to_any, path_holds, path_to_property_path};
+use crate::bfs::{FrontierSearch, Hop, path_holds, path_to_property_path};
 use crate::diagnose::{
     CartesianRiskCombo, Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, DEFAULT_IGNORE_CARTESIAN_RISK, diagnose_parsed,
     ensure_select, resolve_term_pattern, run_select_query_with_deadline,
@@ -548,27 +548,6 @@ fn bind_endpoints(
     Ok(BoundEndpoints { per_triple, pruned_query, pruned_row_count })
 }
 
-/// One bound endpoint's shortest hop sequence at exactly `depth` hops (not
-/// "up to `depth`" — see [`search_candidates`], which calls this once per
-/// depth level and only for endpoints not already resolved at a shallower
-/// one). `allowed_namespaces` restricts which predicates the search may
-/// traverse (see [`NamespaceScope`]). `fanout_index` excludes a candidate
-/// hop whose specific endpoint is an unusually shared "hub" value for its
-/// predicate (see [`crate::fanout`]). `deadline` bounds the search itself
-/// (see the `bfs` module docs on why it's checked by hand rather than via a
-/// `CancellationToken`).
-fn candidate_at_depth(
-    store: &Store,
-    endpoint: &BoundEndpoint,
-    depth: usize,
-    allowed_namespaces: Option<&[String]>,
-    fanout_index: &FanoutIndex,
-    deadline: Option<Instant>,
-) -> Option<Vec<Hop>> {
-    let (s, o) = endpoint;
-    find_path(store, s, o, depth, allowed_namespaces, Some(fanout_index), deadline)
-}
-
 /// Searches `sampled` for every distinct hop sequence connecting a culprit
 /// triple's endpoints, sweeping depth levels one at a time — every sampled
 /// endpoint is tried at 1 hop before *any* is tried at 2, then at 2 before
@@ -579,6 +558,13 @@ fn candidate_at_depth(
 /// happened to sort earlier in `sampled` — this sweep makes that
 /// impossible: nothing at depth 2 is ever even attempted while an
 /// unresolved endpoint might still have a depth-1 match waiting.
+///
+/// Each endpoint keeps its own [`FrontierSearch`] across the whole sweep,
+/// advanced by exactly one hop per depth level, rather than a fresh
+/// [`crate::bfs::find_path`] call per level — so an endpoint still
+/// unresolved at depth 2 reuses the frontier/visited state its own depth-1
+/// attempt already built, instead of re-fetching and re-filtering that same
+/// first hop's edges over again.
 ///
 /// Every sampled endpoint is searched to exhaustion — a longer path found
 /// for one entity doesn't rule out a different, unrelated entity needing
@@ -597,11 +583,12 @@ fn search_candidates(
     deadline: Option<Instant>,
 ) -> Vec<Vec<Hop>> {
     let mut candidates: Vec<Vec<Hop>> = Vec::new();
-    let mut unresolved: Vec<&BoundEndpoint> = sampled.to_vec();
+    let mut unresolved: Vec<(&BoundEndpoint, FrontierSearch)> =
+        sampled.iter().map(|&endpoint| (endpoint, FrontierSearch::new(&endpoint.0))).collect();
 
-    for depth in 1..=max_depth {
+    for _ in 1..=max_depth {
         let mut still_unresolved = Vec::new();
-        for endpoint in unresolved {
+        for (endpoint, mut search) in unresolved {
             let (s, o) = endpoint;
             // Already covered by a candidate found at a shallower depth
             // this sweep (or reused from an earlier triple's search) — no
@@ -609,13 +596,24 @@ fn search_candidates(
             if candidates.iter().any(|hops| path_holds(store, s, o, hops)) {
                 continue;
             }
-            match candidate_at_depth(store, endpoint, depth, allowed_namespaces, fanout_index, deadline) {
+            // `s == o` needs no path at all — matches `find_path`'s own
+            // start-equals-goal shortcut (an empty hop sequence, which
+            // contributes nothing to `candidates` and needs no further
+            // searching), so this endpoint is simply dropped rather than
+            // ever calling `advance`.
+            if s == o {
+                continue;
+            }
+            if search.is_exhausted() {
+                continue;
+            }
+            let goal = HashSet::from([o.clone()]);
+            match search.advance(store, &goal, allowed_namespaces, Some(fanout_index), deadline) {
                 Some(hops) if !hops.is_empty() && !candidates.contains(&hops) => candidates.push(hops),
-                // No path within `depth` hops yet — still a candidate for a
-                // deeper sweep.
-                None => still_unresolved.push(endpoint),
-                // `hops.is_empty()`: start == goal already. `hops` already
-                // in `candidates`: nothing to add or retry either way.
+                // No path within this depth yet, and the frontier isn't
+                // exhausted — still a candidate for a deeper sweep.
+                None => still_unresolved.push((endpoint, search)),
+                // `hops` already in `candidates`: nothing to add or retry.
                 _ => {}
             }
         }
@@ -685,6 +683,11 @@ fn group_by_subject(endpoints: &[BoundEndpoint], subject_limit: Option<usize>) -
 /// distinct one every sampled subject might individually need — that
 /// exhaustive alternative is what `find_all_paths: true` (→
 /// [`search_candidates`]) is for.
+///
+/// Each subject keeps its own [`FrontierSearch`] across the whole sweep (see
+/// [`search_candidates`]'s docs on why), advanced by one hop per depth level
+/// rather than restarted via a fresh [`crate::bfs::find_path_to_any`] call
+/// each time.
 fn search_candidates_grouped(
     store: &Store,
     endpoints: &[BoundEndpoint],
@@ -696,24 +699,35 @@ fn search_candidates_grouped(
 ) -> Vec<Vec<Hop>> {
     let groups = group_by_subject(endpoints, subject_limit);
     let mut candidates: Vec<Vec<Hop>> = Vec::new();
-    let mut unresolved: Vec<&(Term, HashSet<Term>)> = groups.iter().collect();
+    let mut unresolved: Vec<(Term, HashSet<Term>, FrontierSearch)> =
+        groups.into_iter().map(|(s, goals)| { let search = FrontierSearch::new(&s); (s, goals, search) }).collect();
 
-    for depth in 1..=max_depth {
+    for _ in 1..=max_depth {
         let mut still_unresolved = Vec::new();
-        for entry in unresolved {
-            let (subject, goals) = entry;
+        for (subject, goals, mut search) in unresolved {
             // Drop any goal already covered by a candidate found at a
             // shallower depth this sweep, so a subject whose only
             // remaining candidates are already explained by an existing
             // hop sequence isn't searched again for nothing.
             let remaining_goals: HashSet<Term> =
-                goals.iter().filter(|g| !candidates.iter().any(|hops| path_holds(store, subject, g, hops))).cloned().collect();
+                goals.iter().filter(|g| !candidates.iter().any(|hops| path_holds(store, &subject, g, hops))).cloned().collect();
             if remaining_goals.is_empty() {
                 continue;
             }
-            match find_path_to_any(store, subject, &remaining_goals, depth, allowed_namespaces, Some(fanout_index), deadline) {
+            // A subject that already equals one of its own remaining goals
+            // needs no path at all — matches `find_path_to_any`'s own
+            // `goals.contains(start)` shortcut (an empty hop sequence,
+            // which contributes nothing to `candidates`), so this subject
+            // is simply dropped rather than ever calling `advance`.
+            if remaining_goals.contains(&subject) {
+                continue;
+            }
+            if search.is_exhausted() {
+                continue;
+            }
+            match search.advance(store, &remaining_goals, allowed_namespaces, Some(fanout_index), deadline) {
                 Some(hops) if !hops.is_empty() && !candidates.contains(&hops) => candidates.push(hops),
-                None => still_unresolved.push(entry),
+                None => still_unresolved.push((subject, goals, search)),
                 _ => {}
             }
         }

@@ -102,6 +102,23 @@ fn find_path_still_works_through_a_high_fan_out_hub_node() {
 }
 
 #[test]
+fn find_path_sees_edges_in_named_graphs_not_just_the_default_graph() {
+    // Regression test: path search used to hard-code `GraphNameRef::DefaultGraph`,
+    // so a store whose data was loaded into a named graph (e.g. via N-Quads
+    // with an explicit graph term, as here) would be invisible to it —
+    // silently, with no error to indicate why nothing was ever found.
+    let store = Store::new().unwrap();
+    let nquads = "<urn:example#a> <urn:example#hasPart> <urn:example#b> <urn:example#g1> .\n";
+    store.load_from_slice(RdfParser::from_format(RdfFormat::NQuads), nquads).unwrap();
+
+    let a = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#a").unwrap());
+    let b = oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new("urn:example#b").unwrap());
+
+    let found = sparql_relax_core::bfs::find_path(&store, &a, &b, 1, None, None, None);
+    assert_eq!(found, Some(vec![Hop::Forward(oxigraph::model::NamedNode::new("urn:example#hasPart").unwrap())]));
+}
+
+#[test]
 fn fanout_index_rejects_a_hop_through_a_shared_hub_value_but_not_a_normal_one() {
     // Ten entities share one generic tag (`commonTag`) -- a "hub" value in
     // exactly the shape that produced this tool's worst measured
