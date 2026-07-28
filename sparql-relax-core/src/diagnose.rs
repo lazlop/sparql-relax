@@ -35,6 +35,7 @@ use crate::algebra::{
     variables_of_triples, widen_projection, with_pattern,
 };
 use crate::error::{RelaxError, Result};
+use crate::query::RdfTerm;
 use oxigraph::model::{GraphNameRef, NamedOrBlankNode, Term};
 use oxigraph::sparql::{CancellationToken, QueryEvaluationError, QueryResults, QuerySolution, SparqlEvaluator};
 use oxigraph::store::Store;
@@ -88,6 +89,18 @@ pub struct Diagnosis {
     pub culprits: Vec<Culprit>,
     pub filter_culprits: Vec<FilterCulprit>,
     pub cartesian_risks: Vec<CartesianRiskCombo>,
+    /// The projected column order for `sample_rows`. Empty whenever
+    /// `sample_rows` is (i.e. whenever `sample_limit` was 0 or the original
+    /// query returned no rows at all).
+    pub sample_variables: Vec<String>,
+    /// Up to `sample_limit` rows of the *original* query's own result,
+    /// carried along at no extra query cost — [`diagnose_parsed`] already
+    /// materializes the full result to get `original_row_count`, so keeping
+    /// the first few rows before the rest are dropped is free. Empty unless
+    /// the caller opted in via `sample_limit > 0` on [`diagnose`]: this is
+    /// otherwise a pure diagnosis (which triple/filter is broken), not a
+    /// query-results call — see [`crate::query`] for that.
+    pub sample_rows: Vec<Vec<Option<RdfTerm>>>,
 }
 
 /// Default for `depth`/`ablation_depth`: single triples are tried first, and
@@ -135,7 +148,7 @@ fn is_rdf_type_triple(triple: &TriplePattern) -> bool {
 /// `ignore_cartesian_risk` on [`diagnose`]). A convenient default for
 /// callers who don't need to tune the search.
 pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
-    diagnose(query_text, store, DEFAULT_ABLATION_DEPTH, Some(DEFAULT_ABLATION_TIMEOUT), DEFAULT_IGNORE_CARTESIAN_RISK)
+    diagnose(query_text, store, DEFAULT_ABLATION_DEPTH, Some(DEFAULT_ABLATION_TIMEOUT), DEFAULT_IGNORE_CARTESIAN_RISK, 0)
 }
 
 /// Diagnoses `query_text` against `store`. Only `SELECT` queries are
@@ -199,11 +212,28 @@ pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
 /// justifies it. Pass `false` to restore the guard for a caller that can't
 /// tolerate the risk (no watchdog of its own to kill and restart a wedged
 /// worker).
-pub fn diagnose(query_text: &str, store: &Store, depth: usize, timeout: Option<Duration>, ignore_cartesian_risk: bool) -> Result<Diagnosis> {
+///
+/// `sample_limit` opts into carrying along up to that many rows of the
+/// *original* query's own result, in [`Diagnosis::sample_rows`]/
+/// [`Diagnosis::sample_variables`] — free to include since the full result
+/// is already materialized here to get [`Diagnosis::original_row_count`], so
+/// keeping the first few rows before the rest are discarded costs nothing
+/// extra. Defaults to `0` (via [`diagnose_default`]) since a plain diagnosis
+/// is meant to stay a which-triple-is-broken call, not a query-results one —
+/// see [`crate::query`] for that; pass a positive limit to also get a peek at
+/// what the query actually returns without a second round trip.
+pub fn diagnose(
+    query_text: &str,
+    store: &Store,
+    depth: usize,
+    timeout: Option<Duration>,
+    ignore_cartesian_risk: bool,
+    sample_limit: usize,
+) -> Result<Diagnosis> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
-    diagnose_parsed(&query, &pattern, store, depth, timeout, ignore_cartesian_risk)
+    diagnose_parsed(&query, &pattern, store, depth, timeout, ignore_cartesian_risk, sample_limit)
 }
 
 pub(crate) fn ensure_select(query: &Query) -> Result<()> {
@@ -227,6 +257,11 @@ pub(crate) fn ensure_select(query: &Query) -> Result<()> {
 /// `ignore_cartesian_risk` is passed straight through from whichever public
 /// entry point called this — see its docs on [`diagnose`] (and on
 /// [`crate::connect::diagnose_and_connect`], which shares this same guard).
+///
+/// `sample_limit` is passed straight through from [`diagnose`] — see its
+/// docs. [`crate::connect::diagnose_and_connect`] always passes `0`: it
+/// resolves culprit bindings itself, so it has no use for a plain sample of
+/// the original result.
 pub(crate) fn diagnose_parsed(
     query: &Query,
     pattern: &GraphPattern,
@@ -234,6 +269,7 @@ pub(crate) fn diagnose_parsed(
     depth: usize,
     timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
+    sample_limit: usize,
 ) -> Result<Diagnosis> {
     // One shared deadline for every query this call runs, rather than a
     // fresh budget per check — see the `timeout` docs on [`diagnose`].
@@ -242,6 +278,18 @@ pub(crate) fn diagnose_parsed(
     let Some(original_rows) = run_select_query_with_deadline(query.clone(), store, deadline)? else {
         return Err(RelaxError::Timeout);
     };
+
+    // Free to pull out now: `original_rows` is already fully materialized
+    // above to get `original_row_count` below, so keeping the first few rows
+    // before the rest are dropped costs nothing extra. Kept at `0`/empty
+    // unless the caller opted in via `sample_limit` — see [`diagnose`]'s docs.
+    let sample_variables: Vec<String> = if sample_limit == 0 {
+        Vec::new()
+    } else {
+        original_rows.first().map(|row| row.variables().iter().map(|v| v.as_str().to_string()).collect()).unwrap_or_default()
+    };
+    let sample_rows: Vec<Vec<Option<RdfTerm>>> =
+        original_rows.iter().take(sample_limit).map(|row| row.values().iter().map(|v| v.clone().map(RdfTerm::from)).collect()).collect();
 
     let triple_candidates: Vec<TriplePattern> = collect_bgp_triples(pattern)
         .into_iter()
@@ -329,7 +377,7 @@ pub(crate) fn diagnose_parsed(
         })
         .collect();
 
-    Ok(Diagnosis { original_row_count: original_rows.len(), culprits, filter_culprits, cartesian_risks })
+    Ok(Diagnosis { original_row_count: original_rows.len(), culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows })
 }
 
 /// The three outcomes [`classify_combo`] can reach for one candidate

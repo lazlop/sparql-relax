@@ -415,7 +415,7 @@ pub fn diagnose_and_connect_with_fanout_index(
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
-    let diagnosis = diagnose_parsed(&query, &pattern, store, ablation_depth, diagnose_timeout, ignore_cartesian_risk)?;
+    let diagnosis = diagnose_parsed(&query, &pattern, store, ablation_depth, diagnose_timeout, ignore_cartesian_risk, 0)?;
     let allowed_namespaces = namespace_scope.as_filter();
 
     // Every culprit combination is connected independently against the same

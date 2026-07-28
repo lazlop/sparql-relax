@@ -19,7 +19,7 @@ docstring.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from ._sparql_relax import Store as _Store
@@ -129,6 +129,19 @@ class Diagnosis:
     culprits: List[Culprit]
     filter_culprits: List[FilterCulprit]
     cartesian_risks: List[CartesianRiskCombo]
+
+    sample_variables: List[str] = field(default_factory=list)
+    """The `SELECT` column order for `sample_rows`, shaped exactly like `QueryResult.variables`.
+    Empty unless `sample_limit > 0` was passed to `diagnose`/`Store.diagnose`."""
+
+    sample_rows: List[List[Optional[Term]]] = field(default_factory=list)
+    """Up to `sample_limit` rows of the *original* query's own result, carried along at no extra
+    query cost — the full result is already computed to get `original_row_count`, so keeping the
+    first few rows before the rest are dropped is free. Each row aligns to `sample_variables`
+    position-for-position, with `None` wherever that variable was left unbound in that row — same
+    shape as `QueryResult.rows`. Empty unless the caller opted in via `sample_limit > 0`: a plain
+    `diagnose` call is meant to stay a which-triple-is-broken check, not a query-results call —
+    use `query`/`Store.query` for that."""
 
 
 @dataclass
@@ -279,7 +292,9 @@ def _query_result_from_tuple(t) -> QueryResult:
     )
 
 
-def _diagnosis_from_tuples(original_row_count: int, culprits, filter_culprits, cartesian_risks) -> Diagnosis:
+def _diagnosis_from_tuples(
+    original_row_count: int, culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows
+) -> Diagnosis:
     return Diagnosis(
         original_row_count=original_row_count,
         culprits=[Culprit(triples=triples, depth=culprit_depth) for triples, culprit_depth in culprits],
@@ -287,6 +302,8 @@ def _diagnosis_from_tuples(original_row_count: int, culprits, filter_culprits, c
             FilterCulprit(expression=e, row_count_without_filter=n) for e, n in filter_culprits
         ],
         cartesian_risks=[CartesianRiskCombo(triples=triples, depth=d) for triples, d in cartesian_risks],
+        sample_variables=sample_variables,
+        sample_rows=[[None if term is None else _term_from_tuple(term) for term in row] for row in sample_rows],
     )
 
 
@@ -341,12 +358,13 @@ class Store:
         depth: int = 3,
         timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
         ignore_cartesian_risk: bool = True,
+        sample_limit: int = 0,
     ) -> Diagnosis:
         """See the module-level `diagnose` for what this does and what its parameters control."""
-        original_row_count, culprits, filter_culprits, cartesian_risks = self._store.diagnose(
-            query, depth=depth, timeout=timeout, ignore_cartesian_risk=ignore_cartesian_risk
+        original_row_count, culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows = self._store.diagnose(
+            query, depth=depth, timeout=timeout, ignore_cartesian_risk=ignore_cartesian_risk, sample_limit=sample_limit
         )
-        return _diagnosis_from_tuples(original_row_count, culprits, filter_culprits, cartesian_risks)
+        return _diagnosis_from_tuples(original_row_count, culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows)
 
     def diagnose_and_connect(
         self,
@@ -392,6 +410,7 @@ def diagnose(
     depth: int = 3,
     timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
     ignore_cartesian_risk: bool = True,
+    sample_limit: int = 0,
 ) -> Diagnosis:
     """Diagnoses which BGP triple(s)/FILTER(s) in `query` are likely broken against `data`.
 
@@ -452,10 +471,20 @@ def diagnose(
     process-level backstop for a wedged worker thread. Pass `False` to restore the guard for a
     caller that can't tolerate that risk.
 
+    `sample_limit` opts into also populating `Diagnosis.sample_variables`/`Diagnosis.sample_rows`
+    with up to that many rows of the *original* query's own result — free to include since the
+    full result is already computed to get `original_row_count`, so keeping the first few rows
+    before the rest are dropped costs nothing extra. Defaults to `0`: a plain `diagnose` call is
+    meant to stay a which-triple-is-broken check, not a query-results call — use `query`/
+    `Store.query` for that, or pass a positive limit here for a peek at the actual rows without a
+    second round trip.
+
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
     same graph, build a `Store` once instead and call its `diagnose` method.
     """
-    return Store(data, format).diagnose(query, depth=depth, timeout=timeout, ignore_cartesian_risk=ignore_cartesian_risk)
+    return Store(data, format).diagnose(
+        query, depth=depth, timeout=timeout, ignore_cartesian_risk=ignore_cartesian_risk, sample_limit=sample_limit
+    )
 
 
 def diagnose_and_connect(

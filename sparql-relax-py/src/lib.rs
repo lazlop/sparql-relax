@@ -86,7 +86,11 @@ type ConnectResultTuple = (usize, Vec<ConnectedTripleTuple>, Option<String>, usi
 // `CartesianRiskCombo` has the exact same (triples, depth) shape as `Culprit`,
 // so it reuses `CulpritTuple` rather than a duplicate type — the two are
 // kept apart at the Python layer by which list they end up in, not by shape.
-type DiagnoseTuples = (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>);
+//
+// The trailing `(Vec<String>, Vec<Vec<Option<TermTuple>>>)` is
+// `(sample_variables, sample_rows)` — same shape as `QueryTuple`'s
+// `"solutions"` case, empty unless `sample_limit > 0` was passed.
+type DiagnoseTuples = (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>, Vec<String>, Vec<Vec<Option<TermTuple>>>);
 type ConnectTuples = (usize, Vec<ConnectResultTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>);
 
 /// An RDF term as `(kind, value, datatype, language)`, where `kind` is
@@ -142,8 +146,9 @@ fn diagnose_tuples(
     depth: usize,
     timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
+    sample_limit: usize,
 ) -> Result<DiagnoseTuples, sparql_relax_core::RelaxError> {
-    let diagnosis = core_diagnose(query, store, depth, timeout, ignore_cartesian_risk)?;
+    let diagnosis = core_diagnose(query, store, depth, timeout, ignore_cartesian_risk, sample_limit)?;
     let culprits = diagnosis
         .culprits
         .into_iter()
@@ -159,7 +164,8 @@ fn diagnose_tuples(
         .into_iter()
         .map(|c| (c.triples.iter().map(ToString::to_string).collect(), c.depth))
         .collect();
-    Ok((diagnosis.original_row_count, culprits, filter_culprits, cartesian_risks))
+    let sample_rows = diagnosis.sample_rows.into_iter().map(|row| row.into_iter().map(|t| t.map(term_tuple)).collect()).collect();
+    Ok((diagnosis.original_row_count, culprits, filter_culprits, cartesian_risks, diagnosis.sample_variables, sample_rows))
 }
 
 /// Same as [`diagnose_tuples`], but for `diagnose_and_connect` — shared by the
@@ -271,11 +277,16 @@ mod _sparql_relax {
     /// instead of piling up behind an abandoned future.
     ///
     /// Returns `(original_row_count, culprits, filter_culprits,
-    /// cartesian_risks)`. Each culprit is `(triples, depth)`: `triples` is a
-    /// list of triple texts in the combination (just one unless `depth > 1`
-    /// was needed), and `depth` is the combination size at which it was
-    /// found. Each filter culprit is `(expression_text,
-    /// row_count_without_filter)`.
+    /// cartesian_risks, sample_variables, sample_rows)`. Each culprit is
+    /// `(triples, depth)`: `triples` is a list of triple texts in the
+    /// combination (just one unless `depth > 1` was needed), and `depth` is
+    /// the combination size at which it was found. Each filter culprit is
+    /// `(expression_text, row_count_without_filter)`.
+    ///
+    /// `sample_variables` is the `SELECT` column order for `sample_rows`,
+    /// shaped exactly like `query`'s own `variables`/`rows` (each row aligns
+    /// to it position-for-position, with `None` wherever that variable was
+    /// left unbound); both are empty unless `sample_limit > 0` was passed.
     ///
     /// `cartesian_risks` is shaped exactly like `culprits` (`(triples,
     /// depth)`), but means something different: each entry is a combination
@@ -310,6 +321,15 @@ mod _sparql_relax {
     /// caller that already has, or can afford to add, a process-level
     /// backstop for a wedged worker thread. Pass `False` to restore the
     /// guard for a caller that can't tolerate that risk.
+    ///
+    /// `sample_limit` opts into also returning up to that many rows of the
+    /// *original* query's own result, in `sample_variables`/`sample_rows` —
+    /// free to include since the full result is already materialized here to
+    /// compute `original_row_count`, so keeping the first few rows before the
+    /// rest are discarded costs nothing extra. Defaults to `0`: a plain
+    /// diagnosis is meant to stay a which-triple-is-broken call, not a
+    /// query-results one (see `query` for that) — pass a positive limit for a
+    /// peek at what the query actually returns without a second round trip.
     ///
     /// Runs `query` (any SPARQL query form — `SELECT`, `ASK`, `CONSTRUCT`,
     /// `DESCRIBE`) against the RDF graph in `data` (parsed as `format`) and
@@ -382,7 +402,8 @@ mod _sparql_relax {
     /// one query against the same graph, build a `Store` once instead and
     /// call its `diagnose` method, which reuses it.
     #[pyfunction]
-    #[pyo3(signature = (data, query, format="turtle", depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true))]
+    #[pyo3(signature = (data, query, format="turtle", depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true, sample_limit=0))]
+    #[allow(clippy::too_many_arguments)]
     fn diagnose(
         py: Python<'_>,
         data: &str,
@@ -391,6 +412,7 @@ mod _sparql_relax {
         depth: usize,
         timeout: Option<f64>,
         ignore_cartesian_risk: bool,
+        sample_limit: usize,
     ) -> PyResult<DiagnoseTuples> {
         let store = load_store(data, format)?;
         let timeout = parse_timeout_seconds(timeout)?;
@@ -399,7 +421,7 @@ mod _sparql_relax {
         // wrapper around this call couldn't actually regain control until
         // the search finished on its own, since no other Python thread
         // could run while this one held the GIL.
-        py.detach(|| diagnose_tuples(&store, query, depth, timeout, ignore_cartesian_risk)).map_err(to_py_err)
+        py.detach(|| diagnose_tuples(&store, query, depth, timeout, ignore_cartesian_risk, sample_limit)).map_err(to_py_err)
     }
 
     /// Diagnoses `query` and, for each culprit combination found, searches
@@ -610,7 +632,7 @@ mod _sparql_relax {
             Ok(Self { inner, fanout_index })
         }
 
-        #[pyo3(signature = (query, depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true))]
+        #[pyo3(signature = (query, depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true, sample_limit=0))]
         fn diagnose(
             &self,
             py: Python<'_>,
@@ -618,9 +640,10 @@ mod _sparql_relax {
             depth: usize,
             timeout: Option<f64>,
             ignore_cartesian_risk: bool,
+            sample_limit: usize,
         ) -> PyResult<DiagnoseTuples> {
             let timeout = parse_timeout_seconds(timeout)?;
-            py.detach(|| diagnose_tuples(&self.inner, query, depth, timeout, ignore_cartesian_risk)).map_err(to_py_err)
+            py.detach(|| diagnose_tuples(&self.inner, query, depth, timeout, ignore_cartesian_risk, sample_limit)).map_err(to_py_err)
         }
 
         #[pyo3(signature = (
