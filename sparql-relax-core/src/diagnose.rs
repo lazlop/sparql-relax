@@ -131,6 +131,14 @@ pub const DEFAULT_ABLATION_TIMEOUT: Duration = Duration::from_secs(5);
 /// is unacceptable).
 pub const DEFAULT_IGNORE_CARTESIAN_RISK: bool = true;
 
+/// Default for `expand_nonempty_results`: `false`, meaning a query that
+/// already returned at least one row skips the ablation search entirely —
+/// see `expand_nonempty_results`'s docs on [`diagnose`] for the tradeoff.
+/// The common case for this tool is explaining a query that returned
+/// nothing; a caller that also wants to know about triples/filters quietly
+/// narrowing an already-nonempty result should opt in explicitly.
+pub const DEFAULT_EXPAND_NONEMPTY_RESULTS: bool = false;
+
 /// `rdf:type`'s IRI — checked against every candidate triple's predicate to
 /// prioritize the combination search below. Measured across this tool's
 /// building-automation eval set, roughly two-thirds of confirmed culprits
@@ -148,7 +156,15 @@ fn is_rdf_type_triple(triple: &TriplePattern) -> bool {
 /// `ignore_cartesian_risk` on [`diagnose`]). A convenient default for
 /// callers who don't need to tune the search.
 pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
-    diagnose(query_text, store, DEFAULT_ABLATION_DEPTH, Some(DEFAULT_ABLATION_TIMEOUT), DEFAULT_IGNORE_CARTESIAN_RISK, 0)
+    diagnose(
+        query_text,
+        store,
+        DEFAULT_ABLATION_DEPTH,
+        Some(DEFAULT_ABLATION_TIMEOUT),
+        DEFAULT_IGNORE_CARTESIAN_RISK,
+        0,
+        DEFAULT_EXPAND_NONEMPTY_RESULTS,
+    )
 }
 
 /// Diagnoses `query_text` against `store`. Only `SELECT` queries are
@@ -222,6 +238,22 @@ pub fn diagnose_default(query_text: &str, store: &Store) -> Result<Diagnosis> {
 /// is meant to stay a which-triple-is-broken call, not a query-results one —
 /// see [`crate::query`] for that; pass a positive limit to also get a peek at
 /// what the query actually returns without a second round trip.
+///
+/// `expand_nonempty_results` controls whether the (combinatorial, and by far
+/// the most expensive part of this call) ablation search over triples/
+/// filters runs at all once the original query already has at least one
+/// row. The common case for this tool is explaining a query that returned
+/// *nothing*; once it's known the query already returns something,
+/// [`DEFAULT_EXPAND_NONEMPTY_RESULTS`] (`false`, the default via
+/// [`diagnose_default`]) skips the search entirely and returns immediately
+/// with empty `culprits`/`filter_culprits`/`cartesian_risks` — `depth`,
+/// `ignore_cartesian_risk`, and every combination/filter check they'd
+/// otherwise drive become moot. `original_row_count`/`sample_variables`/
+/// `sample_rows` are unaffected either way, since they only ever cost one
+/// materialization of the original query, already paid before this check
+/// runs. Pass `true` to search for triples/filters that are quietly
+/// narrowing an already-nonempty result too — the same search this function
+/// always ran before this parameter existed.
 pub fn diagnose(
     query_text: &str,
     store: &Store,
@@ -229,11 +261,12 @@ pub fn diagnose(
     timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
     sample_limit: usize,
+    expand_nonempty_results: bool,
 ) -> Result<Diagnosis> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
-    diagnose_parsed(&query, &pattern, store, depth, timeout, ignore_cartesian_risk, sample_limit)
+    diagnose_parsed(&query, &pattern, store, depth, timeout, ignore_cartesian_risk, sample_limit, expand_nonempty_results)
 }
 
 pub(crate) fn ensure_select(query: &Query) -> Result<()> {
@@ -262,6 +295,12 @@ pub(crate) fn ensure_select(query: &Query) -> Result<()> {
 /// docs. [`crate::connect::diagnose_and_connect`] always passes `0`: it
 /// resolves culprit bindings itself, so it has no use for a plain sample of
 /// the original result.
+///
+/// `expand_nonempty_results` is passed straight through from [`diagnose`] —
+/// see its docs. [`crate::connect::diagnose_and_connect`] always passes
+/// `true`: a caller reaching for `connect` explicitly wants culprit/path
+/// search regardless of whether the original query already returned rows,
+/// so the cheap skip this flag enables would defeat the point of calling it.
 pub(crate) fn diagnose_parsed(
     query: &Query,
     pattern: &GraphPattern,
@@ -270,6 +309,7 @@ pub(crate) fn diagnose_parsed(
     timeout: Option<Duration>,
     ignore_cartesian_risk: bool,
     sample_limit: usize,
+    expand_nonempty_results: bool,
 ) -> Result<Diagnosis> {
     // One shared deadline for every query this call runs, rather than a
     // fresh budget per check — see the `timeout` docs on [`diagnose`].
@@ -298,6 +338,24 @@ pub(crate) fn diagnose_parsed(
     let filter_candidates = collect_filters(pattern);
     if triple_candidates.is_empty() && filter_candidates.is_empty() {
         return Err(RelaxError::NoTriples);
+    }
+
+    // The ablation search below is the expensive part of this call — up to
+    // C(n, k) reduced-query evaluations per depth level. Skip it entirely
+    // once the original query is already known to return something, unless
+    // the caller opted in via `expand_nonempty_results` — see its docs on
+    // [`diagnose`]. `original_row_count`/`sample_variables`/`sample_rows`
+    // above already cost nothing extra beyond the one materialization every
+    // `diagnose` call needs regardless, so they're unaffected by this.
+    if !original_rows.is_empty() && !expand_nonempty_results {
+        return Ok(Diagnosis {
+            original_row_count: original_rows.len(),
+            culprits: Vec::new(),
+            filter_culprits: Vec::new(),
+            cartesian_risks: Vec::new(),
+            sample_variables,
+            sample_rows,
+        });
     }
 
     // One shared cancellation token (and its one timer thread) for every

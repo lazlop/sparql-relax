@@ -30,7 +30,7 @@ const BROKEN_QUERY: &str = r#"
 #[test]
 fn diagnoses_the_wrong_predicate_as_a_culprit() {
     let store = test_store();
-    let diagnosis = diagnose(BROKEN_QUERY, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(BROKEN_QUERY, &store, 1, None, false, 0, false).unwrap();
 
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1);
@@ -55,7 +55,7 @@ fn diagnose_errors_with_timeout_when_even_the_original_query_cant_run_in_time() 
     // knowing its row count, so this is a hard error, not a graceful
     // "no culprits found".
     let store = test_store();
-    let result = diagnose(BROKEN_QUERY, &store, 1, Some(Duration::from_nanos(1)), false, 0);
+    let result = diagnose(BROKEN_QUERY, &store, 1, Some(Duration::from_nanos(1)), false, 0, false);
     assert!(matches!(result, Err(RelaxError::Timeout)), "expected a Timeout error");
 }
 
@@ -267,7 +267,7 @@ fn query_with_no_broken_triples_reports_no_culprits() {
             ?sensor a ex:TempSensor .
         }
     "#;
-    let diagnosis = diagnose(query, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false, 0, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 1);
     assert!(diagnosis.culprits.is_empty());
 }
@@ -282,7 +282,7 @@ fn sample_limit_zero_returns_no_sample_rows_or_variables() {
             ?sensor a ex:TempSensor .
         }
     "#;
-    let diagnosis = diagnose(query, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false, 0, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 1);
     assert!(diagnosis.sample_variables.is_empty());
     assert!(diagnosis.sample_rows.is_empty());
@@ -298,7 +298,7 @@ fn sample_limit_carries_along_the_original_query_s_own_rows() {
             ?sensor a ex:TempSensor .
         }
     "#;
-    let diagnosis = diagnose(query, &store, 1, None, false, 5).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false, 5, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 1);
     assert_eq!(diagnosis.sample_variables, vec!["sensor".to_string()]);
     assert_eq!(diagnosis.sample_rows.len(), 1);
@@ -318,7 +318,7 @@ fn sample_limit_caps_below_the_full_row_count() {
         PREFIX ex: <urn:example#>
         SELECT ?child WHERE { ex:root ex:hasPart ?child . ?child a ex:Missing . }
     "#;
-    let diagnosis = diagnose(query, &store, 1, None, false, 3).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false, 3, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 0);
     // The one broken triple is ?child a ex:Missing, so the original result is
     // empty even though `ex:root ex:hasPart ?child` alone has 10 matches --
@@ -484,7 +484,7 @@ fn diagnoses_an_overly_restrictive_filter_as_a_culprit() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false, 0, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 0);
     assert!(diagnosis.culprits.is_empty(), "no BGP triple is broken here, only the filter");
     assert_eq!(diagnosis.filter_culprits.len(), 1);
@@ -503,9 +503,50 @@ fn does_not_flag_a_filter_that_is_not_excluding_anything() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false, 0, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 1);
     assert!(diagnosis.filter_culprits.is_empty());
+}
+
+#[test]
+fn expand_nonempty_results_false_skips_the_ablation_search_once_rows_exist() {
+    // Two sensors: sensor1 (72) fails the FILTER, sensor2 (2000) passes it,
+    // so the query already returns one row (sensor2) even though the FILTER
+    // is genuinely excluding sensor1. With the default
+    // `expand_nonempty_results: false`, that's never checked at all — the
+    // ablation search is skipped outright once the original query is known
+    // to return something.
+    let store = Store::new().unwrap();
+    store
+        .load_from_slice(
+            RdfParser::from_format(RdfFormat::Turtle),
+            r#"
+                @prefix ex: <urn:example#> .
+                ex:zone1 ex:hasSensor ex:sensor1 .
+                ex:sensor1 ex:hasValue 72 .
+                ex:zone1 ex:hasSensor ex:sensor2 .
+                ex:sensor2 ex:hasValue 2000 .
+            "#,
+        )
+        .unwrap();
+    let query = r#"
+        PREFIX ex: <urn:example#>
+        SELECT ?sensor ?value WHERE {
+            ex:zone1 ex:hasSensor ?sensor .
+            ?sensor ex:hasValue ?value .
+            FILTER(?value > 1000)
+        }
+    "#;
+
+    let skipped = diagnose(query, &store, 1, None, false, 0, false).unwrap();
+    assert_eq!(skipped.original_row_count, 1);
+    assert!(skipped.filter_culprits.is_empty(), "the search should never have run");
+    assert!(skipped.culprits.is_empty());
+
+    let expanded = diagnose(query, &store, 1, None, false, 0, true).unwrap();
+    assert_eq!(expanded.original_row_count, 1);
+    assert_eq!(expanded.filter_culprits.len(), 1, "opting in should find the same filter culprit as the empty-result case");
+    assert_eq!(expanded.filter_culprits[0].row_count_without_filter, 2);
 }
 
 #[test]
@@ -556,7 +597,7 @@ fn combines_distinct_paths_from_different_bound_pairs_as_alternatives() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false, 0, false).unwrap();
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1);
 
@@ -680,10 +721,10 @@ fn depth_1_finds_nothing_but_depth_2_finds_a_joint_two_triple_culprit() {
         }
     "#;
 
-    let depth_1 = diagnose(query, &store, 1, None, false, 0).unwrap();
+    let depth_1 = diagnose(query, &store, 1, None, false, 0, false).unwrap();
     assert!(depth_1.culprits.is_empty(), "no single triple's removal alone unblocks the query");
 
-    let depth_3 = diagnose(query, &store, 3, None, false, 0).unwrap();
+    let depth_3 = diagnose(query, &store, 3, None, false, 0, false).unwrap();
     assert_eq!(depth_3.culprits.len(), 1, "exactly one joint 2-triple culprit should be found");
     let culprit = &depth_3.culprits[0];
     assert_eq!(culprit.depth, 2, "found at depth 2, so depth 3 never had to run");
@@ -742,7 +783,7 @@ fn does_not_connect_when_the_object_is_unconstrained_elsewhere() {
         }
     "#;
 
-    let diagnosis = diagnose(query, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false, 0, false).unwrap();
     assert_eq!(diagnosis.culprits.len(), 1, "building has no direct hasSensor edge");
 
     let report = diagnose_and_connect(query, &store, 1, Some(2), None, None, NamespaceScope::Unrestricted, None, None, false, false).unwrap();
@@ -941,7 +982,7 @@ const DISCONNECTED_QUERY: &str = r#"
 #[test]
 fn a_disconnected_reduced_pattern_is_reported_as_a_cartesian_risk_not_silently_ruled_out() {
     let store = disconnected_store();
-    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None, false, 0, false).unwrap();
 
     assert_eq!(diagnosis.original_row_count, 0);
     // Removing the real culprit (T1, `ex:hasBrokenLink`) leaves {T2, T3}
@@ -1009,7 +1050,7 @@ fn ignore_cartesian_risk_lets_connect_attempt_a_combo_diagnose_would_otherwise_s
 #[test]
 fn ignore_cartesian_risk_recovers_the_real_culprit_diagnose_skipped() {
     let store = disconnected_store();
-    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None, true, 0).unwrap();
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None, true, 0, false).unwrap();
 
     assert!(diagnosis.cartesian_risks.is_empty(), "every combo was actually evaluated, so none should be reported as skipped");
     assert_eq!(diagnosis.culprits.len(), 1, "only the hasBrokenLink combo should be confirmed a genuine culprit");
@@ -1023,14 +1064,14 @@ fn ignore_cartesian_risk_recovers_the_real_culprit_diagnose_skipped() {
 #[test]
 fn pruned_query_text_removes_the_given_triple_and_the_result_runs() {
     let store = disconnected_store();
-    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None, true, 0).unwrap();
+    let diagnosis = diagnose(DISCONNECTED_QUERY, &store, 1, None, true, 0, false).unwrap();
     assert_eq!(diagnosis.culprits.len(), 1);
 
     let triples: Vec<String> = diagnosis.culprits[0].triples.iter().map(ToString::to_string).collect();
     let pruned = pruned_query_text(DISCONNECTED_QUERY, &triples).unwrap();
     assert!(!pruned.contains("hasBrokenLink"), "the culprit triple should be gone from the pruned query text");
 
-    let rows = diagnose(&pruned, &store, 1, None, false, 0).unwrap();
+    let rows = diagnose(&pruned, &store, 1, None, false, 0, false).unwrap();
     assert_eq!(rows.original_row_count, 1, "removing the real culprit should unblock the query");
 }
 
@@ -1081,7 +1122,7 @@ const DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY: &str = r#"
 #[test]
 fn an_optional_only_shared_variable_does_not_mask_a_cartesian_risk_in_the_required_pattern() {
     let store = disconnected_with_optional_bridge_store();
-    let diagnosis = diagnose(DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(DISCONNECTED_WITH_OPTIONAL_BRIDGE_QUERY, &store, 1, None, false, 0, false).unwrap();
 
     assert_eq!(diagnosis.original_row_count, 0);
     // Removing the real culprit (`ex:hasBrokenLink`) leaves `?sensor` and
@@ -1141,7 +1182,7 @@ fn an_rdf_type_culprit_short_circuits_before_the_rest_of_its_depth_is_ever_check
             ?zone ex:hasWidget ex:widget1 .
         }
     "#;
-    let diagnosis = diagnose(query, &store, 1, None, false, 0).unwrap();
+    let diagnosis = diagnose(query, &store, 1, None, false, 0, false).unwrap();
 
     assert_eq!(diagnosis.original_row_count, 0);
     assert_eq!(diagnosis.culprits.len(), 1, "the rdf:type triple alone should be confirmed as the culprit");

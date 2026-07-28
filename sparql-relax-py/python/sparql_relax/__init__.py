@@ -359,10 +359,16 @@ class Store:
         timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
         ignore_cartesian_risk: bool = True,
         sample_limit: int = 0,
+        expand_nonempty_results: bool = False,
     ) -> Diagnosis:
         """See the module-level `diagnose` for what this does and what its parameters control."""
         original_row_count, culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows = self._store.diagnose(
-            query, depth=depth, timeout=timeout, ignore_cartesian_risk=ignore_cartesian_risk, sample_limit=sample_limit
+            query,
+            depth=depth,
+            timeout=timeout,
+            ignore_cartesian_risk=ignore_cartesian_risk,
+            sample_limit=sample_limit,
+            expand_nonempty_results=expand_nonempty_results,
         )
         return _diagnosis_from_tuples(original_row_count, culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows)
 
@@ -411,6 +417,7 @@ def diagnose(
     timeout: Optional[float] = DEFAULT_ABLATION_TIMEOUT,
     ignore_cartesian_risk: bool = True,
     sample_limit: int = 0,
+    expand_nonempty_results: bool = False,
 ) -> Diagnosis:
     """Diagnoses which BGP triple(s)/FILTER(s) in `query` are likely broken against `data`.
 
@@ -479,11 +486,27 @@ def diagnose(
     `Store.query` for that, or pass a positive limit here for a peek at the actual rows without a
     second round trip.
 
+    `expand_nonempty_results` controls whether the ablation search over triples/filters — by far
+    the most expensive part of this call, since it's combinatorial in the number of candidate
+    triples — runs at all once the original query already has at least one row. Defaults to
+    `False`: the common case for this tool is explaining a query that returned nothing, so once
+    it's known the query already returns something, the search is skipped entirely and this
+    returns immediately with empty `culprits`/`filter_culprits`/`cartesian_risks` (`depth` and
+    `ignore_cartesian_risk` become moot). `original_row_count`/`sample_variables`/`sample_rows` are
+    unaffected either way — they only ever cost the one materialization of the original query this
+    call always needs. Pass `True` to also search for triples/filters that are quietly narrowing an
+    already-nonempty result — the behavior this function always had before this parameter existed.
+
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
     same graph, build a `Store` once instead and call its `diagnose` method.
     """
     return Store(data, format).diagnose(
-        query, depth=depth, timeout=timeout, ignore_cartesian_risk=ignore_cartesian_risk, sample_limit=sample_limit
+        query,
+        depth=depth,
+        timeout=timeout,
+        ignore_cartesian_risk=ignore_cartesian_risk,
+        sample_limit=sample_limit,
+        expand_nonempty_results=expand_nonempty_results,
     )
 
 
