@@ -41,6 +41,25 @@ fn diagnoses_the_wrong_predicate_as_a_culprit() {
 }
 
 #[test]
+fn diagnose_rejects_non_select_queries_naming_the_form_it_got() {
+    let store = test_store();
+    for (query, form) in [
+        ("ASK { ?s ?p ?o }", "ASK"),
+        ("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }", "CONSTRUCT"),
+        ("DESCRIBE ?s WHERE { ?s ?p ?o }", "DESCRIBE"),
+    ] {
+        match diagnose(query, &store, 1, None, false, 0, false) {
+            Err(err @ RelaxError::UnsupportedQueryForm(got)) => {
+                assert_eq!(got, form);
+                assert_eq!(err.to_string(), format!("only SELECT queries are supported, got: {form}"));
+            }
+            Err(other) => panic!("expected UnsupportedQueryForm for {query}, got {other:?}"),
+            Ok(_) => panic!("expected UnsupportedQueryForm for {query}, got a diagnosis"),
+        }
+    }
+}
+
+#[test]
 fn diagnose_default_still_finds_the_culprit_with_its_internal_timeout() {
     let store = test_store();
     let diagnosis = diagnose_default(BROKEN_QUERY, &store).unwrap();

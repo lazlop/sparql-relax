@@ -270,10 +270,21 @@ pub fn diagnose(
 }
 
 pub(crate) fn ensure_select(query: &Query) -> Result<()> {
-    if !matches!(query, Query::Select { .. }) {
-        return Err(RelaxError::UnsupportedQueryForm("SELECT"));
+    match query {
+        Query::Select { .. } => Ok(()),
+        Query::Ask { .. } => Err(RelaxError::UnsupportedQueryForm("ASK")),
+        Query::Construct { .. } => Err(RelaxError::UnsupportedQueryForm("CONSTRUCT")),
+        Query::Describe { .. } => Err(RelaxError::UnsupportedQueryForm("DESCRIBE")),
     }
-    Ok(())
+}
+
+/// The query form a non-solutions result came from, for [`RelaxError::UnsupportedQueryForm`].
+fn results_form_name(results: &QueryResults) -> &'static str {
+    match results {
+        QueryResults::Solutions(_) => "SELECT",
+        QueryResults::Boolean(_) => "ASK",
+        QueryResults::Graph(_) => "CONSTRUCT/DESCRIBE",
+    }
 }
 
 /// Same as [`diagnose`], but takes an already-parsed `query`/`pattern`
@@ -752,7 +763,7 @@ fn run_select_query(query: Query, store: &Store) -> Result<Vec<QuerySolution>> {
             }
             Ok(rows)
         }
-        _ => Err(RelaxError::UnsupportedQueryForm("SELECT")),
+        other => Err(RelaxError::UnsupportedQueryForm(results_form_name(&other))),
     }
 }
 
@@ -823,6 +834,6 @@ pub(crate) fn run_select_query_with_guard(query: Query, store: &Store, guard: &S
             }
             Ok(Some(rows))
         }
-        _ => Err(RelaxError::UnsupportedQueryForm("SELECT")),
+        other => Err(RelaxError::UnsupportedQueryForm(results_form_name(&other))),
     }
 }
