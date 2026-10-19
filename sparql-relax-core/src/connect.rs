@@ -419,7 +419,7 @@ pub fn diagnose_and_connect_with_fanout_index(
     // explicitly wants culprit/path search regardless of whether the
     // original query already returned rows; skipping the search just
     // because it did would defeat the point of calling this at all.
-    let diagnosis = diagnose_parsed(&query, &pattern, store, ablation_depth, diagnose_timeout, ignore_cartesian_risk, 0, true)?;
+    let diagnosis = diagnose_parsed(&query, &pattern, store, ablation_depth, diagnose_timeout, ignore_cartesian_risk, 0, true, None, None)?;
     let allowed_namespaces = namespace_scope.as_filter();
 
     // Every culprit combination is connected independently against the same

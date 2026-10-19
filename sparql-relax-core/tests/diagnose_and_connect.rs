@@ -2,7 +2,8 @@ use oxigraph::io::{RdfFormat, RdfParser};
 use oxigraph::store::Store;
 use sparql_relax_core::bfs::Hop;
 use sparql_relax_core::{
-    NamespaceScope, RdfTerm, RelaxError, diagnose, diagnose_and_connect, diagnose_and_connect_default, diagnose_default, pruned_query_text,
+    NamespaceScope, RdfTerm, RelaxError, diagnose, diagnose_and_connect, diagnose_and_connect_default, diagnose_default, diagnose_timed,
+    pruned_query_text,
 };
 use std::time::{Duration, Instant};
 
@@ -76,6 +77,60 @@ fn diagnose_errors_with_timeout_when_even_the_original_query_cant_run_in_time() 
     let store = test_store();
     let result = diagnose(BROKEN_QUERY, &store, 1, Some(Duration::from_nanos(1)), false, 0, false);
     assert!(matches!(result, Err(RelaxError::Timeout)), "expected a Timeout error");
+}
+
+#[test]
+fn an_original_timeout_reports_the_query_itself_as_timed_out() {
+    let store = test_store();
+    let result = diagnose_timed(BROKEN_QUERY, &store, 1, None, false, 0, false, Some(Duration::from_nanos(1)), None);
+    assert!(matches!(result, Err(RelaxError::QueryTimeout)), "expected a QueryTimeout error");
+}
+
+#[test]
+fn an_original_timeout_leaves_the_search_its_own_budget() {
+    // The original query gets its own budget, and the search still finds
+    // the culprit within `timeout` afterwards.
+    let store = test_store();
+    let diagnosis = diagnose_timed(
+        BROKEN_QUERY,
+        &store,
+        1,
+        Some(Duration::from_secs(5)),
+        false,
+        0,
+        false,
+        Some(Duration::from_secs(10)),
+        Some(Duration::from_secs(10)),
+    )
+    .unwrap();
+    assert_eq!(diagnosis.culprits.len(), 1);
+    assert!(!diagnosis.search_skipped_slow);
+    assert!(diagnosis.original_elapsed < Duration::from_secs(5));
+}
+
+#[test]
+fn a_slow_original_skips_the_search_but_keeps_the_count_and_sample() {
+    let store = test_store();
+    // Any original run takes longer than zero, so this always counts as slow.
+    let empty = diagnose_timed(BROKEN_QUERY, &store, 1, None, false, 3, false, None, Some(Duration::ZERO)).unwrap();
+    assert!(empty.search_skipped_slow);
+    assert_eq!(empty.original_row_count, 0);
+    assert!(empty.culprits.is_empty() && empty.filter_culprits.is_empty() && empty.cartesian_risks.is_empty());
+
+    let working = "PREFIX ex: <urn:example#> SELECT ?s WHERE { ?s a ex:TempSensor }";
+    let rows = diagnose_timed(working, &store, 1, None, false, 3, false, None, Some(Duration::ZERO)).unwrap();
+    assert_eq!(rows.original_row_count, 1);
+    assert_eq!(rows.sample_rows.len(), 1);
+    assert!(rows.original_elapsed > Duration::ZERO);
+}
+
+#[test]
+fn nothing_to_ablate_is_reported_before_the_original_query_runs() {
+    // An already-expired budget would fail the original run, so getting
+    // NoTriples rather than a timeout shows the check comes first.
+    let store = test_store();
+    let result = diagnose("SELECT * WHERE { ?s ?p ?o }", &store, 1, Some(Duration::from_nanos(1)), false, 0, false);
+    assert!(matches!(result, Err(RelaxError::NoTriples)), "expected NoTriples");
 }
 
 #[test]

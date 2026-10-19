@@ -101,6 +101,14 @@ pub struct Diagnosis {
     /// otherwise a pure diagnosis (which triple/filter is broken), not a
     /// query-results call — see [`crate::query`] for that.
     pub sample_rows: Vec<Vec<Option<RdfTerm>>>,
+    /// How long evaluating the original query took — the one run every
+    /// diagnosis makes before any ablation check.
+    pub original_elapsed: Duration,
+    /// Whether the ablation search was skipped because the original query
+    /// alone took longer than `slow_original` (see [`diagnose_timed`]).
+    /// `culprits`/`filter_culprits`/`cartesian_risks` are then empty because
+    /// nothing was checked, not because nothing was found.
+    pub search_skipped_slow: bool,
 }
 
 /// Default for `depth`/`ablation_depth`: single triples are tried first, and
@@ -263,10 +271,57 @@ pub fn diagnose(
     sample_limit: usize,
     expand_nonempty_results: bool,
 ) -> Result<Diagnosis> {
+    diagnose_timed(query_text, store, depth, timeout, ignore_cartesian_risk, sample_limit, expand_nonempty_results, None, None)
+}
+
+/// Same as [`diagnose`], plus two controls over the original query's own
+/// run, for a caller that uses the diagnosis as its way of executing the
+/// query (counting it and sampling its rows) and so needs a slow but valid
+/// query reported as slow rather than as a diagnosis timeout.
+///
+/// `original_timeout` gives the original query a deadline of its own instead
+/// of sharing `timeout`'s: if it can't finish in time, this returns
+/// [`RelaxError::QueryTimeout`] — the query itself timed out — and `timeout`
+/// then bounds only the ablation search, starting once the original has
+/// finished. `None` keeps [`diagnose`]'s behavior: one shared deadline, with
+/// [`RelaxError::Timeout`] if the original can't finish within it.
+///
+/// `slow_original` skips the ablation search when the original query alone
+/// took longer than this, returning its count and sample with
+/// [`Diagnosis::search_skipped_slow`] set. The search reruns reduced
+/// versions of the query many times, so a query that already takes a large
+/// share of `timeout` can only end with most checks cut off, each one then
+/// read as "not a culprit". `None` never skips.
+///
+/// Either way, [`Diagnosis::original_elapsed`] reports how long the original
+/// query took.
+#[allow(clippy::too_many_arguments)]
+pub fn diagnose_timed(
+    query_text: &str,
+    store: &Store,
+    depth: usize,
+    timeout: Option<Duration>,
+    ignore_cartesian_risk: bool,
+    sample_limit: usize,
+    expand_nonempty_results: bool,
+    original_timeout: Option<Duration>,
+    slow_original: Option<Duration>,
+) -> Result<Diagnosis> {
     let query = SparqlParser::new().parse_query(query_text)?;
     ensure_select(&query)?;
     let pattern = pattern_of(&query).clone();
-    diagnose_parsed(&query, &pattern, store, depth, timeout, ignore_cartesian_risk, sample_limit, expand_nonempty_results)
+    diagnose_parsed(
+        &query,
+        &pattern,
+        store,
+        depth,
+        timeout,
+        ignore_cartesian_risk,
+        sample_limit,
+        expand_nonempty_results,
+        original_timeout,
+        slow_original,
+    )
 }
 
 pub(crate) fn ensure_select(query: &Query) -> Result<()> {
@@ -312,6 +367,11 @@ fn results_form_name(results: &QueryResults) -> &'static str {
 /// `true`: a caller reaching for `connect` explicitly wants culprit/path
 /// search regardless of whether the original query already returned rows,
 /// so the cheap skip this flag enables would defeat the point of calling it.
+///
+/// `original_timeout`/`slow_original` are passed straight through from
+/// [`diagnose_timed`] — see its docs. [`diagnose`] and
+/// [`crate::connect::diagnose_and_connect`] pass `None` for both.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn diagnose_parsed(
     query: &Query,
     pattern: &GraphPattern,
@@ -321,13 +381,34 @@ pub(crate) fn diagnose_parsed(
     ignore_cartesian_risk: bool,
     sample_limit: usize,
     expand_nonempty_results: bool,
+    original_timeout: Option<Duration>,
+    slow_original: Option<Duration>,
 ) -> Result<Diagnosis> {
-    // One shared deadline for every query this call runs, rather than a
-    // fresh budget per check — see the `timeout` docs on [`diagnose`].
-    let deadline = timeout.map(|t| Instant::now() + t);
+    // Checked before the original query runs: with nothing to ablate, its
+    // result couldn't explain anything, so evaluating it would be wasted.
+    let triple_candidates: Vec<TriplePattern> = collect_bgp_triples(pattern)
+        .into_iter()
+        .filter(|t| matches!(t.predicate, NamedNodePattern::NamedNode(_)))
+        .collect();
+    let filter_candidates = collect_filters(pattern);
+    if triple_candidates.is_empty() && filter_candidates.is_empty() {
+        return Err(RelaxError::NoTriples);
+    }
 
-    let Some(original_rows) = run_select_query_with_deadline(query.clone(), store, deadline)? else {
-        return Err(RelaxError::Timeout);
+    // One shared deadline for every query this call runs, rather than a
+    // fresh budget per check — see the `timeout` docs on [`diagnose`] —
+    // unless the original query has a budget of its own, in which case the
+    // shared one starts once it's done (see [`diagnose_timed`]).
+    let started = Instant::now();
+    let original_rows = match original_timeout {
+        None => run_select_query_with_deadline(query.clone(), store, timeout.map(|t| started + t))?
+            .ok_or(RelaxError::Timeout)?,
+        Some(t) => run_select_query_with_deadline(query.clone(), store, Some(started + t))?.ok_or(RelaxError::QueryTimeout)?,
+    };
+    let original_elapsed = started.elapsed();
+    let deadline = match original_timeout {
+        None => timeout.map(|t| started + t),
+        Some(_) => timeout.map(|t| Instant::now() + t),
     };
 
     // Free to pull out now: `original_rows` is already fully materialized
@@ -342,14 +423,7 @@ pub(crate) fn diagnose_parsed(
     let sample_rows: Vec<Vec<Option<RdfTerm>>> =
         original_rows.iter().take(sample_limit).map(|row| row.values().iter().map(|v| v.clone().map(RdfTerm::from)).collect()).collect();
 
-    let triple_candidates: Vec<TriplePattern> = collect_bgp_triples(pattern)
-        .into_iter()
-        .filter(|t| matches!(t.predicate, NamedNodePattern::NamedNode(_)))
-        .collect();
-    let filter_candidates = collect_filters(pattern);
-    if triple_candidates.is_empty() && filter_candidates.is_empty() {
-        return Err(RelaxError::NoTriples);
-    }
+    let search_skipped_slow = slow_original.is_some_and(|limit| original_elapsed > limit);
 
     // The ablation search below is the expensive part of this call — up to
     // C(n, k) reduced-query evaluations per depth level. Skip it entirely
@@ -358,7 +432,9 @@ pub(crate) fn diagnose_parsed(
     // [`diagnose`]. `original_row_count`/`sample_variables`/`sample_rows`
     // above already cost nothing extra beyond the one materialization every
     // `diagnose` call needs regardless, so they're unaffected by this.
-    if !original_rows.is_empty() && !expand_nonempty_results {
+    // Likewise once it's known to be too slow to search (see `slow_original`
+    // on [`diagnose_timed`]).
+    if search_skipped_slow || (!original_rows.is_empty() && !expand_nonempty_results) {
         return Ok(Diagnosis {
             original_row_count: original_rows.len(),
             culprits: Vec::new(),
@@ -366,6 +442,8 @@ pub(crate) fn diagnose_parsed(
             cartesian_risks: Vec::new(),
             sample_variables,
             sample_rows,
+            original_elapsed,
+            search_skipped_slow,
         });
     }
 
@@ -446,7 +524,16 @@ pub(crate) fn diagnose_parsed(
         })
         .collect();
 
-    Ok(Diagnosis { original_row_count: original_rows.len(), culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows })
+    Ok(Diagnosis {
+        original_row_count: original_rows.len(),
+        culprits,
+        filter_culprits,
+        cartesian_risks,
+        sample_variables,
+        sample_rows,
+        original_elapsed,
+        search_skipped_slow: false,
+    })
 }
 
 /// The three outcomes [`classify_combo`] can reach for one candidate

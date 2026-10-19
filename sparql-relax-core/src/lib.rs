@@ -12,7 +12,7 @@ pub use connect::{
     diagnose_and_connect_with_fanout_index,
 };
 pub use diagnose::{
-    CartesianRiskCombo, Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, Diagnosis, FilterCulprit, diagnose, diagnose_default,
+    CartesianRiskCombo, Culprit, DEFAULT_ABLATION_DEPTH, DEFAULT_ABLATION_TIMEOUT, Diagnosis, FilterCulprit, diagnose, diagnose_default, diagnose_timed,
     pruned_query_text,
 };
 pub use error::{RelaxError, Result};

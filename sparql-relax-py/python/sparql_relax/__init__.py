@@ -143,6 +143,15 @@ class Diagnosis:
     `diagnose` call is meant to stay a which-triple-is-broken check, not a query-results call —
     use `query`/`Store.query` for that."""
 
+    original_seconds: float = 0.0
+    """How long evaluating the original query took — the one run every diagnosis makes before any
+    ablation check."""
+
+    search_skipped_slow: bool = False
+    """Whether the ablation search was skipped because the original query alone took longer than
+    `slow_original`. `culprits`/`filter_culprits`/`cartesian_risks` are then empty because nothing
+    was checked, not because nothing was found."""
+
 
 @dataclass
 class ConnectedTriple:
@@ -293,9 +302,18 @@ def _query_result_from_tuple(t) -> QueryResult:
 
 
 def _diagnosis_from_tuples(
-    original_row_count: int, culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows
+    original_row_count: int,
+    culprits,
+    filter_culprits,
+    cartesian_risks,
+    sample_variables,
+    sample_rows,
+    original_seconds: float,
+    search_skipped_slow: bool,
 ) -> Diagnosis:
     return Diagnosis(
+        original_seconds=original_seconds,
+        search_skipped_slow=search_skipped_slow,
         original_row_count=original_row_count,
         culprits=[Culprit(triples=triples, depth=culprit_depth) for triples, culprit_depth in culprits],
         filter_culprits=[
@@ -360,17 +378,22 @@ class Store:
         ignore_cartesian_risk: bool = True,
         sample_limit: int = 0,
         expand_nonempty_results: bool = False,
+        original_timeout: Optional[float] = None,
+        slow_original: Optional[float] = None,
     ) -> Diagnosis:
         """See the module-level `diagnose` for what this does and what its parameters control."""
-        original_row_count, culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows = self._store.diagnose(
-            query,
-            depth=depth,
-            timeout=timeout,
-            ignore_cartesian_risk=ignore_cartesian_risk,
-            sample_limit=sample_limit,
-            expand_nonempty_results=expand_nonempty_results,
+        return _diagnosis_from_tuples(
+            *self._store.diagnose(
+                query,
+                depth=depth,
+                timeout=timeout,
+                ignore_cartesian_risk=ignore_cartesian_risk,
+                sample_limit=sample_limit,
+                expand_nonempty_results=expand_nonempty_results,
+                original_timeout=original_timeout,
+                slow_original=slow_original,
+            )
         )
-        return _diagnosis_from_tuples(original_row_count, culprits, filter_culprits, cartesian_risks, sample_variables, sample_rows)
 
     def diagnose_and_connect(
         self,
@@ -418,6 +441,8 @@ def diagnose(
     ignore_cartesian_risk: bool = True,
     sample_limit: int = 0,
     expand_nonempty_results: bool = False,
+    original_timeout: Optional[float] = None,
+    slow_original: Optional[float] = None,
 ) -> Diagnosis:
     """Diagnoses which BGP triple(s)/FILTER(s) in `query` are likely broken against `data`.
 
@@ -497,6 +522,20 @@ def diagnose(
     call always needs. Pass `True` to also search for triples/filters that are quietly narrowing an
     already-nonempty result — the behavior this function always had before this parameter existed.
 
+    `original_timeout` and `slow_original` are for a caller that uses the diagnosis as its way of
+    running the query (counting it and sampling its rows), so a slow but valid query is reported
+    as slow rather than as a diagnosis timeout. `original_timeout` (seconds) gives the original
+    query its own budget instead of sharing `timeout`'s: if it can't finish in time this raises
+    "query timed out", and `timeout` then bounds only the search, starting once the original is
+    done. `slow_original` (seconds) skips the search when the original alone took longer than
+    this, still returning its count and sample, with `Diagnosis.search_skipped_slow` set — the
+    search reruns reduced versions of the query many times, so a query that already takes much of
+    `timeout` would only see most checks cut off. Both default to `None`: one shared budget, never
+    skipped. `Diagnosis.original_seconds` reports how long the original took either way.
+
+    A query with nothing to ablate (no triple with a concrete predicate, and no FILTER) raises
+    before the original query is run at all.
+
     Builds a throwaway `Store` from `data` on every call — for more than one query against the
     same graph, build a `Store` once instead and call its `diagnose` method.
     """
@@ -507,6 +546,8 @@ def diagnose(
         ignore_cartesian_risk=ignore_cartesian_risk,
         sample_limit=sample_limit,
         expand_nonempty_results=expand_nonempty_results,
+        original_timeout=original_timeout,
+        slow_original=slow_original,
     )
 
 

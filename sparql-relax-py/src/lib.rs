@@ -3,7 +3,7 @@ use oxigraph::store::Store;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use sparql_relax_core::{
-    FanoutIndex, NamespaceScope, QueryOutcome, RdfTerm, diagnose as core_diagnose,
+    FanoutIndex, NamespaceScope, QueryOutcome, RdfTerm, diagnose_timed as core_diagnose,
     diagnose_and_connect_with_fanout_index as core_connect, pruned_query_text as core_pruned_query_text, query as core_query,
 };
 use std::fmt::Display;
@@ -89,8 +89,10 @@ type ConnectResultTuple = (usize, Vec<ConnectedTripleTuple>, Option<String>, usi
 //
 // The trailing `(Vec<String>, Vec<Vec<Option<TermTuple>>>)` is
 // `(sample_variables, sample_rows)` — same shape as `QueryTuple`'s
-// `"solutions"` case, empty unless `sample_limit > 0` was passed.
-type DiagnoseTuples = (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>, Vec<String>, Vec<Vec<Option<TermTuple>>>);
+// `"solutions"` case, empty unless `sample_limit > 0` was passed. After it
+// come `(original_seconds, search_skipped_slow)` — see `Diagnosis`.
+type DiagnoseTuples =
+    (usize, Vec<CulpritTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>, Vec<String>, Vec<Vec<Option<TermTuple>>>, f64, bool);
 type ConnectTuples = (usize, Vec<ConnectResultTuple>, Vec<FilterCulpritTuple>, Vec<CulpritTuple>);
 
 /// An RDF term as `(kind, value, datatype, language)`, where `kind` is
@@ -140,6 +142,7 @@ fn query_tuples(store: &Store, query: &str, row_limit: Option<usize>, timeout: O
 /// `diagnose` pyfunction (which loads a throwaway `store` first) and
 /// `RdfStore::diagnose` (which reuses one built once, up front) so the two
 /// entry points can't drift apart.
+#[allow(clippy::too_many_arguments)]
 fn diagnose_tuples(
     store: &Store,
     query: &str,
@@ -148,8 +151,20 @@ fn diagnose_tuples(
     ignore_cartesian_risk: bool,
     sample_limit: usize,
     expand_nonempty_results: bool,
+    original_timeout: Option<Duration>,
+    slow_original: Option<Duration>,
 ) -> Result<DiagnoseTuples, sparql_relax_core::RelaxError> {
-    let diagnosis = core_diagnose(query, store, depth, timeout, ignore_cartesian_risk, sample_limit, expand_nonempty_results)?;
+    let diagnosis = core_diagnose(
+        query,
+        store,
+        depth,
+        timeout,
+        ignore_cartesian_risk,
+        sample_limit,
+        expand_nonempty_results,
+        original_timeout,
+        slow_original,
+    )?;
     let culprits = diagnosis
         .culprits
         .into_iter()
@@ -166,7 +181,16 @@ fn diagnose_tuples(
         .map(|c| (c.triples.iter().map(ToString::to_string).collect(), c.depth))
         .collect();
     let sample_rows = diagnosis.sample_rows.into_iter().map(|row| row.into_iter().map(|t| t.map(term_tuple)).collect()).collect();
-    Ok((diagnosis.original_row_count, culprits, filter_culprits, cartesian_risks, diagnosis.sample_variables, sample_rows))
+    Ok((
+        diagnosis.original_row_count,
+        culprits,
+        filter_culprits,
+        cartesian_risks,
+        diagnosis.sample_variables,
+        sample_rows,
+        diagnosis.original_elapsed.as_secs_f64(),
+        diagnosis.search_skipped_slow,
+    ))
 }
 
 /// Same as [`diagnose_tuples`], but for `diagnose_and_connect` — shared by the
@@ -278,7 +302,8 @@ mod _sparql_relax {
     /// instead of piling up behind an abandoned future.
     ///
     /// Returns `(original_row_count, culprits, filter_culprits,
-    /// cartesian_risks, sample_variables, sample_rows)`. Each culprit is
+    /// cartesian_risks, sample_variables, sample_rows, original_seconds,
+    /// search_skipped_slow)`. Each culprit is
     /// `(triples, depth)`: `triples` is a list of triple texts in the
     /// combination (just one unless `depth > 1` was needed), and `depth` is
     /// the combination size at which it was found. Each filter culprit is
@@ -344,6 +369,18 @@ mod _sparql_relax {
     /// either way. Pass `True` to also search for triples/filters that are
     /// quietly narrowing an already-nonempty result — the behavior this
     /// function always had before this parameter existed.
+    ///
+    /// `original_timeout` (seconds) gives the original query its own budget
+    /// instead of sharing `timeout`'s: if it can't finish in time this raises
+    /// "query timed out" (the query itself is too slow), and `timeout` then
+    /// bounds only the search, starting once the original is done. `None`
+    /// (the default) keeps one shared budget, raising "diagnosis timed out
+    /// before the original query could even be evaluated".
+    ///
+    /// `slow_original` (seconds) skips the search when the original query
+    /// alone took longer than this, still returning its count and sample,
+    /// with `search_skipped_slow` set. `None` (the default) never skips.
+    /// `original_seconds` is how long the original query took either way.
     ///
     /// Runs `query` (any SPARQL query form — `SELECT`, `ASK`, `CONSTRUCT`,
     /// `DESCRIBE`) against the RDF graph in `data` (parsed as `format`) and
@@ -416,7 +453,7 @@ mod _sparql_relax {
     /// one query against the same graph, build a `Store` once instead and
     /// call its `diagnose` method, which reuses it.
     #[pyfunction]
-    #[pyo3(signature = (data, query, format="turtle", depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true, sample_limit=0, expand_nonempty_results=false))]
+    #[pyo3(signature = (data, query, format="turtle", depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true, sample_limit=0, expand_nonempty_results=false, original_timeout=None, slow_original=None))]
     #[allow(clippy::too_many_arguments)]
     fn diagnose(
         py: Python<'_>,
@@ -428,15 +465,32 @@ mod _sparql_relax {
         ignore_cartesian_risk: bool,
         sample_limit: usize,
         expand_nonempty_results: bool,
+        original_timeout: Option<f64>,
+        slow_original: Option<f64>,
     ) -> PyResult<DiagnoseTuples> {
         let store = load_store(data, format)?;
         let timeout = parse_timeout_seconds(timeout)?;
+        let original_timeout = parse_timeout_seconds(original_timeout)?;
+        let slow_original = parse_timeout_seconds(slow_original)?;
         // Releases the GIL for the (potentially long-running, internally
         // multi-threaded) search: without this, a Python-side timeout
         // wrapper around this call couldn't actually regain control until
         // the search finished on its own, since no other Python thread
         // could run while this one held the GIL.
-        py.detach(|| diagnose_tuples(&store, query, depth, timeout, ignore_cartesian_risk, sample_limit, expand_nonempty_results)).map_err(to_py_err)
+        py.detach(|| {
+            diagnose_tuples(
+                &store,
+                query,
+                depth,
+                timeout,
+                ignore_cartesian_risk,
+                sample_limit,
+                expand_nonempty_results,
+                original_timeout,
+                slow_original,
+            )
+        })
+        .map_err(to_py_err)
     }
 
     /// Diagnoses `query` and, for each culprit combination found, searches
@@ -647,7 +701,8 @@ mod _sparql_relax {
             Ok(Self { inner, fanout_index })
         }
 
-        #[pyo3(signature = (query, depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true, sample_limit=0, expand_nonempty_results=false))]
+        #[pyo3(signature = (query, depth=3, timeout=default_ablation_timeout(), ignore_cartesian_risk=true, sample_limit=0, expand_nonempty_results=false, original_timeout=None, slow_original=None))]
+        #[allow(clippy::too_many_arguments)]
         fn diagnose(
             &self,
             py: Python<'_>,
@@ -657,10 +712,26 @@ mod _sparql_relax {
             ignore_cartesian_risk: bool,
             sample_limit: usize,
             expand_nonempty_results: bool,
+            original_timeout: Option<f64>,
+            slow_original: Option<f64>,
         ) -> PyResult<DiagnoseTuples> {
             let timeout = parse_timeout_seconds(timeout)?;
-            py.detach(|| diagnose_tuples(&self.inner, query, depth, timeout, ignore_cartesian_risk, sample_limit, expand_nonempty_results))
-                .map_err(to_py_err)
+            let original_timeout = parse_timeout_seconds(original_timeout)?;
+            let slow_original = parse_timeout_seconds(slow_original)?;
+            py.detach(|| {
+                diagnose_tuples(
+                    &self.inner,
+                    query,
+                    depth,
+                    timeout,
+                    ignore_cartesian_risk,
+                    sample_limit,
+                    expand_nonempty_results,
+                    original_timeout,
+                    slow_original,
+                )
+            })
+            .map_err(to_py_err)
         }
 
         #[pyo3(signature = (
